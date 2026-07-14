@@ -49,6 +49,15 @@ export interface RunMetrics {
   falsePositives: number;
 }
 
+export type EvidenceInstallInput = Omit<
+  Evidence,
+  "status" | "createdAt" | "invalidatedAt" | "dependencyVersion" | "dependencies"
+> & {
+  dependencies?: EvidenceDependencies;
+  dependencyVersion?: 1;
+  now?: string;
+};
+
 export class SqliteStore {
   readonly database: Sqlite;
 
@@ -256,14 +265,7 @@ export class SqliteStore {
     return this.requireOperation(id);
   }
 
-  installEvidence(input: Omit<
-    Evidence,
-    "status" | "createdAt" | "invalidatedAt" | "dependencyVersion" | "dependencies"
-  > & {
-    dependencies?: EvidenceDependencies;
-    dependencyVersion?: 1;
-    now?: string;
-  }): Evidence {
+  installEvidence(input: EvidenceInstallInput): Evidence {
     const run = this.requireRun(input.runId);
     if (run.binding && !input.dependencies) {
       throw new Error("Bound runs require fully bound Evidence dependencies");
@@ -307,6 +309,23 @@ export class SqliteStore {
         now,
       );
     return this.requireEvidence(input.id);
+  }
+
+  installEvidenceReplacingKinds(
+    input: EvidenceInstallInput,
+    replacedKinds: readonly string[],
+  ): Evidence {
+    const transaction = this.database.transaction(() => {
+      const evidence = this.installEvidence(input);
+      this.invalidateEvidenceOfKindsExcept(
+        input.runId,
+        replacedKinds,
+        evidence.status === "valid" ? [evidence.dependencyHash] : [],
+        input.now,
+      );
+      return this.requireEvidence(evidence.id);
+    });
+    return transaction();
   }
 
   listEvidence(runId: string, status?: "valid" | "invalid"): Evidence[] {

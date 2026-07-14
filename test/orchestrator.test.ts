@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { CommandRunner, type CommandRequest, type CommandResult } from "../src/execution.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { GenericNodeProjectAdapter } from "../src/project.js";
 import type {
@@ -54,6 +55,22 @@ function targetRepository(
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function repairableRepository(): ReturnType<typeof targetRepository> {
+  const fixture = targetRepository();
+  writeFileSync(
+    join(fixture.root, "check.mjs"),
+    [
+      "import { readFileSync } from 'node:fs';",
+      "const value = readFileSync('changed.txt', 'utf8').trim();",
+      "if (value !== 'fixed') { process.stderr.write(`expected fixed, received ${value}\\n`); process.exit(3); }",
+      "",
+    ].join("\n"),
+  );
+  git(fixture.root, ["add", "check.mjs"]);
+  git(fixture.root, ["commit", "--amend", "--no-edit"]);
+  return fixture;
 }
 
 class FakeAuthor implements ProviderAdapter {
@@ -128,6 +145,24 @@ class CommittingAuthor extends FakeAuthor {
   }
 }
 
+class RepairingAuthor extends FakeAuthor {
+  constructor(private readonly repairSucceeds = true) {
+    super();
+  }
+
+  override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    const result = await super.run(request);
+    if (request.workspaceAccess !== "read-only") {
+      const repairing = request.prompt.includes("Role: bounded Repair attempt");
+      writeFileSync(join(request.cwd, "changed.txt"), repairing && this.repairSucceeds ? "fixed\n" : "broken\n");
+      if (repairing && !this.repairSucceeds) {
+        writeFileSync(join(request.cwd, "repair-attempt.txt"), "ineffective repair\n");
+      }
+    }
+    return result;
+  }
+}
+
 class WritingExplorer extends FakeAuthor {
   override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
     if (request.workspaceAccess === "read-only") {
@@ -137,11 +172,60 @@ class WritingExplorer extends FakeAuthor {
   }
 }
 
+class FailedResultAuthor extends FakeAuthor {
+  override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    const result = await super.run(request);
+    return { ...result, ok: false, exitCode: 1, failureClass: "transient" };
+  }
+}
+
+class CommitResetAuthor extends FakeAuthor {
+  override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    const result = await super.run(request);
+    if (request.workspaceAccess !== "read-only") {
+      git(request.cwd, ["add", "changed.txt"]);
+      git(request.cwd, ["commit", "-m", "provider control-state mutation"]);
+      git(request.cwd, ["reset", "--mixed", "HEAD^"]);
+    }
+    return result;
+  }
+}
+
+class TimedOutSuccessRunner extends CommandRunner {
+  override async run(request: CommandRequest): Promise<CommandResult> {
+    mkdirSync(request.artifactDirectory, { recursive: true });
+    const stdoutPath = join(request.artifactDirectory, "stdout.log");
+    const stderrPath = join(request.artifactDirectory, "stderr.log");
+    writeFileSync(stdoutPath, "");
+    writeFileSync(stderrPath, "timed out after child reported zero\n");
+    return {
+      argv: request.argv,
+      cwd: request.cwd,
+      exitCode: 0,
+      signal: null,
+      durationMs: 1,
+      timedOut: true,
+      stdoutPath,
+      stderrPath,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      commitBefore: git(request.cwd, ["rev-parse", "HEAD"]),
+    };
+  }
+}
+
 function createOrchestrator(
   fixture: ReturnType<typeof targetRepository>,
   provider: ProviderAdapter,
   projectAdapter: ProjectAdapter = new GenericNodeProjectAdapter(),
-  faults?: { afterProviderCompletion?: () => void; afterHarnessCommit?: () => void },
+  faults?: {
+    afterProviderCompletion?: () => void;
+    afterHarnessCommit?: () => void;
+    afterVerificationFailure?: () => void;
+    afterWriterOperationCreated?: (role: "author" | "repair") => void;
+    afterCandidateEvidenceInstalled?: () => void;
+    afterExplorerOperationCompleted?: () => void;
+  },
 ): Orchestrator {
   const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
   temporaryDirectories.push(loopHome);
@@ -149,7 +233,6 @@ function createOrchestrator(
     loopHome,
     provider,
     projectAdapter,
-    outputSchemaPath: fixture.schemaPath,
     faults,
   });
 }
@@ -212,7 +295,181 @@ describe("Orchestrator", () => {
     expect(missingView.run.status).toBe("blocked");
     expect(missingView.evidence.map((item) => item.kind)).toEqual(["candidate_commit"]);
     missing.close();
-  }, 20_000);
+  }, 90_000);
+
+  it("never treats a timed-out command with exit zero as successful Evidence", async () => {
+    const fixture = targetRepository();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    const orchestrator = new Orchestrator({
+      loopHome,
+      provider: new FakeAuthor(),
+      projectAdapter: new GenericNodeProjectAdapter(),
+      commandRunner: new TimedOutSuccessRunner(),
+    });
+    const view = await orchestrator.start({
+      runId: "run-timeout-zero", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+    expect(view.run.status).toBe("blocked");
+    expect(view.evidence.some((item) => item.kind === "command" && item.status === "valid")).toBe(false);
+    expect(view.evidence.some((item) => item.kind === "verification_failure")).toBe(true);
+    expect(view.operations.find((operation) => operation.kind === "verify:check")).toMatchObject({
+      status: "failed",
+      result: { exitCode: 0, timedOut: true },
+    });
+    orchestrator.close();
+  }, 30_000);
+
+  it("repairs a real verification failure in the same Run and commits the repaired candidate", async () => {
+    const fixture = repairableRepository();
+    const provider = new RepairingAuthor();
+    const orchestrator = createOrchestrator(fixture, provider);
+    const view = await orchestrator.start({
+      runId: "run-repair", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+    expect(view.run).toMatchObject({ id: "run-repair", status: "ready" });
+    expect(provider.calls).toBe(2);
+    expect(view.operations.filter((operation) => operation.kind === "repair")).toHaveLength(1);
+    expect(view.operations.filter((operation) => operation.kind === "checkpoint-commit")).toHaveLength(2);
+    expect(view.operations.filter((operation) => operation.kind === "verify:check")).toHaveLength(2);
+    expect(provider.requests[1]?.prompt).toContain("Deterministic failure evidence:");
+    expect(provider.requests[1]?.prompt).toContain("expected fixed, received broken");
+    expect(Number(git(view.worktreePath, ["rev-list", "--count", "HEAD"]))).toBe(3);
+    expect(view.evidence.filter((item) => item.kind === "verification_failure")).toHaveLength(1);
+    expect(view.evidence.filter((item) => item.status === "valid").map((item) => item.kind).sort()).toEqual([
+      "candidate_commit", "command",
+    ]);
+    orchestrator.close();
+  }, 60_000);
+
+  it("atomically replaces stale commit-bound Evidence when a repaired candidate is installed", async () => {
+    const fixture = repairableRepository();
+    const provider = new RepairingAuthor();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    let candidateReceipts = 0;
+    const first = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+      faults: {
+        afterCandidateEvidenceInstalled: () => {
+          candidateReceipts += 1;
+          if (candidateReceipts === 2) throw new Error("simulated crash after repaired candidate receipt");
+        },
+      },
+    });
+    await expect(first.start({
+      runId: "run-candidate-atomic", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    })).rejects.toThrow("repaired candidate receipt");
+    const crashed = first.status("run-candidate-atomic");
+    const head = git(crashed.worktreePath, ["rev-parse", "HEAD"]);
+    const validCommitEvidence = crashed.evidence.filter((item) =>
+      item.status === "valid" && item.kind !== "exploration"
+    );
+    expect(validCommitEvidence.map((item) => item.kind)).toEqual(["candidate_commit"]);
+    expect(validCommitEvidence.every((item) => item.commitSha === head)).toBe(true);
+    expect(crashed.evidence.filter((item) => item.kind === "candidate_commit" && item.status === "invalid")).toHaveLength(1);
+    expect(crashed.evidence.filter((item) => item.kind === "verification_failure" && item.status === "invalid")).toHaveLength(1);
+    first.close();
+
+    const resumed = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+    });
+    const view = await resumed.resume("run-candidate-atomic");
+    expect(view.run.status).toBe("ready");
+    expect(view.evidence.filter((item) => item.status === "valid").map((item) => item.kind).sort()).toEqual([
+      "candidate_commit", "command",
+    ]);
+    resumed.close();
+  }, 90_000);
+
+  it("resumes after a recorded verification failure without creating a new Run", async () => {
+    const fixture = repairableRepository();
+    const provider = new RepairingAuthor();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    const first = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+      outputSchemaPath: fixture.schemaPath,
+      faults: { afterVerificationFailure: () => { throw new Error("simulated restart after failed verification"); } },
+    });
+    await expect(first.start({
+      runId: "run-repair-resume", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    })).rejects.toThrow("simulated restart");
+    expect(first.status("run-repair-resume").run.status).toBe("open");
+    first.close();
+
+    const resumed = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+      outputSchemaPath: fixture.schemaPath,
+    });
+    const view = await resumed.resume("run-repair-resume");
+    expect(view.run).toMatchObject({ id: "run-repair-resume", status: "ready" });
+    expect(resumed.listRuns()).toHaveLength(1);
+    expect(provider.calls).toBe(2);
+    resumed.close();
+  }, 60_000);
+
+  it("re-enters the same unfinished Repair operation after a clean-tree restart", async () => {
+    const fixture = repairableRepository();
+    const provider = new RepairingAuthor();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    let interrupted = false;
+    const first = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+      faults: {
+        afterWriterOperationCreated: (role) => {
+          if (role === "repair" && !interrupted) {
+            interrupted = true;
+            throw new Error("simulated restart after Repair operation creation");
+          }
+        },
+      },
+    });
+    await expect(first.start({
+      runId: "run-repair-running", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    })).rejects.toThrow("Repair operation creation");
+    expect(first.status("run-repair-running").operations.at(-1)).toMatchObject({
+      id: "run-repair-running:repair:1", kind: "repair", status: "running",
+    });
+    first.close();
+
+    const resumed = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+    });
+    const view = await resumed.resume("run-repair-running");
+    expect(view.run.status).toBe("ready");
+    expect(view.operations.filter((operation) => operation.kind === "repair")).toHaveLength(1);
+    expect(view.operations.some((operation) => operation.id.endsWith("repair:2"))).toBe(false);
+    expect(provider.calls).toBe(2);
+    resumed.close();
+  }, 90_000);
+
+  it("blocks a repeated failure signature after the one bounded Repair", async () => {
+    const fixture = repairableRepository();
+    const provider = new RepairingAuthor(false);
+    const orchestrator = createOrchestrator(fixture, provider);
+    const view = await orchestrator.start({
+      runId: "run-repeat", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+    expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked?.reason).toContain("repeated failure signature");
+    expect(view.operations.filter((operation) => operation.kind === "repair")).toHaveLength(1);
+    expect(view.operations.filter((operation) => operation.kind === "verify:check")).toHaveLength(2);
+    orchestrator.close();
+  }, 60_000);
 
   it("fails closed at ready when risk is unknown", async () => {
     const fixture = targetRepository(false, "unknown");
@@ -228,7 +485,8 @@ describe("Orchestrator", () => {
       previousStatus: "open",
       checkpointRef: "risk-classification",
     });
-    expect(view.evidence).toHaveLength(2);
+    expect(view.evidence).toHaveLength(0);
+    expect(orchestrator.store.listHumanInbox("run-unknown-risk")).toHaveLength(1);
     orchestrator.close();
   }, 20_000);
 
@@ -255,18 +513,63 @@ describe("Orchestrator", () => {
     expect(provider.requests[1]?.prompt).not.toContain("thread.started");
     expect(view.operations[0]).toMatchObject({ kind: "explorer", status: "succeeded" });
     expect(view.operations[0]?.result).toMatchObject({ costTokens: 0, latencyMs: 1, used: true });
+    expect(view.evidence.filter((item) => item.status === "valid").map((item) => item.kind).sort()).toEqual([
+      "candidate_commit", "command", "exploration",
+    ]);
+    const exploration = view.evidence.find((item) => item.kind === "exploration");
+    expect(exploration?.dependencies).toMatchObject({
+      commitSha: view.run.binding?.baselineCommit,
+      taskSpecHash: view.run.binding?.taskSpecHash,
+      acceptanceHash: view.run.binding?.acceptanceHash,
+      policyVersion: view.run.binding?.policyVersion,
+      stepId: "exploration",
+    });
     orchestrator.close();
   }, 20_000);
 
-  it("rejects an attempted Explorer write at the Harness boundary without changing Run state", async () => {
+  it("recovers Explorer Evidence after a crash without invoking Explorer twice", async () => {
+    const fixture = targetRepository(false, "normal");
+    const provider = new FakeAuthor();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    const first = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+      faults: { afterExplorerOperationCompleted: () => { throw new Error("simulated Explorer receipt crash"); } },
+    });
+    await expect(first.start({
+      runId: "run-explorer-receipt", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    })).rejects.toThrow("Explorer receipt crash");
+    expect(first.status("run-explorer-receipt").operations[0]).toMatchObject({
+      kind: "explorer", status: "succeeded",
+    });
+    expect(first.status("run-explorer-receipt").evidence).toHaveLength(0);
+    first.close();
+
+    const resumed = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+    });
+    const view = await resumed.resume("run-explorer-receipt");
+    expect(view.run.status).toBe("ready");
+    expect(provider.requests.filter((request) => request.workspaceAccess === "read-only")).toHaveLength(1);
+    expect(view.evidence.filter((item) => item.status === "valid").map((item) => item.kind).sort()).toEqual([
+      "candidate_commit", "command", "exploration",
+    ]);
+    resumed.close();
+  }, 60_000);
+
+  it("rejects an attempted Explorer write at the Harness boundary", async () => {
     const fixture = targetRepository(false, "normal");
     const orchestrator = createOrchestrator(fixture, new WritingExplorer());
 
-    await expect(orchestrator.start({
+    const view = await orchestrator.start({
       runId: "run-explorer-write", taskPath: fixture.taskPath, targetRepository: fixture.root,
-    })).rejects.toThrow("read-only workspace boundary");
-    const view = orchestrator.status("run-explorer-write");
-    expect(view.run.status).toBe("open");
+    });
+    expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked?.reason).toContain("read-only workspace boundary");
     expect(view.operations).toHaveLength(1);
     expect(view.operations[0]).toMatchObject({ kind: "explorer", status: "failed" });
     orchestrator.close();
@@ -297,6 +600,19 @@ describe("Orchestrator", () => {
     expect(provider.requests[0]?.additionalWritableDirectories).toBeUndefined();
     orchestrator.close();
   }, 20_000);
+
+  it("rejects a Provider commit followed by reset even when the final diff looks valid", async () => {
+    const fixture = targetRepository();
+    const orchestrator = createOrchestrator(fixture, new CommitResetAuthor());
+    const view = await orchestrator.start({
+      runId: "run-provider-reset", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+    expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked?.reason).toContain("Git refs or reflogs");
+    expect(view.operations.map((operation) => operation.kind)).toEqual(["author"]);
+    expect(view.evidence).toHaveLength(0);
+    orchestrator.close();
+  }, 30_000);
 
   it("records only a real supplied merge commit", async () => {
     const fixture = targetRepository();
@@ -366,6 +682,65 @@ describe("Orchestrator", () => {
     orchestrator.close();
   }, 20_000);
 
+  it("refuses to bless an external same-parent commit during checkpoint recovery", async () => {
+    const fixture = targetRepository();
+    const provider = new FakeAuthor();
+    const orchestrator = createOrchestrator(fixture, provider, new GenericNodeProjectAdapter(), {
+      afterHarnessCommit: () => { throw new Error("simulated checkpoint crash"); },
+    });
+    await expect(orchestrator.start({
+      runId: "run-commit-replaced", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    })).rejects.toThrow("checkpoint crash");
+    const crashed = orchestrator.status("run-commit-replaced");
+    const baseCommit = crashed.run.binding?.baselineCommit;
+    expect(baseCommit).toBeTruthy();
+    git(crashed.worktreePath, ["reset", "--hard", baseCommit!]);
+    writeFileSync(join(crashed.worktreePath, "changed.txt"), "external replacement\n");
+    git(crashed.worktreePath, ["add", "changed.txt"]);
+    git(crashed.worktreePath, ["commit", "-m", "external replacement"]);
+
+    const blocked = await orchestrator.resume("run-commit-replaced");
+    expect(blocked.run.status).toBe("blocked");
+    expect(blocked.run.blocked?.reason).toContain("ambiguous");
+    expect(blocked.operations.find((operation) => operation.kind === "checkpoint-commit")).toMatchObject({
+      status: "failed",
+    });
+    expect(blocked.evidence).toHaveLength(0);
+    orchestrator.close();
+  }, 30_000);
+
+  it("never recovers a failed Provider completion as a successful Writer", async () => {
+    const fixture = targetRepository();
+    const provider = new FailedResultAuthor();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    const first = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+      faults: { afterProviderCompletion: () => { throw new Error("simulated crash after failed Provider result"); } },
+    });
+    await expect(first.start({
+      runId: "run-failed-receipt", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    })).rejects.toThrow("failed Provider result");
+    expect(first.status("run-failed-receipt").operations[0]).toMatchObject({ status: "running" });
+    first.close();
+
+    const resumed = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+    });
+    const view = await resumed.resume("run-failed-receipt");
+    expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked?.reason).toContain("unsuccessfully");
+    expect(view.operations[0]).toMatchObject({ kind: "author", status: "failed" });
+    expect(view.operations.some((operation) => operation.kind === "checkpoint-commit")).toBe(false);
+    expect(view.evidence).toHaveLength(0);
+    expect(provider.calls).toBe(1);
+    resumed.close();
+  }, 30_000);
+
   it("invalidates Evidence and blocks if an external actor replaces the Harness candidate", async () => {
     const fixture = targetRepository();
     const orchestrator = createOrchestrator(fixture, new FakeAuthor());
@@ -383,7 +758,7 @@ describe("Orchestrator", () => {
     expect(blocked.run.blocked?.reason).toContain("candidate commit");
     expect(blocked.evidence.every((item) => item.status === "invalid")).toBe(true);
     orchestrator.close();
-  }, 20_000);
+  }, 60_000);
 
   it("resumes from the saved task snapshot and fails closed if the task source is rebound", async () => {
     const fixture = targetRepository();
@@ -447,7 +822,7 @@ describe("Orchestrator", () => {
     expect([repeated.operations.length, repeated.evidence.length, repeated.events.length]).toEqual(factCounts);
     expect(repeated.run).toMatchObject({ status: "blocked", mergeSha: failedMergeSha });
     failing.close();
-  }, 30_000);
+  }, 90_000);
 });
 
 describe("CLI surface", () => {

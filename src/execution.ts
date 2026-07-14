@@ -84,6 +84,12 @@ export class GitService {
     return this.git(["rev-parse", `${commitSha}^`]).trim();
   }
 
+  controlStateHash(): string {
+    const refs = this.git(["for-each-ref", "--format=%(refname)%00%(objectname)"]);
+    const reflogs = this.git(["reflog", "show", "--all", "--format=%gd%00%H%00%gs"]);
+    return createHash("sha256").update(refs).update("\0").update(reflogs).digest("hex");
+  }
+
   commitCandidate(input: {
     baseCommit: string;
     message: string;

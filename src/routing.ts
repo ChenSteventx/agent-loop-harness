@@ -22,16 +22,16 @@ export const executionTemplates: Readonly<Record<ExecutionTemplateName, Executio
   solo: {
     name: "solo",
     steps: ["author", "verification"],
-    maximumRepairs: 0,
+    maximumRepairs: 1,
   },
   assisted: {
     name: "assisted",
     steps: ["explorer", "author", "verification"],
-    maximumRepairs: 0,
+    maximumRepairs: 1,
   },
   reviewed: {
     name: "reviewed",
-    steps: ["author", "verification", "independent-review", "repair", "verification"],
+    steps: ["author", "verification", "independent-review", "repair", "verification", "independent-review"],
     maximumRepairs: 1,
   },
 };

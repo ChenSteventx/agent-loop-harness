@@ -28,7 +28,9 @@ describe("Phase 2 integration gate", () => {
     for (const name of ["CODEX_PRIMARY", "CLAUDE_PRIMARY"] as const) {
       const profile = createProviderProfile(name, providers);
       expect(profile.author.adapter).toBe(adapter);
-      expect(executionTemplates.reviewed.steps).toEqual(["author", "verification", "independent-review", "repair", "verification"]);
+      expect(executionTemplates.reviewed.steps).toEqual([
+        "author", "verification", "independent-review", "repair", "verification", "independent-review",
+      ]);
     }
   });
 

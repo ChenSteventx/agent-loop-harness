@@ -14,10 +14,15 @@ import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { ProviderAdapter } from "./provider.js";
 import { loadTaskSpec } from "./project.js";
 import { SqliteStore } from "./store.js";
-import type { Run } from "./domain.js";
-import { canBecomeReady } from "./routing.js";
-import { routeRisk } from "./routing.js";
-import { compactExplorerReport, runExplorer, type ExplorerReport } from "./explorer.js";
+import type { Evidence, Operation, Run } from "./domain.js";
+import { executionTemplates } from "./routing.js";
+import {
+  compactExplorerReport,
+  explorerReportSchema,
+  runExplorer,
+  type ExplorerReport,
+} from "./explorer.js";
+import { decideNextAction, type NextAction, type ProofGapSnapshot } from "./loop.js";
 import {
   acceptanceHash,
   createRunBinding,
@@ -46,9 +51,14 @@ export interface OrchestratorOptions {
   providerProfileName?: string;
   commandRunner?: CommandRunner;
   explorerContextBudget?: number;
+  maxLoopSteps?: number;
   faults?: {
     afterProviderCompletion?: () => void;
     afterHarnessCommit?: () => void;
+    afterVerificationFailure?: () => void;
+    afterWriterOperationCreated?: (role: "author" | "repair") => void;
+    afterCandidateEvidenceInstalled?: () => void;
+    afterExplorerOperationCompleted?: () => void;
   };
 }
 
@@ -67,6 +77,18 @@ export interface RunView {
   worktreeExists: boolean;
 }
 
+interface WriterProviderCompletion {
+  operationId: string;
+  invocationId: string;
+  operationInputHash: string | null;
+  ok: boolean;
+  exitCode: number | null;
+  signal: string | null;
+  failureClass: string | null;
+  identity: unknown;
+  outputHash: string;
+}
+
 export class Orchestrator {
   readonly loopHome: string;
   readonly store: SqliteStore;
@@ -76,8 +98,13 @@ export class Orchestrator {
   private readonly commandRunner: CommandRunner;
   private readonly afterProviderCompletion?: () => void;
   private readonly afterHarnessCommit?: () => void;
+  private readonly afterVerificationFailure?: () => void;
+  private readonly afterWriterOperationCreated?: (role: "author" | "repair") => void;
+  private readonly afterCandidateEvidenceInstalled?: () => void;
+  private readonly afterExplorerOperationCompleted?: () => void;
   private readonly explorerContextBudget: number;
   private readonly providerProfileName: string;
+  private readonly maxLoopSteps: number;
 
   constructor(options: OrchestratorOptions) {
     this.loopHome = resolve(options.loopHome ?? process.env.LOOP_HOME ?? defaultLoopHome());
@@ -95,8 +122,16 @@ export class Orchestrator {
     this.commandRunner = options.commandRunner ?? new CommandRunner();
     this.afterProviderCompletion = options.faults?.afterProviderCompletion;
     this.afterHarnessCommit = options.faults?.afterHarnessCommit;
+    this.afterVerificationFailure = options.faults?.afterVerificationFailure;
+    this.afterWriterOperationCreated = options.faults?.afterWriterOperationCreated;
+    this.afterCandidateEvidenceInstalled = options.faults?.afterCandidateEvidenceInstalled;
+    this.afterExplorerOperationCompleted = options.faults?.afterExplorerOperationCompleted;
     this.explorerContextBudget = options.explorerContextBudget ?? 8_000;
     this.providerProfileName = options.providerProfileName ?? "LEGACY_SINGLE_PROVIDER";
+    this.maxLoopSteps = options.maxLoopSteps ?? 32;
+    if (!Number.isSafeInteger(this.maxLoopSteps) || this.maxLoopSteps <= 0) {
+      throw new Error("maxLoopSteps must be a positive integer");
+    }
   }
 
   close(): void {
@@ -130,131 +165,7 @@ export class Orchestrator {
     );
     this.store.appendEvent(runId, "worktree.created", worktree);
 
-    let explorerReport: ExplorerReport | null = null;
-    if (routeRisk(task.risk) === "assisted") {
-      const explorer = this.store.createOperation({
-        id: `${runId}:explorer`, runId, kind: "explorer", idempotencyKey: `${runId}:explorer`,
-      });
-      const explorerGit = new GitService(worktreePath);
-      const explorerHead = explorerGit.head();
-      const result = await runExplorer(this.provider, {
-        task,
-        baselineCommit: worktree.head,
-        currentCommit: new GitService(worktreePath).head(),
-        allowedRepositoryRoots: [worktreePath],
-        contextBudget: this.explorerContextBudget,
-      }, {
-        invocationId: explorer.id,
-        cwd: worktreePath,
-        artifactDirectory: resolve(this.loopHome, "runs", runId, "explorer"),
-        outputSchemaPath: this.roleOutputSchemas.explorer,
-      });
-      this.store.recordAgentCall(runId, {
-        role: "explorer", provider: result.provider.identity.provider,
-        latencyMs: result.latencyMs, usage: result.provider.usage,
-      });
-      if (explorerGit.head() !== explorerHead || explorerGit.isDirty()) {
-        this.store.finishOperation(explorer.id, "failed", {
-          report: null,
-          costTokens: result.costTokens,
-          latencyMs: result.latencyMs,
-          used: false,
-          reason: "Explorer violated the read-only workspace boundary",
-        });
-        throw new Error("Explorer violated the read-only workspace boundary");
-      }
-      explorerReport = result.report;
-      this.store.finishOperation(explorer.id, explorerReport ? "succeeded" : "failed", {
-        report: explorerReport,
-        costTokens: result.costTokens,
-        latencyMs: result.latencyMs,
-        used: result.used,
-        failureClass: result.provider.failureClass,
-      });
-    }
-
-    const authorInput = {
-      role: "author",
-      attempt: 1,
-      baseCommit: worktree.head,
-      taskSpecHash: binding.taskSpecHash,
-      acceptanceHash: binding.acceptanceHash,
-    };
-    const author = this.store.createOperation({
-      id: `${runId}:author`,
-      runId,
-      kind: "author",
-      idempotencyKey: `${runId}:author`,
-      input: authorInput,
-    });
-    const providerResult = await this.provider.run({
-      invocationId: author.id,
-      prompt: authorPrompt(task, explorerReport),
-      cwd: worktreePath,
-      artifactDirectory: resolve(this.loopHome, "runs", runId, "author"),
-      outputSchemaPath: this.roleOutputSchemas.author,
-      workspaceAccess: "workspace-write",
-      allowedRepositoryRoots: [worktreePath],
-    });
-    this.store.recordAgentCall(runId, {
-      role: "author", provider: providerResult.identity.provider,
-      latencyMs: providerResult.durationMs, usage: providerResult.usage,
-    });
-    this.afterProviderCompletion?.();
-    if (!providerResult.ok) {
-      this.store.finishOperation(author.id, "failed", providerResult);
-      this.block(runId, `Author failed: ${providerResult.failureClass ?? "unknown"}`, author.id);
-      return this.status(runId);
-    }
-    const authorOutput = authorOutputSchema.safeParse(providerResult.finalOutput);
-    if (!authorOutput.success) {
-      this.store.finishOperation(author.id, "failed", {
-        provider: providerResult,
-        reason: "Author returned output that does not match the Author schema",
-      });
-      this.block(runId, "Author returned invalid structured output", author.id);
-      return this.status(runId);
-    }
-
-    const authoredGit = new GitService(worktreePath);
-    if (authoredGit.head() !== worktree.head || !authoredGit.isDirty() || authoredGit.hasStagedChanges()) {
-      const reason = authoredGit.head() !== worktree.head
-        ? "Author changed Git HEAD; only the Harness may commit"
-        : authoredGit.hasStagedChanges()
-          ? "Author changed the Git index; only the Harness may stage files"
-          : "Author produced no working diff";
-      this.store.finishOperation(author.id, "failed", {
-        provider: providerResult,
-        reason,
-      });
-      this.block(runId, reason, author.id);
-      return this.status(runId);
-    }
-    this.store.finishOperation(author.id, "succeeded", {
-      provider: providerResult,
-      report: authorOutput.data,
-      worktreePath,
-      baseCommit: worktree.head,
-      workingDiffHash: authoredGit.diffHash(),
-    });
-    const candidate = this.ensureCandidateCommit(runId, authoredGit, author.id, 1);
-    if (!candidate) return this.status(runId);
-
-    const commands = this.projectAdapter.verificationCommands(task);
-    if (commands.length === 0) {
-      this.block(runId, "No verification commands were configured", author.id);
-      return this.status(runId);
-    }
-    const verified = await this.verifyCommands(runId, worktreePath, commands, "verify");
-    if (!verified) return this.status(runId);
-
-    if (!canBecomeReady(task.risk)) {
-      this.block(runId, "Risk must be classified before the run can become ready", "risk-classification");
-      return this.status(runId);
-    }
-
-    this.store.transitionRun(runId, "ready", {}, { commitSha: candidate.commitSha });
-    return this.status(runId);
+    return this.runUntilStable(runId);
   }
 
   status(runId: string): RunView {
@@ -291,7 +202,7 @@ export class Orchestrator {
     if (run.status !== "open") throw new Error(`Run ${runId} must be open to verify; current status is ${run.status}`);
     const task = this.loadBoundTask(runId, legacyTaskPath);
     if (!task) return this.status(runId);
-    return this.verifyOpenRun(runId, task);
+    return this.runUntilStable(runId);
   }
 
   async resume(runId: string, legacyTaskPath?: string): Promise<RunView> {
@@ -307,99 +218,496 @@ export class Orchestrator {
     }
 
     if (run.status === "merged") return this.completeMergedRun(runId, task);
-    const worktreePath = run.binding?.worktreePath ?? this.worktreePath(runId);
+    const worktreePath = this.requireBoundRun(runId).binding.worktreePath;
     if (!existsSync(worktreePath)) {
       this.block(runId, "Task worktree is missing", "worktree");
       return this.status(runId);
     }
-    const git = new GitService(worktreePath);
-    const author = this.store.listOperations(runId).find((operation) => operation.kind === "author");
-    if (!author) {
-      this.block(runId, "Author operation is missing", "author");
-      return this.status(runId);
-    }
-    if (author.status === "failed") {
-      this.block(runId, "Author operation previously failed; start a new bounded run", author.id);
-      return this.status(runId);
-    }
-    if (author.status === "running") {
-      const bound = this.requireBoundRun(runId).binding;
-      if (git.head() !== bound.baselineCommit || !git.isDirty() || git.hasStagedChanges()) {
-        this.store.finishOperation(author.id, "failed", {
-          reason: "Author recovery cannot prove a bounded working diff without Git metadata changes",
-        });
-        this.block(runId, "Author recovery found an invalid Git state", author.id);
-        return this.status(runId);
-      }
-      const finalOutputPath = resolve(this.loopHome, "runs", runId, "author", "final.json");
-      let recoveredOutput: ReturnType<typeof authorOutputSchema.safeParse> | null = null;
-      try {
-        recoveredOutput = existsSync(finalOutputPath)
-          ? authorOutputSchema.safeParse(JSON.parse(readFileSync(finalOutputPath, "utf8")) as unknown)
-          : null;
-      } catch {
-        recoveredOutput = null;
-      }
-      if (!recoveredOutput?.success) {
-        this.store.finishOperation(author.id, "failed", {
-          reason: "Author recovery is missing valid structured output",
-        });
-        this.block(runId, "Author recovery is missing its structured receipt", author.id);
-        return this.status(runId);
-      }
-      this.store.finishOperation(author.id, "succeeded", {
-        recoveredAfterProviderCompletion: true,
-        worktreePath,
-        baseCommit: bound.baselineCommit,
-        workingDiffHash: git.diffHash(),
-        report: recoveredOutput.data,
-      });
-      this.store.appendEvent(runId, "author.recovered", { operationId: author.id, workingDiffHash: git.diffHash() });
-    }
-    const candidate = this.ensureCandidateCommit(runId, git, author.id, 1);
-    if (!candidate) return this.status(runId);
-
-    const commands = this.projectAdapter.verificationCommands(task);
-    const expectedHashes = commands.map((command) =>
-      this.commandEvidenceReceipt(runId, candidate.commitSha, worktreePath, "verify", command).dependencyHash,
-    );
-    this.store.invalidateEvidenceOfKindsExcept(runId, ["command"], expectedHashes);
-    const validHashes = new Set(this.store.listEvidence(runId, "valid").map((item) => item.dependencyHash));
-
     if (run.status === "ready") {
-      if (expectedHashes.length > 0 && expectedHashes.every((hash) => validHashes.has(hash))) {
-        return this.status(runId);
-      }
+      if (this.nextAction(runId).kind === "advance-ready") return this.status(runId);
       this.store.reopenRunForInvalidEvidence(runId);
     }
-    return this.verifyOpenRun(runId, task);
+    return this.runUntilStable(runId);
   }
 
-  private async verifyOpenRun(runId: string, task: ReturnType<typeof loadTaskSpec>): Promise<RunView> {
-    const run = this.requireBoundRun(runId);
-    const worktreePath = run.binding.worktreePath;
-    const git = new GitService(worktreePath);
-    if (git.isDirty()) {
-      this.block(runId, "Task worktree is dirty; verification requires a committed state", "verify");
-      return this.status(runId);
-    }
-    const commands = this.projectAdapter.verificationCommands(task);
-    if (commands.length === 0) {
-      this.block(runId, "No verification commands were configured", "verify");
-      return this.status(runId);
-    }
-    const expectedHashes = commands.map((command) =>
-      this.commandEvidenceReceipt(runId, git.head(), worktreePath, "verify", command).dependencyHash,
-    );
-    this.store.invalidateEvidenceOfKindsExcept(runId, ["command"], expectedHashes);
-    if (await this.verifyCommands(runId, worktreePath, commands, "verify")) {
-      if (canBecomeReady(task.risk)) {
-        this.store.transitionRun(runId, "ready", {}, { commitSha: git.head() });
-      } else {
-        this.block(runId, "Risk must be classified before the run can become ready", "risk-classification");
+  private async runUntilStable(runId: string): Promise<RunView> {
+    for (let step = 0; step < this.maxLoopSteps; step += 1) {
+      const run = this.store.getRun(runId);
+      if (!run) throw new Error(`Run not found: ${runId}`);
+      if (run.status !== "open") return this.status(runId);
+      const action = this.nextAction(runId);
+      this.store.appendEvent(runId, "loop.action", { step: step + 1, action });
+      if (action.kind === "resolve-risk") {
+        if (this.store.listHumanInbox(runId).length === 0) {
+          this.store.createHumanInbox(runId, {
+            question: "Classify this task risk before execution",
+            options: ["low", "normal", "high", "cancel"],
+            recommendation: "high",
+            evidence: { taskId: run.taskId, taskSpecHash: run.binding?.taskSpecHash },
+            risk: "unknown",
+            consequence: "The Harness cannot select a safe fixed template",
+            resumeCommand: `agent-loop resume --run-id ${runId}`,
+          });
+        }
+        this.block(runId, "Risk must be classified before execution", "risk-classification");
+        return this.status(runId);
+      }
+      if (action.kind === "explore") await this.executeExplorer(runId);
+      else if (action.kind === "author") await this.executeWriter(runId, "author", action.attempt);
+      else if (action.kind === "checkpoint-commit") this.executeCheckpointCommit(runId);
+      else if (action.kind === "verify") await this.executeVerification(runId);
+      else if (action.kind === "repair") await this.executeWriter(runId, "repair", action.attempt);
+      else if (action.kind === "review") {
+        this.block(runId, "Independent Reviewer is not configured in the Runtime", "independent-review");
+        return this.status(runId);
+      } else if (action.kind === "advance-ready") {
+        const commitSha = new GitService(this.requireBoundRun(runId).binding.worktreePath).head();
+        this.store.transitionRun(runId, "ready", {}, { commitSha });
+        return this.status(runId);
+      } else if (action.kind === "block") {
+        this.block(runId, this.durableBlockReason(runId, action.reason), this.failureCheckpoint(runId));
+        return this.status(runId);
       }
     }
+    this.block(runId, "Loop step budget exhausted", "loop-budget");
     return this.status(runId);
+  }
+
+  private nextAction(runId: string): NextAction {
+    return decideNextAction(this.proofGapSnapshot(runId));
+  }
+
+  private proofGapSnapshot(runId: string): ProofGapSnapshot {
+    const run = this.requireBoundRun(runId);
+    const binding = run.binding;
+    const git = new GitService(binding.worktreePath);
+    this.reconcileCommitBoundEvidence(runId, git.head());
+    const operations = this.store.listOperations(runId);
+    const allEvidence = this.store.listEvidence(runId);
+    const validEvidence = allEvidence.filter((item) => item.status === "valid");
+    const template = executionTemplates[binding.executionTemplate];
+
+    const explorer = operations.find((operation) => operation.kind === "explorer");
+    const explorerDependencyHash = explorer
+      ? this.explorationEvidenceReceipt(runId, explorer).dependencyHash
+      : null;
+    const exploration = binding.executionTemplate !== "assisted"
+      ? "not-required"
+      : explorerDependencyHash && validEvidence.some((item) =>
+          item.kind === "exploration" && item.dependencyHash === explorerDependencyHash
+        )
+        ? "satisfied"
+        : explorer?.status === "failed"
+          ? "failed"
+          : "missing";
+
+    const writers = operations.filter((operation) => operation.kind === "author" || operation.kind === "repair");
+    const writer = writers.at(-1);
+    const recoveringCheckpoint = operations.some((operation) =>
+      operation.kind === "checkpoint-commit" && operation.status === "running"
+    );
+    const savedCheckpoint = operations.some((operation) =>
+      operation.kind === "checkpoint-commit" && operation.status === "succeeded"
+    );
+    const currentCandidate = validEvidence.some((item) =>
+      item.kind === "candidate_commit" && item.commitSha === git.head()
+    );
+    let writerProof: ProofGapSnapshot["writer"];
+    if (git.isDirty()) {
+      writerProof = writer && (writer.status === "running" || writer.status === "succeeded")
+        ? "patch-ready"
+        : "failed";
+    } else if (recoveringCheckpoint || (savedCheckpoint && !currentCandidate)) writerProof = "patch-ready";
+    else if (writer?.status === "running") writerProof = "running";
+    else if (currentCandidate) writerProof = "committed";
+    else if (!writer) writerProof = "missing";
+    else if (writer.status === "failed") writerProof = "failed";
+    else writerProof = "running";
+
+    const commands = this.projectAdapter.verificationCommands(binding.taskSpec);
+    const expectedCommandHashes = commands.map((command) =>
+      this.commandEvidenceReceipt(runId, git.head(), binding.worktreePath, "verify", command).dependencyHash
+    );
+    const validHashes = new Set(validEvidence.map((item) => item.dependencyHash));
+    const currentFailures = validEvidence.filter((item) =>
+      item.kind === "verification_failure" && item.commitSha === git.head()
+    );
+    const verification = currentFailures.length > 0
+      ? "failed"
+      : expectedCommandHashes.length > 0 && expectedCommandHashes.every((hash) => validHashes.has(hash))
+        ? "passed"
+        : "missing";
+
+    const latestFailure = currentFailures.at(-1);
+    const signature = failureEvidenceSignature(latestFailure);
+    const repeatedFailure = signature !== null && allEvidence.some((item) =>
+      item.id !== latestFailure?.id && failureEvidenceSignature(item) === signature
+    );
+    const repairsUsed = operations.filter((operation) => operation.kind === "repair").length;
+    return {
+      risk: binding.risk,
+      template: binding.executionTemplate,
+      exploration,
+      writer: writerProof,
+      verification,
+      review: binding.executionTemplate === "reviewed" ? "unavailable" : "not-required",
+      repairsUsed,
+      maximumRepairs: template.maximumRepairs,
+      repeatedFailure,
+    };
+  }
+
+  private async executeExplorer(runId: string): Promise<void> {
+    const run = this.requireBoundRun(runId);
+    const binding = run.binding;
+    const operation = this.store.createOperation({
+      id: `${runId}:explorer`,
+      runId,
+      kind: "explorer",
+      idempotencyKey: `${runId}:explorer`,
+      input: {
+        taskSpecHash: binding.taskSpecHash,
+        baselineCommit: binding.baselineCommit,
+        contextBudget: this.explorerContextBudget,
+      },
+    });
+    if (operation.status === "succeeded") {
+      this.installExplorationEvidence(runId, operation);
+      return;
+    }
+    if (operation.status !== "running") return;
+    const git = new GitService(binding.worktreePath);
+    const before = git.state();
+    const beforeControlState = git.controlStateHash();
+    const result = await runExplorer(this.provider, {
+      task: binding.taskSpec,
+      baselineCommit: binding.baselineCommit,
+      currentCommit: before.head,
+      allowedRepositoryRoots: [binding.worktreePath],
+      contextBudget: this.explorerContextBudget,
+    }, {
+      invocationId: operation.id,
+      cwd: binding.worktreePath,
+      artifactDirectory: resolve(this.loopHome, "runs", runId, "explorer"),
+      outputSchemaPath: this.roleOutputSchemas.explorer,
+    });
+    this.store.recordAgentCall(runId, {
+      role: "explorer",
+      provider: result.provider.identity.provider,
+      latencyMs: result.latencyMs,
+      usage: result.provider.usage,
+    });
+    const after = git.state();
+    if (
+      after.head !== before.head ||
+      after.dirty ||
+      after.diffHash !== before.diffHash ||
+      git.controlStateHash() !== beforeControlState
+    ) {
+      this.store.finishOperation(operation.id, "failed", {
+        reason: "Explorer violated the read-only workspace boundary",
+        provider: result.provider,
+      });
+      return;
+    }
+    const completed = this.store.finishOperation(operation.id, result.report ? "succeeded" : "failed", {
+      report: result.report,
+      costTokens: result.costTokens,
+      latencyMs: result.latencyMs,
+      used: result.used,
+      failureClass: result.provider.failureClass,
+    });
+    this.afterExplorerOperationCompleted?.();
+    if (completed.status === "succeeded") this.installExplorationEvidence(runId, completed);
+  }
+
+  private async executeWriter(
+    runId: string,
+    role: "author" | "repair",
+    attempt: number,
+  ): Promise<void> {
+    const run = this.requireBoundRun(runId);
+    const binding = run.binding;
+    const git = new GitService(binding.worktreePath);
+    if (git.isDirty()) {
+      this.block(runId, `${role} cannot start from a dirty worktree`, "worktree");
+      return;
+    }
+    const failureEvidence = role === "repair"
+      ? this.store.listEvidence(runId, "valid").filter((item) =>
+          item.kind === "verification_failure" && item.commitSha === git.head()
+        )
+      : [];
+    const operationId = role === "author" ? `${runId}:author` : `${runId}:repair:${attempt}`;
+    const input = {
+      role,
+      attempt,
+      baseCommit: git.head(),
+      gitControlHash: git.controlStateHash(),
+      taskSpecHash: binding.taskSpecHash,
+      acceptanceHash: binding.acceptanceHash,
+      failureEvidenceIds: failureEvidence.map((item) => item.id),
+      failureSignatures: failureEvidence.map(failureEvidenceSignature).filter((value): value is string => value !== null),
+    };
+    const existingOperation = this.store.getOperation(operationId);
+    const operation = this.store.createOperation({
+      id: operationId,
+      runId,
+      kind: role,
+      idempotencyKey: operationId,
+      input,
+    });
+    if (operation.status !== "running") return;
+    const completedReceipt = this.writerProviderReceipt(runId, operation.id);
+    if (completedReceipt) {
+      this.store.finishOperation(operation.id, "failed", {
+        reason: completedReceipt.ok
+          ? "Completed Writer call produced no recoverable working diff"
+          : "Writer Provider call completed unsuccessfully",
+        providerCompletion: completedReceipt,
+      });
+      return;
+    }
+    if (!existingOperation) this.afterWriterOperationCreated?.(role);
+    const explorerReport = this.savedExplorerReport(runId);
+    const providerResult = await this.provider.run({
+      invocationId: operation.id,
+      prompt: role === "author"
+        ? authorPrompt(binding.taskSpec, explorerReport)
+        : repairPrompt(binding.taskSpec, attempt, git.head(), failureEvidence),
+      cwd: binding.worktreePath,
+      artifactDirectory: this.writerArtifactDirectory(runId, role, attempt),
+      outputSchemaPath: this.roleOutputSchemas.author,
+      workspaceAccess: "workspace-write",
+      allowedRepositoryRoots: [binding.worktreePath],
+    });
+    this.store.recordAgentCall(runId, {
+      role,
+      provider: providerResult.identity.provider,
+      latencyMs: providerResult.durationMs,
+      usage: providerResult.usage,
+    });
+    this.store.appendEvent(runId, "writer.provider-completed", {
+      operationId: operation.id,
+      invocationId: providerResult.invocationId,
+      operationInputHash: operation.inputHash,
+      ok: providerResult.ok,
+      exitCode: providerResult.exitCode,
+      signal: providerResult.signal,
+      failureClass: providerResult.failureClass,
+      identity: providerResult.identity,
+      outputHash: operationInputHash(providerResult.finalOutput),
+    });
+    this.afterProviderCompletion?.();
+    if (!providerResult.ok) {
+      this.store.finishOperation(operation.id, "failed", providerResult);
+      return;
+    }
+    const output = authorOutputSchema.safeParse(providerResult.finalOutput);
+    const reason = writerBoundaryViolation(git, input.baseCommit, output.success, input.gitControlHash);
+    if (reason) {
+      this.store.finishOperation(operation.id, "failed", { provider: providerResult, reason });
+      return;
+    }
+    this.store.finishOperation(operation.id, "succeeded", {
+      provider: providerResult,
+      report: output.success ? output.data : null,
+      worktreePath: binding.worktreePath,
+      baseCommit: input.baseCommit,
+      workingDiffHash: git.diffHash(),
+    });
+  }
+
+  private executeCheckpointCommit(runId: string): void {
+    const run = this.requireBoundRun(runId);
+    const git = new GitService(run.binding.worktreePath);
+    let writer = this.store.listOperations(runId)
+      .filter((operation) => operation.kind === "author" || operation.kind === "repair")
+      .at(-1);
+    if (!writer) {
+      this.block(runId, "No writer operation can own the pending diff", "checkpoint-commit");
+      return;
+    }
+    if (writer.status === "running") writer = this.recoverWriterOperation(runId, writer, git);
+    if (writer.status !== "succeeded") {
+      this.block(runId, this.durableBlockReason(runId, "Writer receipt is not recoverable"), writer.id);
+      return;
+    }
+    const input = writerOperationInput(writer.input);
+    const commitAttempt = writer.kind === "author" ? 1 : input.attempt + 1;
+    const candidate = this.ensureCandidateCommit(runId, git, writer.id, commitAttempt, input.baseCommit);
+    if (!candidate) return;
+    this.afterCandidateEvidenceInstalled?.();
+  }
+
+  private async executeVerification(runId: string): Promise<void> {
+    const run = this.requireBoundRun(runId);
+    const commands = this.projectAdapter.verificationCommands(run.binding.taskSpec);
+    if (commands.length === 0) {
+      this.block(runId, "No verification commands were configured", "verify");
+      return;
+    }
+    const git = new GitService(run.binding.worktreePath);
+    if (git.isDirty()) {
+      this.block(runId, "Verification requires a clean Harness candidate", "verify");
+      return;
+    }
+    await this.verifyCommands(runId, run.binding.worktreePath, commands, "verify");
+  }
+
+  private recoverWriterOperation(runId: string, operation: Operation, git: GitService): Operation {
+    const input = writerOperationInput(operation.input);
+    const output = this.readWriterOutput(runId, operation.kind as "author" | "repair", input.attempt);
+    const completion = this.writerProviderReceipt(runId, operation.id);
+    const completionReason = !completion
+      ? "Writer recovery is missing a durable Provider completion receipt"
+      : completion.invocationId !== operation.id || completion.operationInputHash !== operation.inputHash
+        ? "Writer Provider completion receipt does not match the persisted operation"
+        : !completion.ok
+          ? "Writer Provider call completed unsuccessfully"
+          : !output || completion.outputHash !== operationInputHash(output)
+            ? "Writer Provider output does not match its durable completion receipt"
+            : null;
+    const reason = completionReason ?? writerBoundaryViolation(
+      git,
+      input.baseCommit,
+      output !== null,
+      input.gitControlHash,
+    );
+    if (reason || !output) {
+      return this.store.finishOperation(operation.id, "failed", {
+        reason: reason ?? "Writer recovery is missing valid structured output",
+        providerCompletion: completion,
+      });
+    }
+    const recovered = this.store.finishOperation(operation.id, "succeeded", {
+      recoveredAfterProviderCompletion: true,
+      baseCommit: input.baseCommit,
+      workingDiffHash: git.diffHash(),
+      report: output,
+    });
+    this.store.appendEvent(runId, `${operation.kind}.recovered`, {
+      operationId: operation.id,
+      workingDiffHash: git.diffHash(),
+    });
+    return recovered;
+  }
+
+  private writerProviderReceipt(runId: string, operationId: string): WriterProviderCompletion | null {
+    const event = [...this.store.listEvents(runId)].reverse().find((item) =>
+      item.type === "writer.provider-completed" &&
+      isRecord(item.data) &&
+      item.data.operationId === operationId
+    );
+    if (!event || !isRecord(event.data)) return null;
+    const data = event.data;
+    if (
+      typeof data.operationId !== "string" ||
+      typeof data.invocationId !== "string" ||
+      !(typeof data.operationInputHash === "string" || data.operationInputHash === null) ||
+      typeof data.ok !== "boolean" ||
+      !(typeof data.exitCode === "number" || data.exitCode === null) ||
+      !(typeof data.signal === "string" || data.signal === null) ||
+      !(typeof data.failureClass === "string" || data.failureClass === null) ||
+      typeof data.outputHash !== "string"
+    ) return null;
+    return data as unknown as WriterProviderCompletion;
+  }
+
+  private explorationEvidenceReceipt(
+    runId: string,
+    operation: Operation,
+  ): { dependencies: ReturnType<typeof evidenceDependencies>; dependencyHash: string; stepId: string } {
+    const run = this.requireBoundRun(runId);
+    const stepId = "exploration";
+    const dependencies = evidenceDependencies({
+      commitSha: run.binding.baselineCommit,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      operationInputHash: operation.inputHash ?? operationInputHash(operation.input),
+    });
+    return { dependencies, dependencyHash: evidenceDependencyHash(dependencies), stepId };
+  }
+
+  private installExplorationEvidence(runId: string, operation: Operation): Evidence | null {
+    const result = isRecord(operation.result) ? operation.result : null;
+    const report = result ? explorerReportSchema.safeParse(result.report) : null;
+    if (!report?.success) {
+      this.block(runId, "Saved Explorer result cannot prove a valid bounded report", operation.id);
+      return null;
+    }
+    const run = this.requireBoundRun(runId);
+    const receipt = this.explorationEvidenceReceipt(runId, operation);
+    return this.store.installEvidence({
+      id: `${runId}:evidence:exploration:${receipt.dependencyHash.slice(0, 12)}`,
+      runId,
+      operationId: operation.id,
+      kind: "exploration",
+      commitSha: run.binding.baselineCommit,
+      policyVersion: run.binding.policyVersion,
+      stepId: receipt.stepId,
+      dependencyHash: receipt.dependencyHash,
+      dependencies: receipt.dependencies,
+      data: { report: report.data, result: operation.result },
+    });
+  }
+
+  private reconcileCommitBoundEvidence(runId: string, currentCommit: string): void {
+    const kinds = [
+      "candidate_commit",
+      "command",
+      "verification_failure",
+      "independent_review",
+      "acceptance_binding",
+    ];
+    const currentHashes = this.store.listEvidence(runId, "valid")
+      .filter((item) => kinds.includes(item.kind) && item.commitSha === currentCommit)
+      .map((item) => item.dependencyHash);
+    this.store.invalidateEvidenceOfKindsExcept(runId, kinds, currentHashes);
+  }
+
+  private readWriterOutput(
+    runId: string,
+    role: "author" | "repair",
+    attempt: number,
+  ): ReturnType<typeof authorOutputSchema.parse> | null {
+    const path = resolve(this.writerArtifactDirectory(runId, role, attempt), "final.json");
+    try {
+      return existsSync(path) ? authorOutputSchema.parse(JSON.parse(readFileSync(path, "utf8")) as unknown) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private writerArtifactDirectory(runId: string, role: "author" | "repair", attempt: number): string {
+    return role === "author"
+      ? resolve(this.loopHome, "runs", runId, "author")
+      : resolve(this.loopHome, "runs", runId, "repair", String(attempt));
+  }
+
+  private savedExplorerReport(runId: string): ExplorerReport | null {
+    const result = this.store.listOperations(runId).find((operation) => operation.kind === "explorer")?.result;
+    const parsed = isRecord(result) ? explorerReportSchema.safeParse(result.report) : null;
+    return parsed?.success ? parsed.data : null;
+  }
+
+  private failureCheckpoint(runId: string): string {
+    const operations = this.store.listOperations(runId);
+    const failed = [...operations].reverse().find((operation) => operation.status === "failed");
+    if (failed) return failed.id;
+    const evidence = [...this.store.listEvidence(runId)].reverse().find((item) =>
+      item.kind === "verification_failure"
+    );
+    return evidence?.operationId ?? "proof-gap";
+  }
+
+  private durableBlockReason(runId: string, fallback: string): string {
+    const failed = [...this.store.listOperations(runId)].reverse().find((operation) => operation.status === "failed");
+    return failed && isRecord(failed.result) && typeof failed.result.reason === "string"
+      ? failed.result.reason
+      : fallback;
   }
 
   private async completeMergedRun(runId: string, task: ReturnType<typeof loadTaskSpec>): Promise<RunView> {
@@ -471,11 +779,16 @@ export class Orchestrator {
         return false;
       }
       if (operation.status === "failed") {
-        this.block(runId, `Previous ${stepId} operation failed`, operation.id);
+        if (phase === "verify" && isCommandFailureResult(operation.result)) {
+          this.installVerificationFailure(runId, operation, command, commitSha, receipt.operationInput);
+        } else {
+          this.block(runId, `Previous ${stepId} operation failed`, operation.id);
+        }
         return false;
       }
+      let result;
       try {
-        const result = await this.commandRunner.run({
+        result = await this.commandRunner.run({
           argv: command.argv,
           cwd: worktreePath,
           artifactDirectory: resolve(this.loopHome, "runs", runId, phase, command.id),
@@ -483,30 +796,92 @@ export class Orchestrator {
           timeoutMs: 10 * 60_000,
           outputLimitBytes: 1024 * 1024,
         });
-        this.store.finishOperation(operation.id, result.exitCode === 0 ? "succeeded" : "failed", result);
-        if (result.exitCode !== 0) {
-          this.block(runId, `Verification ${command.id} failed with exit ${result.exitCode}`, operation.id);
-          return false;
-        }
-        this.store.installEvidence({
-          id: `${runId}:evidence:${phase}:${command.id}:${dependencyHash.slice(0, 12)}`,
-          runId,
-          operationId: operation.id,
-          kind: "command",
-          commitSha,
-          policyVersion: this.projectAdapter.policyVersion,
-          stepId,
-          dependencyHash,
-          dependencies: receipt.dependencies,
-          data: result,
-        });
       } catch (error) {
         this.store.finishOperation(operation.id, "failed", { error: errorMessage(error) });
         this.block(runId, `Verification ${command.id} could not run: ${errorMessage(error)}`, operation.id);
         return false;
       }
+      const succeeded = isSuccessfulCommandResult(result, commitSha, command.argv);
+      this.store.finishOperation(operation.id, succeeded ? "succeeded" : "failed", result);
+      if (!succeeded) {
+        if (phase === "verify") {
+          this.installVerificationFailure(runId, operation, command, commitSha, receipt.operationInput, result);
+        } else {
+          this.block(
+            runId,
+            `Post-merge verification ${command.id} failed or produced an invalid process receipt`,
+            operation.id,
+          );
+        }
+        return false;
+      }
+      this.store.installEvidence({
+        id: `${runId}:evidence:${phase}:${command.id}:${dependencyHash.slice(0, 12)}`,
+        runId,
+        operationId: operation.id,
+        kind: "command",
+        commitSha,
+        policyVersion: this.projectAdapter.policyVersion,
+        stepId,
+        dependencyHash,
+        dependencies: receipt.dependencies,
+        data: result,
+      });
     }
     return true;
+  }
+
+  private installVerificationFailure(
+    runId: string,
+    operation: Operation,
+    command: VerificationCommand,
+    commitSha: string,
+    operationInput: unknown,
+    suppliedResult?: unknown,
+  ): Evidence {
+    const run = this.requireBoundRun(runId);
+    const result = suppliedResult ?? operation.result;
+    const stderr = commandArtifactText(result, "stderrPath");
+    const stdout = commandArtifactText(result, "stdoutPath");
+    const signature = operationInputHash({
+      commandId: command.id,
+      exitCode: isRecord(result) ? result.exitCode : null,
+      signal: isRecord(result) ? result.signal : null,
+      timedOut: isRecord(result) ? result.timedOut : null,
+      stderr,
+      stdout,
+    });
+    const stepId = `verification-failure:${command.id}`;
+    const dependencies = evidenceDependencies({
+      commitSha,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      operationInputHash: operationInputHash(operationInput),
+    });
+    const dependencyHash = evidenceDependencyHash(dependencies);
+    const evidence = this.store.installEvidence({
+      id: `${runId}:evidence:failure:${command.id}:${dependencyHash.slice(0, 12)}`,
+      runId,
+      operationId: operation.id,
+      kind: "verification_failure",
+      commitSha,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      dependencyHash,
+      dependencies,
+      data: {
+        signature,
+        commandId: command.id,
+        argv: [...command.argv],
+        result,
+        stderr,
+        stdout,
+      },
+    });
+    this.afterVerificationFailure?.();
+    return evidence;
   }
 
   private ensureCandidateCommit(
@@ -557,24 +932,32 @@ export class Orchestrator {
           return null;
         }
         candidate = git.commitCandidate({ baseCommit: input.baseCommit, message: input.message });
+        this.store.appendEvent(runId, "candidate-commit.created", {
+          operationId: operation.id,
+          candidate,
+        });
         this.afterHarnessCommit?.();
       } else {
-        if (git.isDirty() || git.parent() !== input.baseCommit) {
+        const receipt = this.candidateCommitReceipt(runId, operation.id);
+        if (
+          !receipt ||
+          git.isDirty() ||
+          git.head() !== receipt.commitSha ||
+          git.parent() !== input.baseCommit ||
+          receipt.baseCommit !== input.baseCommit ||
+          receipt.message !== input.message ||
+          receipt.diffHash !== git.diffHashBetween(input.baseCommit) ||
+          receipt.authorName !== "Agent Loop Harness" ||
+          receipt.authorEmail !== "agent-loop@localhost"
+        ) {
           this.store.finishOperation(operation.id, "failed", {
-            reason: "Cannot recover a unique Harness-owned candidate commit",
+            reason: "Cannot recover the exact durable Harness-owned candidate commit",
             currentHead: git.head(),
           });
           this.block(runId, "Candidate commit recovery is ambiguous", operation.id);
           return null;
         }
-        candidate = {
-          baseCommit: input.baseCommit,
-          commitSha: git.head(),
-          diffHash: git.diffHashBetween(input.baseCommit),
-          message: input.message,
-          authorName: "Agent Loop Harness",
-          authorEmail: "agent-loop@localhost",
-        };
+        candidate = receipt;
         this.store.appendEvent(runId, "candidate-commit.recovered", {
           operationId: operation.id,
           commitSha: candidate.commitSha,
@@ -601,7 +984,7 @@ export class Orchestrator {
       operationInputHash: operationInputHash(operationInput),
     });
     const dependencyHash = evidenceDependencyHash(dependencies);
-    this.store.installEvidence({
+    this.store.installEvidenceReplacingKinds({
       id: `${runId}:evidence:candidate:${dependencyHash.slice(0, 12)}`,
       runId,
       operationId: operation.id,
@@ -612,8 +995,22 @@ export class Orchestrator {
       dependencyHash,
       dependencies,
       data: candidate,
-    });
+    }, ["candidate_commit", "command", "verification_failure", "independent_review", "acceptance_binding"]);
     return candidate;
+  }
+
+  private candidateCommitReceipt(runId: string, operationId: string): CandidateCommit | null {
+    const event = [...this.store.listEvents(runId)].reverse().find((item) =>
+      item.type === "candidate-commit.created" &&
+      isRecord(item.data) &&
+      item.data.operationId === operationId
+    );
+    if (!event || !isRecord(event.data)) return null;
+    try {
+      return candidateCommitResult(event.data.candidate);
+    } catch {
+      return null;
+    }
   }
 
   private commandEvidenceReceipt(
@@ -815,4 +1212,75 @@ function candidateCommitResult(value: unknown): CandidateCommit {
     throw new Error("Candidate commit operation has invalid persisted result");
   }
   return value as unknown as CandidateCommit;
+}
+
+function writerOperationInput(value: unknown): { baseCommit: string; attempt: number; gitControlHash: string } {
+  if (
+    !isRecord(value) ||
+    typeof value.baseCommit !== "string" ||
+    typeof value.gitControlHash !== "string" ||
+    typeof value.attempt !== "number" ||
+    !Number.isSafeInteger(value.attempt) ||
+    value.attempt <= 0
+  ) {
+    throw new Error("Writer operation has invalid persisted input");
+  }
+  return { baseCommit: value.baseCommit, attempt: value.attempt, gitControlHash: value.gitControlHash };
+}
+
+function writerBoundaryViolation(
+  git: GitService,
+  baseCommit: string,
+  validOutput: boolean,
+  expectedControlHash: string,
+): string | null {
+  if (git.head() !== baseCommit) return "Writer changed Git HEAD; only the Harness may commit";
+  if (git.hasStagedChanges()) return "Writer changed the Git index; only the Harness may stage files";
+  if (git.controlStateHash() !== expectedControlHash) {
+    return "Writer changed Git refs or reflogs; only the Harness may change Git control state";
+  }
+  if (!git.isDirty()) return "Writer produced no working diff";
+  if (!validOutput) return "Writer returned invalid structured output";
+  return null;
+}
+
+function repairPrompt(
+  task: ReturnType<typeof loadTaskSpec>,
+  attempt: number,
+  currentCommit: string,
+  failureEvidence: readonly Evidence[],
+): string {
+  return [
+    `Role: bounded Repair attempt ${attempt}.`,
+    `Task: ${task.id}`,
+    `Goal: ${task.goal}`,
+    `Acceptance: ${JSON.stringify(task.acceptance)}`,
+    `Current candidate commit: ${currentCommit}`,
+    `Deterministic failure evidence: ${JSON.stringify(failureEvidence.map((item) => ({ id: item.id, data: item.data })))}`,
+    "Fix only the demonstrated failure within the task scope.",
+    "Edit files only; do not run git add, git commit, or change Git metadata.",
+    "Leave a non-empty working diff for the Harness to inspect and commit deterministically.",
+    "Return only a concise summary and the changedFiles array required by the Author output schema.",
+  ].join("\n");
+}
+
+function failureEvidenceSignature(evidence: Evidence | undefined): string | null {
+  return evidence && isRecord(evidence.data) && typeof evidence.data.signature === "string"
+    ? evidence.data.signature
+    : null;
+}
+
+function isCommandFailureResult(value: unknown): boolean {
+  return isRecord(value) &&
+    Array.isArray(value.argv) &&
+    (value.exitCode !== 0 || value.timedOut === true || value.signal !== null);
+}
+
+function commandArtifactText(value: unknown, field: "stdoutPath" | "stderrPath"): string {
+  if (!isRecord(value) || typeof value[field] !== "string" || !existsSync(value[field])) return "";
+  try {
+    return readFileSync(value[field], "utf8");
+  } catch {
+    return "";
+  }
 }
