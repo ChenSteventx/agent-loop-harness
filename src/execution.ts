@@ -13,6 +13,15 @@ export interface GitState {
   diffHash: string;
 }
 
+export interface CandidateCommit {
+  baseCommit: string;
+  commitSha: string;
+  diffHash: string;
+  message: string;
+  authorName: string;
+  authorEmail: string;
+}
+
 export class GitService {
   readonly root: string;
 
@@ -53,6 +62,71 @@ export class GitService {
 
   diffHash(): string {
     return createHash("sha256").update(this.diff()).digest("hex");
+  }
+
+  stagedDiff(): string {
+    return this.git(["diff", "--cached", "--binary", "HEAD"]);
+  }
+
+  hasStagedChanges(): boolean {
+    return this.stagedDiff().length > 0;
+  }
+
+  diffBetween(baseCommit: string, commitSha = "HEAD"): string {
+    return this.git(["diff", "--binary", baseCommit, commitSha]);
+  }
+
+  diffHashBetween(baseCommit: string, commitSha = "HEAD"): string {
+    return createHash("sha256").update(this.diffBetween(baseCommit, commitSha)).digest("hex");
+  }
+
+  parent(commitSha = "HEAD"): string {
+    return this.git(["rev-parse", `${commitSha}^`]).trim();
+  }
+
+  commitCandidate(input: {
+    baseCommit: string;
+    message: string;
+    authorName?: string;
+    authorEmail?: string;
+  }): CandidateCommit {
+    if (this.head() !== input.baseCommit) {
+      throw new Error("Candidate commit base does not match the current HEAD");
+    }
+    if (!this.isDirty()) throw new Error("Candidate commit requires a non-empty working diff");
+    if (this.hasStagedChanges()) {
+      throw new Error("Provider changed the Git index; only the Harness may stage candidate files");
+    }
+    const message = requiredText(input.message, "Candidate commit message");
+    const authorName = requiredText(input.authorName ?? "Agent Loop Harness", "Candidate author name");
+    const authorEmail = requiredText(input.authorEmail ?? "agent-loop@localhost", "Candidate author email");
+    this.git(["add", "--all"]);
+    const stagedDiff = this.stagedDiff();
+    if (!stagedDiff) throw new Error("Candidate staging produced an empty diff");
+    const stagedDiffHash = createHash("sha256").update(stagedDiff).digest("hex");
+    this.git([
+      "-c", `user.name=${authorName}`,
+      "-c", `user.email=${authorEmail}`,
+      "-c", "commit.gpgSign=false",
+      "commit", "--no-verify", "--no-gpg-sign", "-m", message,
+    ]);
+    const commitSha = this.head();
+    if (this.parent(commitSha) !== input.baseCommit) {
+      throw new Error("Harness candidate commit has an unexpected parent");
+    }
+    const committedDiffHash = this.diffHashBetween(input.baseCommit, commitSha);
+    if (committedDiffHash !== stagedDiffHash) {
+      throw new Error("Committed candidate diff does not match the staged Harness diff");
+    }
+    if (this.isDirty()) throw new Error("Harness candidate commit left a dirty worktree");
+    return {
+      baseCommit: input.baseCommit,
+      commitSha,
+      diffHash: committedDiffHash,
+      message,
+      authorName,
+      authorEmail,
+    };
   }
 
   state(): GitState {
@@ -272,6 +346,11 @@ function normalizeExisting(path: string): string {
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+function requiredText(value: string, name: string): string {
+  if (!value.trim()) throw new Error(`${name} is required`);
+  return value;
 }
 
 export function safeBranchName(taskId: string, runId: string): string {

@@ -78,8 +78,6 @@ class FakeAuthor implements ProviderAdapter {
     const explorer = request.workspaceAccess === "read-only";
     if (this.succeeds && !explorer) {
       writeFileSync(join(request.cwd, "changed.txt"), "created by fake author\n");
-      git(request.cwd, ["add", "changed.txt"]);
-      git(request.cwd, ["commit", "-m", "feat: add requested file"]);
     }
     const result: ProviderRunResult = {
       invocationId: request.invocationId,
@@ -119,6 +117,17 @@ class FakeAuthor implements ProviderAdapter {
   }
 }
 
+class CommittingAuthor extends FakeAuthor {
+  override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    const result = await super.run(request);
+    if (request.workspaceAccess !== "read-only") {
+      git(request.cwd, ["add", "changed.txt"]);
+      git(request.cwd, ["commit", "-m", "malicious provider commit"]);
+    }
+    return result;
+  }
+}
+
 class WritingExplorer extends FakeAuthor {
   override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
     if (request.workspaceAccess === "read-only") {
@@ -132,7 +141,7 @@ function createOrchestrator(
   fixture: ReturnType<typeof targetRepository>,
   provider: ProviderAdapter,
   projectAdapter: ProjectAdapter = new GenericNodeProjectAdapter(),
-  faults?: { afterProviderCompletion?: () => void },
+  faults?: { afterProviderCompletion?: () => void; afterHarnessCommit?: () => void },
 ): Orchestrator {
   const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
   temporaryDirectories.push(loopHome);
@@ -164,12 +173,17 @@ describe("Orchestrator", () => {
 
     expect(view.run.status).toBe("ready");
     expect(view.worktreePath).not.toBe(fixture.root);
-    expect(provider.requests[0]?.additionalWritableDirectories).toEqual([
-      resolve(fixture.root, ".git"),
-    ]);
-    expect(view.evidence).toHaveLength(1);
-    expect((view.evidence[0]?.data as { exitCode: number }).exitCode).toBe(0);
-    expect(view.operations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded"]);
+    expect(provider.requests[0]).toMatchObject({
+      workspaceAccess: "workspace-write",
+      allowedRepositoryRoots: [view.worktreePath],
+    });
+    expect(provider.requests[0]?.additionalWritableDirectories).toBeUndefined();
+    expect(view.evidence.map((item) => item.kind)).toEqual(["candidate_commit", "command"]);
+    expect((view.evidence.find((item) => item.kind === "command")?.data as { exitCode: number }).exitCode).toBe(0);
+    expect(view.operations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded", "succeeded"]);
+    expect(git(view.worktreePath, ["show", "-s", "--format=%an <%ae>", "HEAD"])).toBe(
+      "Agent Loop Harness <agent-loop@localhost>",
+    );
     orchestrator.close();
   }, 20_000);
 
@@ -196,7 +210,7 @@ describe("Orchestrator", () => {
       targetRepository: missingFixture.root,
     });
     expect(missingView.run.status).toBe("blocked");
-    expect(missingView.evidence).toHaveLength(0);
+    expect(missingView.evidence.map((item) => item.kind)).toEqual(["candidate_commit"]);
     missing.close();
   }, 20_000);
 
@@ -214,7 +228,7 @@ describe("Orchestrator", () => {
       previousStatus: "open",
       checkpointRef: "risk-classification",
     });
-    expect(view.evidence).toHaveLength(1);
+    expect(view.evidence).toHaveLength(2);
     orchestrator.close();
   }, 20_000);
 
@@ -270,6 +284,20 @@ describe("Orchestrator", () => {
     orchestrator.close();
   }, 20_000);
 
+  it("rejects a Provider-created commit and never grants the Git common directory", async () => {
+    const fixture = targetRepository();
+    const provider = new CommittingAuthor();
+    const orchestrator = createOrchestrator(fixture, provider);
+    const view = await orchestrator.start({
+      runId: "run-provider-commit", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+    expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked?.reason).toContain("only the Harness may commit");
+    expect(view.operations.map((operation) => operation.kind)).toEqual(["author"]);
+    expect(provider.requests[0]?.additionalWritableDirectories).toBeUndefined();
+    orchestrator.close();
+  }, 20_000);
+
   it("records only a real supplied merge commit", async () => {
     const fixture = targetRepository();
     const orchestrator = createOrchestrator(fixture, new FakeAuthor());
@@ -312,7 +340,33 @@ describe("Orchestrator", () => {
     orchestrator.close();
   }, 20_000);
 
-  it("invalidates commit-bound evidence and re-verifies exactly once", async () => {
+  it("recovers a crash after the Harness commit without invoking the Author again", async () => {
+    const fixture = targetRepository();
+    const provider = new FakeAuthor();
+    let crash = true;
+    const orchestrator = createOrchestrator(fixture, provider, new GenericNodeProjectAdapter(), {
+      afterHarnessCommit: () => {
+        if (crash) {
+          crash = false;
+          throw new Error("simulated crash after Harness commit");
+        }
+      },
+    });
+    await expect(orchestrator.start({
+      runId: "run-commit-crash", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    })).rejects.toThrow("simulated crash after Harness commit");
+    expect(orchestrator.status("run-commit-crash").operations.at(-1)).toMatchObject({
+      kind: "checkpoint-commit", status: "running",
+    });
+
+    const resumed = await orchestrator.resume("run-commit-crash");
+    expect(resumed.run.status).toBe("ready");
+    expect(provider.calls).toBe(1);
+    expect(resumed.events.some((event) => event.type === "candidate-commit.recovered")).toBe(true);
+    orchestrator.close();
+  }, 20_000);
+
+  it("invalidates Evidence and blocks if an external actor replaces the Harness candidate", async () => {
     const fixture = targetRepository();
     const orchestrator = createOrchestrator(fixture, new FakeAuthor());
     const ready = await orchestrator.start({
@@ -320,18 +374,14 @@ describe("Orchestrator", () => {
       taskPath: fixture.taskPath,
       targetRepository: fixture.root,
     });
-    const originalHash = ready.evidence[0]?.dependencyHash;
     writeFileSync(join(ready.worktreePath, "follow-up.txt"), "new committed state\n");
     git(ready.worktreePath, ["add", "follow-up.txt"]);
     git(ready.worktreePath, ["commit", "-m", "test: change evidence dependency"]);
 
-    const reverified = await orchestrator.resume("run-invalidate", fixture.taskPath);
-    expect(reverified.run.status).toBe("ready");
-    expect(reverified.evidence).toHaveLength(2);
-    expect(reverified.evidence.find((item) => item.dependencyHash === originalHash)?.status).toBe("invalid");
-    expect(reverified.evidence.filter((item) => item.status === "valid")).toHaveLength(1);
-    const eventCount = reverified.events.length;
-    expect((await orchestrator.resume("run-invalidate", fixture.taskPath)).events).toHaveLength(eventCount);
+    const blocked = await orchestrator.resume("run-invalidate");
+    expect(blocked.run.status).toBe("blocked");
+    expect(blocked.run.blocked?.reason).toContain("candidate commit");
+    expect(blocked.evidence.every((item) => item.status === "invalid")).toBe(true);
     orchestrator.close();
   }, 20_000);
 

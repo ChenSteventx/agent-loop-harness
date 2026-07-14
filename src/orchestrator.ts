@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
-import { CommandRunner, GitService, WorktreeService, safeBranchName } from "./execution.js";
+import {
+  CommandRunner,
+  GitService,
+  WorktreeService,
+  safeBranchName,
+  type CandidateCommit,
+} from "./execution.js";
 import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { ProviderAdapter } from "./provider.js";
 import { loadTaskSpec } from "./project.js";
@@ -42,6 +48,7 @@ export interface OrchestratorOptions {
   explorerContextBudget?: number;
   faults?: {
     afterProviderCompletion?: () => void;
+    afterHarnessCommit?: () => void;
   };
 }
 
@@ -68,6 +75,7 @@ export class Orchestrator {
   private readonly roleOutputSchemas: RoleOutputSchemas;
   private readonly commandRunner: CommandRunner;
   private readonly afterProviderCompletion?: () => void;
+  private readonly afterHarnessCommit?: () => void;
   private readonly explorerContextBudget: number;
   private readonly providerProfileName: string;
 
@@ -86,6 +94,7 @@ export class Orchestrator {
     };
     this.commandRunner = options.commandRunner ?? new CommandRunner();
     this.afterProviderCompletion = options.faults?.afterProviderCompletion;
+    this.afterHarnessCommit = options.faults?.afterHarnessCommit;
     this.explorerContextBudget = options.explorerContextBudget ?? 8_000;
     this.providerProfileName = options.providerProfileName ?? "LEGACY_SINGLE_PROVIDER";
   }
@@ -164,11 +173,19 @@ export class Orchestrator {
       });
     }
 
+    const authorInput = {
+      role: "author",
+      attempt: 1,
+      baseCommit: worktree.head,
+      taskSpecHash: binding.taskSpecHash,
+      acceptanceHash: binding.acceptanceHash,
+    };
     const author = this.store.createOperation({
       id: `${runId}:author`,
       runId,
       kind: "author",
       idempotencyKey: `${runId}:author`,
+      input: authorInput,
     });
     const providerResult = await this.provider.run({
       invocationId: author.id,
@@ -176,7 +193,8 @@ export class Orchestrator {
       cwd: worktreePath,
       artifactDirectory: resolve(this.loopHome, "runs", runId, "author"),
       outputSchemaPath: this.roleOutputSchemas.author,
-      additionalWritableDirectories: [sourceGit.commonDirectory()],
+      workspaceAccess: "workspace-write",
+      allowedRepositoryRoots: [worktreePath],
     });
     this.store.recordAgentCall(runId, {
       role: "author", provider: providerResult.identity.provider,
@@ -199,24 +217,28 @@ export class Orchestrator {
     }
 
     const authoredGit = new GitService(worktreePath);
-    if (authoredGit.isDirty() || authoredGit.head() === worktree.head) {
+    if (authoredGit.head() !== worktree.head || !authoredGit.isDirty() || authoredGit.hasStagedChanges()) {
+      const reason = authoredGit.head() !== worktree.head
+        ? "Author changed Git HEAD; only the Harness may commit"
+        : authoredGit.hasStagedChanges()
+          ? "Author changed the Git index; only the Harness may stage files"
+          : "Author produced no working diff";
       this.store.finishOperation(author.id, "failed", {
         provider: providerResult,
-        reason: authoredGit.isDirty() ? "Author left a dirty worktree" : "Author produced no commit",
+        reason,
       });
-      this.block(
-        runId,
-        authoredGit.isDirty() ? "Author left a dirty worktree" : "Author produced no commit",
-        author.id,
-      );
+      this.block(runId, reason, author.id);
       return this.status(runId);
     }
     this.store.finishOperation(author.id, "succeeded", {
       provider: providerResult,
       report: authorOutput.data,
       worktreePath,
-      commitSha: authoredGit.head(),
+      baseCommit: worktree.head,
+      workingDiffHash: authoredGit.diffHash(),
     });
+    const candidate = this.ensureCandidateCommit(runId, authoredGit, author.id, 1);
+    if (!candidate) return this.status(runId);
 
     const commands = this.projectAdapter.verificationCommands(task);
     if (commands.length === 0) {
@@ -231,7 +253,7 @@ export class Orchestrator {
       return this.status(runId);
     }
 
-    this.store.transitionRun(runId, "ready", {}, { commitSha: authoredGit.head() });
+    this.store.transitionRun(runId, "ready", {}, { commitSha: candidate.commitSha });
     return this.status(runId);
   }
 
@@ -291,25 +313,6 @@ export class Orchestrator {
       return this.status(runId);
     }
     const git = new GitService(worktreePath);
-    if (git.isDirty()) {
-      this.block(runId, "Task worktree is dirty; inspect it before resuming", "worktree");
-      return this.status(runId);
-    }
-
-    const commands = this.projectAdapter.verificationCommands(task);
-    const expectedHashes = commands.map((command) =>
-      this.commandEvidenceReceipt(runId, git.head(), worktreePath, "verify", command).dependencyHash,
-    );
-    this.store.invalidateEvidenceExcept(runId, expectedHashes);
-    const validHashes = new Set(this.store.listEvidence(runId, "valid").map((item) => item.dependencyHash));
-
-    if (run.status === "ready") {
-      if (expectedHashes.length > 0 && expectedHashes.every((hash) => validHashes.has(hash))) {
-        return this.status(runId);
-      }
-      this.store.reopenRunForInvalidEvidence(runId);
-    }
-
     const author = this.store.listOperations(runId).find((operation) => operation.kind === "author");
     if (!author) {
       this.block(runId, "Author operation is missing", "author");
@@ -320,18 +323,54 @@ export class Orchestrator {
       return this.status(runId);
     }
     if (author.status === "running") {
-      const created = this.store.listEvents(runId).find((event) => event.type === "worktree.created");
-      const baseHead = isRecord(created?.data) && typeof created.data.head === "string" ? created.data.head : null;
-      if (!baseHead || git.head() === baseHead) {
-        this.block(runId, "Author operation has no completed commit to recover", author.id);
+      const bound = this.requireBoundRun(runId).binding;
+      if (git.head() !== bound.baselineCommit || !git.isDirty() || git.hasStagedChanges()) {
+        this.store.finishOperation(author.id, "failed", {
+          reason: "Author recovery cannot prove a bounded working diff without Git metadata changes",
+        });
+        this.block(runId, "Author recovery found an invalid Git state", author.id);
+        return this.status(runId);
+      }
+      const finalOutputPath = resolve(this.loopHome, "runs", runId, "author", "final.json");
+      let recoveredOutput: ReturnType<typeof authorOutputSchema.safeParse> | null = null;
+      try {
+        recoveredOutput = existsSync(finalOutputPath)
+          ? authorOutputSchema.safeParse(JSON.parse(readFileSync(finalOutputPath, "utf8")) as unknown)
+          : null;
+      } catch {
+        recoveredOutput = null;
+      }
+      if (!recoveredOutput?.success) {
+        this.store.finishOperation(author.id, "failed", {
+          reason: "Author recovery is missing valid structured output",
+        });
+        this.block(runId, "Author recovery is missing its structured receipt", author.id);
         return this.status(runId);
       }
       this.store.finishOperation(author.id, "succeeded", {
         recoveredAfterProviderCompletion: true,
         worktreePath,
-        commitSha: git.head(),
+        baseCommit: bound.baselineCommit,
+        workingDiffHash: git.diffHash(),
+        report: recoveredOutput.data,
       });
-      this.store.appendEvent(runId, "author.recovered", { operationId: author.id, commitSha: git.head() });
+      this.store.appendEvent(runId, "author.recovered", { operationId: author.id, workingDiffHash: git.diffHash() });
+    }
+    const candidate = this.ensureCandidateCommit(runId, git, author.id, 1);
+    if (!candidate) return this.status(runId);
+
+    const commands = this.projectAdapter.verificationCommands(task);
+    const expectedHashes = commands.map((command) =>
+      this.commandEvidenceReceipt(runId, candidate.commitSha, worktreePath, "verify", command).dependencyHash,
+    );
+    this.store.invalidateEvidenceOfKindsExcept(runId, ["command"], expectedHashes);
+    const validHashes = new Set(this.store.listEvidence(runId, "valid").map((item) => item.dependencyHash));
+
+    if (run.status === "ready") {
+      if (expectedHashes.length > 0 && expectedHashes.every((hash) => validHashes.has(hash))) {
+        return this.status(runId);
+      }
+      this.store.reopenRunForInvalidEvidence(runId);
     }
     return this.verifyOpenRun(runId, task);
   }
@@ -352,7 +391,7 @@ export class Orchestrator {
     const expectedHashes = commands.map((command) =>
       this.commandEvidenceReceipt(runId, git.head(), worktreePath, "verify", command).dependencyHash,
     );
-    this.store.invalidateEvidenceExcept(runId, expectedHashes);
+    this.store.invalidateEvidenceOfKindsExcept(runId, ["command"], expectedHashes);
     if (await this.verifyCommands(runId, worktreePath, commands, "verify")) {
       if (canBecomeReady(task.risk)) {
         this.store.transitionRun(runId, "ready", {}, { commitSha: git.head() });
@@ -468,6 +507,113 @@ export class Orchestrator {
       }
     }
     return true;
+  }
+
+  private ensureCandidateCommit(
+    runId: string,
+    git: GitService,
+    writerOperationId: string,
+    attempt: number,
+    baseCommit = this.requireBoundRun(runId).binding.baselineCommit,
+  ): CandidateCommit | null {
+    const run = this.requireBoundRun(runId);
+    const operationId = `${runId}:checkpoint-commit:${attempt}`;
+    let operation = this.store.getOperation(operationId);
+    if (!operation) {
+      if (git.head() !== baseCommit || !git.isDirty() || git.hasStagedChanges()) {
+        this.block(runId, "Harness cannot plan a candidate commit from the current Git state", writerOperationId);
+        return null;
+      }
+      const input = {
+        role: "checkpoint-commit",
+        attempt,
+        writerOperationId,
+        baseCommit,
+        workingDiffHash: git.diffHash(),
+        message: `agent-loop(${run.taskId}): checkpoint ${attempt}`,
+      };
+      operation = this.store.createOperation({
+        id: operationId,
+        runId,
+        kind: "checkpoint-commit",
+        idempotencyKey: operationId,
+        input,
+      });
+    }
+
+    if (operation.status === "failed") {
+      this.block(runId, "Harness candidate commit previously failed", operation.id);
+      return null;
+    }
+    const input = candidateOperationInput(operation.input);
+    let candidate: CandidateCommit;
+    if (operation.status === "running") {
+      if (git.head() === input.baseCommit) {
+        if (!git.isDirty() || git.hasStagedChanges() || git.diffHash() !== input.workingDiffHash) {
+          this.store.finishOperation(operation.id, "failed", {
+            reason: "Working diff changed after the Harness planned its candidate commit",
+          });
+          this.block(runId, "Working diff changed before the Harness commit", operation.id);
+          return null;
+        }
+        candidate = git.commitCandidate({ baseCommit: input.baseCommit, message: input.message });
+        this.afterHarnessCommit?.();
+      } else {
+        if (git.isDirty() || git.parent() !== input.baseCommit) {
+          this.store.finishOperation(operation.id, "failed", {
+            reason: "Cannot recover a unique Harness-owned candidate commit",
+            currentHead: git.head(),
+          });
+          this.block(runId, "Candidate commit recovery is ambiguous", operation.id);
+          return null;
+        }
+        candidate = {
+          baseCommit: input.baseCommit,
+          commitSha: git.head(),
+          diffHash: git.diffHashBetween(input.baseCommit),
+          message: input.message,
+          authorName: "Agent Loop Harness",
+          authorEmail: "agent-loop@localhost",
+        };
+        this.store.appendEvent(runId, "candidate-commit.recovered", {
+          operationId: operation.id,
+          commitSha: candidate.commitSha,
+        });
+      }
+      operation = this.store.finishOperation(operation.id, "succeeded", candidate);
+    } else {
+      candidate = candidateCommitResult(operation.result);
+      if (git.isDirty() || git.head() !== candidate.commitSha || git.parent() !== candidate.baseCommit) {
+        this.store.invalidateAllEvidence(runId);
+        this.block(runId, "Saved candidate commit no longer matches the worktree", operation.id);
+        return null;
+      }
+    }
+
+    const operationInput = operation.input;
+    const stepId = `candidate-commit:${attempt}`;
+    const dependencies = evidenceDependencies({
+      commitSha: candidate.commitSha,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      operationInputHash: operationInputHash(operationInput),
+    });
+    const dependencyHash = evidenceDependencyHash(dependencies);
+    this.store.installEvidence({
+      id: `${runId}:evidence:candidate:${dependencyHash.slice(0, 12)}`,
+      runId,
+      operationId: operation.id,
+      kind: "candidate_commit",
+      commitSha: candidate.commitSha,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      dependencyHash,
+      dependencies,
+      data: candidate,
+    });
+    return candidate;
   }
 
   private commandEvidenceReceipt(
@@ -587,7 +733,8 @@ function authorPrompt(task: ReturnType<typeof loadTaskSpec>, explorerReport: Exp
     "Acceptance:",
     ...task.acceptance.map((item) => `- ${item}`),
     ...(explorerReport ? [`Explorer advisory report: ${compactExplorerReport(explorerReport)}`] : []),
-    "Work only in the current worktree. Commit the completed bounded change before reporting success.",
+    "Work only in the current worktree. Edit files only; do not run git add, git commit, or change Git metadata.",
+    "Leave a non-empty working diff for the Harness to inspect and commit deterministically.",
     "Return only a concise summary and the changedFiles array required by the Author output schema.",
   ].join("\n");
 }
@@ -633,4 +780,39 @@ function isSuccessfulCommandResult(
 function normalizedExistingPath(path: string): string {
   const normalized = realpathSync(resolve(path));
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function candidateOperationInput(value: unknown): {
+  baseCommit: string;
+  workingDiffHash: string;
+  message: string;
+} {
+  if (
+    !isRecord(value) ||
+    typeof value.baseCommit !== "string" ||
+    typeof value.workingDiffHash !== "string" ||
+    typeof value.message !== "string"
+  ) {
+    throw new Error("Candidate commit operation has invalid persisted input");
+  }
+  return {
+    baseCommit: value.baseCommit,
+    workingDiffHash: value.workingDiffHash,
+    message: value.message,
+  };
+}
+
+function candidateCommitResult(value: unknown): CandidateCommit {
+  if (
+    !isRecord(value) ||
+    typeof value.baseCommit !== "string" ||
+    typeof value.commitSha !== "string" ||
+    typeof value.diffHash !== "string" ||
+    typeof value.message !== "string" ||
+    typeof value.authorName !== "string" ||
+    typeof value.authorEmail !== "string"
+  ) {
+    throw new Error("Candidate commit operation has invalid persisted result");
+  }
+  return value as unknown as CandidateCommit;
 }

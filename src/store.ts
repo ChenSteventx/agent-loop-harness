@@ -346,6 +346,24 @@ export class SqliteStore {
       .run(now, runId).changes;
   }
 
+  invalidateEvidenceOfKindsExcept(
+    runId: string,
+    kinds: readonly string[],
+    validDependencyHashes: readonly string[],
+    now = new Date().toISOString(),
+  ): number {
+    this.requireRun(runId);
+    if (kinds.length === 0) return 0;
+    const kindPlaceholders = kinds.map(() => "?").join(", ");
+    const hashClause = validDependencyHashes.length === 0
+      ? ""
+      : ` AND dependency_hash NOT IN (${validDependencyHashes.map(() => "?").join(", ")})`;
+    return this.database.prepare(
+      `UPDATE evidence SET status = 'invalid', invalidated_at = ?
+       WHERE run_id = ? AND status = 'valid' AND kind IN (${kindPlaceholders})${hashClause}`,
+    ).run(now, runId, ...kinds, ...validDependencyHashes).changes;
+  }
+
   enqueueOutbox(runId: string, type: OutboxEventType, payload: unknown, now = new Date().toISOString()): OutboxRecord {
     this.requireRun(runId);
     const transaction = this.database.transaction(() => this.requireOutbox(this.insertOutbox(runId, type, payload, now)));

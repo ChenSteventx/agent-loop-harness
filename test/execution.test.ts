@@ -55,6 +55,32 @@ describe("GitService and WorktreeService", () => {
     service.remove(worktreePath);
     expect(service.list().some((item) => item.branch === "agent-loop/task-1")).toBe(false);
   });
+
+  it("creates a deterministic Harness-owned candidate and rejects a Provider-staged index", () => {
+    const root = repository();
+    const service = new GitService(root);
+    const baseCommit = service.head();
+    writeFileSync(join(root, "tracked.txt"), "candidate\n");
+    const candidate = service.commitCandidate({ baseCommit, message: "agent-loop(T): checkpoint 1" });
+    expect(candidate).toMatchObject({
+      baseCommit,
+      commitSha: service.head(),
+      diffHash: service.diffHashBetween(baseCommit),
+      authorName: "Agent Loop Harness",
+      authorEmail: "agent-loop@localhost",
+    });
+    expect(service.parent()).toBe(baseCommit);
+    expect(service.isDirty()).toBe(false);
+    expect(git(root, ["show", "-s", "--format=%an <%ae>", "HEAD"]).trim()).toBe(
+      "Agent Loop Harness <agent-loop@localhost>",
+    );
+
+    writeFileSync(join(root, "tracked.txt"), "provider staged\n");
+    git(root, ["add", "tracked.txt"]);
+    expect(() => service.commitCandidate({
+      baseCommit: service.head(), message: "must not commit",
+    })).toThrow("only the Harness may stage");
+  }, 20_000);
 });
 
 describe("CommandRunner", () => {
