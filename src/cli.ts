@@ -6,6 +6,7 @@ import { Command } from "commander";
 import { Orchestrator, defaultLoopHome } from "./orchestrator.js";
 import { CodexCliAdapter } from "./provider.js";
 import { GenericNodeProjectAdapter } from "./project.js";
+import { defaultRoleOutputSchemas } from "./role-output-schemas.js";
 
 const program = new Command()
   .name("agent-loop")
@@ -92,7 +93,7 @@ function createOrchestrator(loopHome: string): Orchestrator {
     loopHome,
     provider: new CodexCliAdapter({ sandbox: "workspace-write" }),
     projectAdapter: new GenericNodeProjectAdapter(),
-    outputSchemaPath: resolve("automation/report.schema.json"),
+    roleOutputSchemas: defaultRoleOutputSchemas(),
   });
 }
 

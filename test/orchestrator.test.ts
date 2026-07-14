@@ -96,7 +96,7 @@ class FakeAuthor implements ProviderAdapter {
               evidence: [{ path: "task.yaml", observation: "Acceptance requires changed.txt" }],
               importantUnknowns: [],
             }
-          : { status: "completed" }
+          : { summary: "Added the requested file", changedFiles: ["changed.txt"] }
         : null,
       stderr: this.succeeds ? "" : "fixture author failure",
       exitCode: this.succeeds ? 0 : 1,
@@ -234,6 +234,9 @@ describe("Orchestrator", () => {
     });
     expect(provider.requests[0]?.allowedRepositoryRoots).toEqual([view.worktreePath]);
     expect(provider.requests[0]?.additionalWritableDirectories).toBeUndefined();
+    expect(provider.requests[0]?.outputSchemaPath).toMatch(/explorer-output\.schema\.json$/u);
+    expect(provider.requests[1]?.outputSchemaPath).toMatch(/author-output\.schema\.json$/u);
+    expect(provider.requests.some((request) => request.outputSchemaPath.includes("automation"))).toBe(false);
     expect(provider.requests[1]?.prompt).toContain("Explorer advisory report:");
     expect(provider.requests[1]?.prompt).not.toContain("thread.started");
     expect(view.operations[0]).toMatchObject({ kind: "explorer", status: "succeeded" });

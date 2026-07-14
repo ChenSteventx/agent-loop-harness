@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-loop-harness.invalid/schemas/author-output.schema.json",
+  "title": "AuthorOutput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "changedFiles"],
+  "properties": {
+    "summary": { "type": "string", "minLength": 1 },
+    "changedFiles": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

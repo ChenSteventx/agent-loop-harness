@@ -22,7 +22,13 @@ class FakeReviewer implements ProviderAdapter {
     this.request = request;
     this.mutate?.();
     return { invocationId: request.invocationId, ok: true, cancelled: false, identity, threadId: "t", events: [],
-      finalOutput: { findings: [finding()] }, stderr: "", exitCode: 0, signal: null, durationMs: 1, usage: null,
+      finalOutput: {
+        findings: [{
+          id: "F1", category: "correctness", severity: "high", claim: "behavior is wrong", location: "src/a.ts:1",
+          reproductionCommand: "npm test", expectedResult: "exit 0", observedResult: "exit 1", confidence: 0.9,
+          proposedVerification: "run npm test", status: "open",
+        }],
+      }, stderr: "", exitCode: 0, signal: null, durationMs: 1, usage: null,
       failureClass: null, eventsPath: "events", finalOutputPath: "final", stderrPath: "stderr" };
   }
   async cancel() { return false; }
@@ -44,6 +50,21 @@ describe("independent reviewer", () => {
     expect(provider.request?.prompt).toContain("Verification evidence:");
     expect(provider.request?.prompt).not.toMatch(/self[- ]evaluation/i);
     expect(result.report?.findings[0]).toEqual(finding());
+    expect(provider.request?.prompt).toContain("Harness binds those facts");
+  });
+
+  it("rejects provider attempts to self-assert identity or reviewed commit", async () => {
+    const provider = new FakeReviewer();
+    const original = provider.run.bind(provider);
+    provider.run = async (request) => {
+      const result = await original(request);
+      const first = (result.finalOutput as { findings: Record<string, unknown>[] }).findings[0]!;
+      return { ...result, finalOutput: { findings: [{ ...first, reviewerIdentity: identity, reviewedCommit: "forged" }] } };
+    };
+    const state = { commit, diffHash: hashReviewDiff(diff), dirty: false };
+    expect((await runReviewer(provider, input(), () => state, {
+      invocationId: "forged", cwd: "/repo", artifactDirectory: "/artifacts", outputSchemaPath: "/schema",
+    })).report).toBeNull();
   });
 
   it("rejects reviewer writes and invalidates review evidence when the commit changes", async () => {

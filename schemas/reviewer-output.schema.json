@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-loop-harness.invalid/schemas/reviewer-output.schema.json",
+  "title": "ReviewerOutput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "severity", "claim", "location", "reproductionCommand", "expectedResult", "observedResult", "confidence", "proposedVerification", "status"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "category": { "type": "string", "enum": ["correctness", "acceptance", "security", "reliability", "test", "maintainability"] },
+          "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+          "claim": { "type": "string", "minLength": 1 },
+          "location": { "type": "string", "minLength": 1 },
+          "reproductionCommand": { "type": ["string", "null"], "minLength": 1 },
+          "expectedResult": { "type": ["string", "null"], "minLength": 1 },
+          "observedResult": { "type": ["string", "null"], "minLength": 1 },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "proposedVerification": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["open", "evidence_requested", "verified", "dismissed"] }
+        }
+      }
+    }
+  }
+}

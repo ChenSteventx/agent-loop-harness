@@ -12,6 +12,11 @@ import type { Run } from "./domain.js";
 import { canBecomeReady } from "./routing.js";
 import { routeRisk } from "./routing.js";
 import { compactExplorerReport, runExplorer, type ExplorerReport } from "./explorer.js";
+import {
+  authorOutputSchema,
+  defaultRoleOutputSchemas,
+  type RoleOutputSchemas,
+} from "./role-output-schemas.js";
 
 export function defaultLoopHome(): string {
   return resolve(homedir(), ".agent-loop-harness");
@@ -21,7 +26,9 @@ export interface OrchestratorOptions {
   loopHome?: string;
   provider: ProviderAdapter;
   projectAdapter: ProjectAdapter;
-  outputSchemaPath: string;
+  roleOutputSchemas?: Partial<RoleOutputSchemas>;
+  /** @deprecated Supply roleOutputSchemas instead. */
+  outputSchemaPath?: string;
   commandRunner?: CommandRunner;
   explorerContextBudget?: number;
   faults?: {
@@ -49,7 +56,7 @@ export class Orchestrator {
   readonly store: SqliteStore;
   private readonly provider: ProviderAdapter;
   private readonly projectAdapter: ProjectAdapter;
-  private readonly outputSchemaPath: string;
+  private readonly roleOutputSchemas: RoleOutputSchemas;
   private readonly commandRunner: CommandRunner;
   private readonly afterProviderCompletion?: () => void;
   private readonly explorerContextBudget: number;
@@ -60,7 +67,13 @@ export class Orchestrator {
     this.store = new SqliteStore(resolve(this.loopHome, "state.sqlite"));
     this.provider = options.provider;
     this.projectAdapter = options.projectAdapter;
-    this.outputSchemaPath = resolve(options.outputSchemaPath);
+    const defaults = defaultRoleOutputSchemas();
+    const legacySchema = options.outputSchemaPath ? resolve(options.outputSchemaPath) : null;
+    this.roleOutputSchemas = {
+      author: resolve(options.roleOutputSchemas?.author ?? legacySchema ?? defaults.author),
+      explorer: resolve(options.roleOutputSchemas?.explorer ?? legacySchema ?? defaults.explorer),
+      reviewer: resolve(options.roleOutputSchemas?.reviewer ?? legacySchema ?? defaults.reviewer),
+    };
     this.commandRunner = options.commandRunner ?? new CommandRunner();
     this.afterProviderCompletion = options.faults?.afterProviderCompletion;
     this.explorerContextBudget = options.explorerContextBudget ?? 8_000;
@@ -104,7 +117,7 @@ export class Orchestrator {
         invocationId: explorer.id,
         cwd: worktreePath,
         artifactDirectory: resolve(this.loopHome, "runs", runId, "explorer"),
-        outputSchemaPath: this.outputSchemaPath,
+        outputSchemaPath: this.roleOutputSchemas.explorer,
       });
       this.store.recordAgentCall(runId, {
         role: "explorer", provider: result.provider.identity.provider,
@@ -141,7 +154,7 @@ export class Orchestrator {
       prompt: authorPrompt(task, explorerReport),
       cwd: worktreePath,
       artifactDirectory: resolve(this.loopHome, "runs", runId, "author"),
-      outputSchemaPath: this.outputSchemaPath,
+      outputSchemaPath: this.roleOutputSchemas.author,
       additionalWritableDirectories: [sourceGit.commonDirectory()],
     });
     this.store.recordAgentCall(runId, {
@@ -152,6 +165,15 @@ export class Orchestrator {
     if (!providerResult.ok) {
       this.store.finishOperation(author.id, "failed", providerResult);
       this.block(runId, `Author failed: ${providerResult.failureClass ?? "unknown"}`, author.id);
+      return this.status(runId);
+    }
+    const authorOutput = authorOutputSchema.safeParse(providerResult.finalOutput);
+    if (!authorOutput.success) {
+      this.store.finishOperation(author.id, "failed", {
+        provider: providerResult,
+        reason: "Author returned output that does not match the Author schema",
+      });
+      this.block(runId, "Author returned invalid structured output", author.id);
       return this.status(runId);
     }
 
@@ -170,6 +192,7 @@ export class Orchestrator {
     }
     this.store.finishOperation(author.id, "succeeded", {
       provider: providerResult,
+      report: authorOutput.data,
       worktreePath,
       commitSha: authoredGit.head(),
     });
@@ -456,6 +479,7 @@ function authorPrompt(task: ReturnType<typeof loadTaskSpec>, explorerReport: Exp
     ...task.acceptance.map((item) => `- ${item}`),
     ...(explorerReport ? [`Explorer advisory report: ${compactExplorerReport(explorerReport)}`] : []),
     "Work only in the current worktree. Commit the completed bounded change before reporting success.",
+    "Return only a concise summary and the changedFiles array required by the Author output schema.",
   ].join("\n");
 }
 

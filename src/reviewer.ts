@@ -9,7 +9,7 @@ export const findingStatuses = ["open", "evidence_requested", "verified", "dismi
 
 const optionalText = z.string().trim().min(1).nullable();
 
-export const findingSchema = z.object({
+export const reviewerFindingOutputSchema = z.object({
   id: z.string().trim().min(1),
   category: z.enum(findingCategories),
   severity: z.enum(findingSeverities),
@@ -20,6 +20,19 @@ export const findingSchema = z.object({
   observedResult: optionalText,
   confidence: z.number().min(0).max(1),
   proposedVerification: z.string().trim().min(1),
+  status: z.enum(findingStatuses),
+}).strict();
+
+const reviewerIdentitySchema = z.object({
+  provider: z.string().trim().min(1),
+  model: z.string().nullable(),
+  executable: z.string().trim().min(1),
+  version: z.string().nullable(),
+}).strict();
+
+export const reviewerOutputSchema = z.object({ findings: z.array(reviewerFindingOutputSchema) }).strict();
+
+export const findingSchema = reviewerFindingOutputSchema.extend({
   reviewerIdentity: z.object({
     provider: z.string().trim().min(1),
     model: z.string().nullable(),
@@ -27,7 +40,6 @@ export const findingSchema = z.object({
     version: z.string().nullable(),
   }).strict(),
   reviewedCommit: z.string().trim().min(1),
-  status: z.enum(findingStatuses),
 }).strict();
 
 export const reviewReportSchema = z.object({ findings: z.array(findingSchema) }).strict();
@@ -88,10 +100,16 @@ export async function runReviewer(
   if (after.dirty || after.commit !== input.reviewedCommit || after.diffHash !== input.diffHash) {
     throw new Error("Reviewer violated the read-only workspace boundary or review binding changed");
   }
-  const parsed = providerResult.ok ? reviewReportSchema.safeParse(providerResult.finalOutput) : null;
-  const report = parsed?.success && parsed.data.findings.every((finding) =>
-    sameIdentity(finding.reviewerIdentity, providerResult.identity) && finding.reviewedCommit === input.reviewedCommit
-  ) ? parsed.data : null;
+  const parsed = providerResult.ok ? reviewerOutputSchema.safeParse(providerResult.finalOutput) : null;
+  const report = parsed?.success
+    ? reviewReportSchema.parse({
+        findings: parsed.data.findings.map((finding) => ({
+          ...finding,
+          reviewerIdentity: harnessIdentity(providerResult.identity),
+          reviewedCommit: input.reviewedCommit,
+        })),
+      })
+    : null;
   return { report, provider: providerResult, reviewedCommit: input.reviewedCommit, diffHash: input.diffHash, stale: false };
 }
 
@@ -138,10 +156,16 @@ function reviewerPrompt(input: ReviewerInput): string {
     `Diff SHA-256: ${input.diffHash}`,
     `Diff: ${input.diff}`,
     `Verification evidence: ${JSON.stringify(input.verificationEvidence)}`,
-    "Return only structured findings. Do not vote. For conflicts request evidence or propose a deterministic experiment.",
+    "Return only structured findings. Do not report provider identity or the reviewed commit; the Harness binds those facts.",
+    "Do not vote. For conflicts request evidence or propose a deterministic experiment.",
   ].join("\n");
 }
 
-function sameIdentity(left: ProviderIdentity, right: ProviderIdentity): boolean {
-  return left.provider === right.provider && left.model === right.model && left.executable === right.executable && left.version === right.version;
+function harnessIdentity(identity: ProviderIdentity): z.infer<typeof reviewerIdentitySchema> {
+  return reviewerIdentitySchema.parse({
+    provider: identity.provider,
+    model: identity.model,
+    executable: identity.executable,
+    version: identity.version,
+  });
 }

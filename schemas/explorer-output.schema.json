@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-loop-harness.invalid/schemas/explorer-output.schema.json",
+  "title": "ExplorerOutput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["relevantFiles", "likelyAffectedTests", "evidence", "importantUnknowns"],
+  "properties": {
+    "relevantFiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "symbols"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "symbols": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+        }
+      }
+    },
+    "likelyAffectedTests": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "observation"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "observation": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "importantUnknowns": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  }
+}
