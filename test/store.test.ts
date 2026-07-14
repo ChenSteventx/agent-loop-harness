@@ -99,4 +99,33 @@ describe("SqliteStore", () => {
     expect(store.transitionRun("run-1", "done").status).toBe("done");
     store.close();
   });
+
+  it("writes lifecycle results and their notifications transactionally", () => {
+    const store = new SqliteStore(databasePath());
+    store.createRun("run-1", "task-1");
+    store.transitionRun("run-1", "ready", {}, { commit: "head-1" });
+    expect(store.listPendingOutbox()).toEqual([
+      expect.objectContaining({ runId: "run-1", type: "ready", payload: { commit: "head-1" } }),
+    ]);
+    expect(() => store.transitionRun("run-1", "merged", { mergeSha: "m" }, { bad: 1n })).toThrow();
+    expect(store.getRun("run-1")?.status).toBe("ready");
+    store.close();
+  });
+
+  it("creates a complete Human Inbox record and needs-human Outbox item atomically", () => {
+    const store = new SqliteStore(databasePath());
+    store.createRun("run-1", "task-1");
+    const item = store.createHumanInbox("run-1", {
+      question: "Proceed without an independent reviewer?",
+      options: ["wait", "cancel"],
+      recommendation: "wait",
+      evidence: { unavailable: ["Claude", "DeepSeek"] },
+      risk: "high",
+      consequence: "No independent receipt can be issued",
+      resumeCommand: "npm run loop -- resume run-1",
+    });
+    expect(item).toMatchObject({ question: "Proceed without an independent reviewer?", risk: "high" });
+    expect(store.listPendingOutbox()[0]).toMatchObject({ type: "needs-human" });
+    store.close();
+  });
 });

@@ -15,7 +15,10 @@ import type { ProjectAdapter } from "../src/ports.js";
 
 const temporaryDirectories: string[] = [];
 
-function targetRepository(failingCheck = false): { root: string; taskPath: string; schemaPath: string } {
+function targetRepository(
+  failingCheck = false,
+  risk: "low" | "normal" | "high" | "unknown" = "low",
+): { root: string; taskPath: string; schemaPath: string } {
   const root = mkdtempSync(join(tmpdir(), "agent-loop-target-"));
   temporaryDirectories.push(root);
   git(root, ["init", "-b", "main"]);
@@ -35,7 +38,7 @@ function targetRepository(failingCheck = false): { root: string; taskPath: strin
       "goal: Add the requested file",
       "acceptance:",
       "  - changed.txt exists",
-      "risk: low",
+      `risk: ${risk}`,
       "verification:",
       "  - id: check",
       "    argv: [node, check.mjs]",
@@ -72,7 +75,8 @@ class FakeAuthor implements ProviderAdapter {
     this.requests.push(request);
     mkdirSync(request.artifactDirectory, { recursive: true });
     const identity = { provider: "fake", model: "fixture", executable: "in-process", version: "1" };
-    if (this.succeeds) {
+    const explorer = request.workspaceAccess === "read-only";
+    if (this.succeeds && !explorer) {
       writeFileSync(join(request.cwd, "changed.txt"), "created by fake author\n");
       git(request.cwd, ["add", "changed.txt"]);
       git(request.cwd, ["commit", "-m", "feat: add requested file"]);
@@ -84,7 +88,16 @@ class FakeAuthor implements ProviderAdapter {
       identity,
       threadId: "fake-thread",
       events: [{ type: "thread.started", thread_id: "fake-thread" }],
-      finalOutput: this.succeeds ? { status: "completed" } : null,
+      finalOutput: this.succeeds
+        ? explorer
+          ? {
+              relevantFiles: [{ path: "check.mjs", symbols: [] }],
+              likelyAffectedTests: ["check.mjs"],
+              evidence: [{ path: "task.yaml", observation: "Acceptance requires changed.txt" }],
+              importantUnknowns: [],
+            }
+          : { status: "completed" }
+        : null,
       stderr: this.succeeds ? "" : "fixture author failure",
       exitCode: this.succeeds ? 0 : 1,
       signal: null,
@@ -103,6 +116,15 @@ class FakeAuthor implements ProviderAdapter {
 
   async cancel(): Promise<boolean> {
     return false;
+  }
+}
+
+class WritingExplorer extends FakeAuthor {
+  override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    if (request.workspaceAccess === "read-only") {
+      writeFileSync(join(request.cwd, "forbidden.txt"), "attempted explorer write\n");
+    }
+    return super.run(request);
   }
 }
 
@@ -176,6 +198,61 @@ describe("Orchestrator", () => {
     expect(missingView.run.status).toBe("blocked");
     expect(missingView.evidence).toHaveLength(0);
     missing.close();
+  }, 20_000);
+
+  it("fails closed at ready when risk is unknown", async () => {
+    const fixture = targetRepository(false, "unknown");
+    const orchestrator = createOrchestrator(fixture, new FakeAuthor());
+    const view = await orchestrator.start({
+      runId: "run-unknown-risk",
+      taskPath: fixture.taskPath,
+      targetRepository: fixture.root,
+    });
+
+    expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked).toMatchObject({
+      previousStatus: "open",
+      checkpointRef: "risk-classification",
+    });
+    expect(view.evidence).toHaveLength(1);
+    orchestrator.close();
+  }, 20_000);
+
+  it("runs a bounded Explorer for assisted work and gives the Author only its compact report", async () => {
+    const fixture = targetRepository(false, "normal");
+    const provider = new FakeAuthor();
+    const orchestrator = createOrchestrator(fixture, provider);
+    const view = await orchestrator.start({
+      runId: "run-assisted", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+
+    expect(view.run.status).toBe("ready");
+    expect(provider.requests).toHaveLength(2);
+    expect(provider.requests[0]).toMatchObject({
+      workspaceAccess: "read-only",
+      contextBudget: 8000,
+    });
+    expect(provider.requests[0]?.allowedRepositoryRoots).toEqual([view.worktreePath]);
+    expect(provider.requests[0]?.additionalWritableDirectories).toBeUndefined();
+    expect(provider.requests[1]?.prompt).toContain("Explorer advisory report:");
+    expect(provider.requests[1]?.prompt).not.toContain("thread.started");
+    expect(view.operations[0]).toMatchObject({ kind: "explorer", status: "succeeded" });
+    expect(view.operations[0]?.result).toMatchObject({ costTokens: 0, latencyMs: 1, used: true });
+    orchestrator.close();
+  }, 20_000);
+
+  it("rejects an attempted Explorer write at the Harness boundary without changing Run state", async () => {
+    const fixture = targetRepository(false, "normal");
+    const orchestrator = createOrchestrator(fixture, new WritingExplorer());
+
+    await expect(orchestrator.start({
+      runId: "run-explorer-write", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    })).rejects.toThrow("read-only workspace boundary");
+    const view = orchestrator.status("run-explorer-write");
+    expect(view.run.status).toBe("open");
+    expect(view.operations).toHaveLength(1);
+    expect(view.operations[0]).toMatchObject({ kind: "explorer", status: "failed" });
+    orchestrator.close();
   }, 20_000);
 
   it("keeps useful durable status when the Author fails", async () => {

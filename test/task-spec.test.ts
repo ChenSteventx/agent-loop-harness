@@ -14,6 +14,14 @@ describe("task spec", () => {
     expect(parseTaskSpec(valid)).toEqual(valid);
   });
 
+  it.each(["low", "normal", "high", "unknown"] as const)("accepts %s risk", (risk) => {
+    expect(parseTaskSpec({ ...valid, risk }).risk).toBe(risk);
+  });
+
+  it("rejects the replaced medium risk value", () => {
+    expect(() => parseTaskSpec({ ...valid, risk: "medium" })).toThrow();
+  });
+
   it("rejects incomplete specs", () => {
     expect(() => parseTaskSpec({ ...valid, acceptance: [] })).toThrow();
     expect(() => parseTaskSpec({ ...valid, verification: [{ id: "test", argv: [""] }] })).toThrow();

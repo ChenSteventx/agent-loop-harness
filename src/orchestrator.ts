@@ -9,6 +9,9 @@ import type { ProviderAdapter } from "./provider.js";
 import { loadTaskSpec } from "./project.js";
 import { SqliteStore } from "./store.js";
 import type { Run } from "./domain.js";
+import { canBecomeReady } from "./routing.js";
+import { routeRisk } from "./routing.js";
+import { compactExplorerReport, runExplorer, type ExplorerReport } from "./explorer.js";
 
 export function defaultLoopHome(): string {
   return resolve(homedir(), ".agent-loop-harness");
@@ -20,6 +23,7 @@ export interface OrchestratorOptions {
   projectAdapter: ProjectAdapter;
   outputSchemaPath: string;
   commandRunner?: CommandRunner;
+  explorerContextBudget?: number;
   faults?: {
     afterProviderCompletion?: () => void;
   };
@@ -48,6 +52,7 @@ export class Orchestrator {
   private readonly outputSchemaPath: string;
   private readonly commandRunner: CommandRunner;
   private readonly afterProviderCompletion?: () => void;
+  private readonly explorerContextBudget: number;
 
   constructor(options: OrchestratorOptions) {
     this.loopHome = resolve(options.loopHome ?? process.env.LOOP_HOME ?? defaultLoopHome());
@@ -58,6 +63,7 @@ export class Orchestrator {
     this.outputSchemaPath = resolve(options.outputSchemaPath);
     this.commandRunner = options.commandRunner ?? new CommandRunner();
     this.afterProviderCompletion = options.faults?.afterProviderCompletion;
+    this.explorerContextBudget = options.explorerContextBudget ?? 8_000;
   }
 
   close(): void {
@@ -81,6 +87,49 @@ export class Orchestrator {
     );
     this.store.appendEvent(runId, "worktree.created", worktree);
 
+    let explorerReport: ExplorerReport | null = null;
+    if (routeRisk(task.risk) === "assisted") {
+      const explorer = this.store.createOperation({
+        id: `${runId}:explorer`, runId, kind: "explorer", idempotencyKey: `${runId}:explorer`,
+      });
+      const explorerGit = new GitService(worktreePath);
+      const explorerHead = explorerGit.head();
+      const result = await runExplorer(this.provider, {
+        task,
+        baselineCommit: worktree.head,
+        currentCommit: new GitService(worktreePath).head(),
+        allowedRepositoryRoots: [worktreePath],
+        contextBudget: this.explorerContextBudget,
+      }, {
+        invocationId: explorer.id,
+        cwd: worktreePath,
+        artifactDirectory: resolve(this.loopHome, "runs", runId, "explorer"),
+        outputSchemaPath: this.outputSchemaPath,
+      });
+      this.store.recordAgentCall(runId, {
+        role: "explorer", provider: result.provider.identity.provider,
+        latencyMs: result.latencyMs, usage: result.provider.usage,
+      });
+      if (explorerGit.head() !== explorerHead || explorerGit.isDirty()) {
+        this.store.finishOperation(explorer.id, "failed", {
+          report: null,
+          costTokens: result.costTokens,
+          latencyMs: result.latencyMs,
+          used: false,
+          reason: "Explorer violated the read-only workspace boundary",
+        });
+        throw new Error("Explorer violated the read-only workspace boundary");
+      }
+      explorerReport = result.report;
+      this.store.finishOperation(explorer.id, explorerReport ? "succeeded" : "failed", {
+        report: explorerReport,
+        costTokens: result.costTokens,
+        latencyMs: result.latencyMs,
+        used: result.used,
+        failureClass: result.provider.failureClass,
+      });
+    }
+
     const author = this.store.createOperation({
       id: `${runId}:author`,
       runId,
@@ -89,11 +138,15 @@ export class Orchestrator {
     });
     const providerResult = await this.provider.run({
       invocationId: author.id,
-      prompt: authorPrompt(task),
+      prompt: authorPrompt(task, explorerReport),
       cwd: worktreePath,
       artifactDirectory: resolve(this.loopHome, "runs", runId, "author"),
       outputSchemaPath: this.outputSchemaPath,
       additionalWritableDirectories: [sourceGit.commonDirectory()],
+    });
+    this.store.recordAgentCall(runId, {
+      role: "author", provider: providerResult.identity.provider,
+      latencyMs: providerResult.durationMs, usage: providerResult.usage,
     });
     this.afterProviderCompletion?.();
     if (!providerResult.ok) {
@@ -128,6 +181,11 @@ export class Orchestrator {
     }
     const verified = await this.verifyCommands(runId, worktreePath, commands, "verify");
     if (!verified) return this.status(runId);
+
+    if (!canBecomeReady(task.risk)) {
+      this.block(runId, "Risk must be classified before the run can become ready", "risk-classification");
+      return this.status(runId);
+    }
 
     this.store.transitionRun(runId, "ready", {}, { commitSha: authoredGit.head() });
     return this.status(runId);
@@ -249,7 +307,11 @@ export class Orchestrator {
     );
     this.store.invalidateEvidenceExcept(runId, expectedHashes);
     if (await this.verifyCommands(runId, worktreePath, commands, "verify")) {
-      this.store.transitionRun(runId, "ready", {}, { commitSha: git.head() });
+      if (canBecomeReady(task.risk)) {
+        this.store.transitionRun(runId, "ready", {}, { commitSha: git.head() });
+      } else {
+        this.block(runId, "Risk must be classified before the run can become ready", "risk-classification");
+      }
     }
     return this.status(runId);
   }
@@ -386,12 +448,13 @@ export function evidenceDependencyHash(commitSha: string, policyVersion: string,
     .digest("hex");
 }
 
-function authorPrompt(task: ReturnType<typeof loadTaskSpec>): string {
+function authorPrompt(task: ReturnType<typeof loadTaskSpec>, explorerReport: ExplorerReport | null): string {
   return [
     `Task: ${task.id}`,
     `Goal: ${task.goal}`,
     "Acceptance:",
     ...task.acceptance.map((item) => `- ${item}`),
+    ...(explorerReport ? [`Explorer advisory report: ${compactExplorerReport(explorerReport)}`] : []),
     "Work only in the current worktree. Commit the completed bounded change before reporting success.",
   ].join("\n");
 }

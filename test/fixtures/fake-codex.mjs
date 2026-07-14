@@ -32,6 +32,9 @@ function event(value) {
 
 if (mode === "timeout") {
   setInterval(() => {}, 1000);
+} else if (mode === "idle") {
+  event({ type: "thread.started", thread_id: "fake-thread-idle" });
+  setInterval(() => {}, 1000);
 } else if (mode === "quota") {
   process.stderr.write("Quota exceeded: usage limit reached\n");
   process.exit(1);

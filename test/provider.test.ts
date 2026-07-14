@@ -24,7 +24,7 @@ function request(root: string, invocationId = "invocation-1") {
   };
 }
 
-function adapter(mode: string, timeouts?: { startupTimeoutMs?: number; absoluteTimeoutMs?: number }) {
+function adapter(mode: string, timeouts?: { startupTimeoutMs?: number; idleTimeoutMs?: number; absoluteTimeoutMs?: number }) {
   return new CodexCliAdapter({
     executable: process.execPath,
     baseArgs: [fixture],
@@ -32,6 +32,7 @@ function adapter(mode: string, timeouts?: { startupTimeoutMs?: number; absoluteT
     model: "fixture-model",
     sandbox: "workspace-write",
     startupTimeoutMs: timeouts?.startupTimeoutMs ?? 1_000,
+    idleTimeoutMs: timeouts?.idleTimeoutMs ?? 1_000,
     absoluteTimeoutMs: timeouts?.absoluteTimeoutMs ?? 2_000,
     environment: { ...process.env, FAKE_CODEX_MODE: mode },
   });
@@ -96,6 +97,17 @@ describe("CodexCliAdapter", () => {
     expect(await provider.cancel("cancelled")).toBe(true);
     const cancelled = await running;
     expect(cancelled.cancelled).toBe(true);
+  });
+
+  it("enforces idle timeout after startup activity", async () => {
+    const timed = await adapter("idle", {
+      startupTimeoutMs: 1_000,
+      idleTimeoutMs: 100,
+      absoluteTimeoutMs: 2_000,
+    }).run(request(temporaryRoot(), "idle"));
+    expect(timed.ok).toBe(false);
+    expect(timed.threadId).toBe("fake-thread-idle");
+    expect(timed.failureClass).toBe("timeout");
   });
 });
 

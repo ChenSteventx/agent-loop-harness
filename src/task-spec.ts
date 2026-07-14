@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { riskValues } from "./routing.js";
 
 const nonEmptyStrings = z.array(z.string().trim().min(1)).min(1);
 
@@ -9,7 +10,7 @@ export const taskSpecSchema = z
     acceptance: nonEmptyStrings,
     scope: z.array(z.string().trim().min(1)).optional(),
     outOfScope: z.array(z.string().trim().min(1)).optional(),
-    risk: z.enum(["low", "medium", "high"]),
+    risk: z.enum(riskValues),
     verification: z
       .array(
         z.object({

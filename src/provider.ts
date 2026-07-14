@@ -16,13 +16,21 @@ export type ProviderFailureClass =
 export interface ProviderIdentity {
   provider: string;
   model: string | null;
+  modelDisplayName?: string | null;
+  modelFamily?: string | null;
   executable: string;
   version: string | null;
+}
+
+export interface ProviderCapabilities {
+  structuredOutput: boolean;
+  resume: boolean;
 }
 
 export interface ProviderProbe {
   available: boolean;
   identity: ProviderIdentity;
+  capabilities?: ProviderCapabilities;
   error: string | null;
 }
 
@@ -32,6 +40,9 @@ export interface ProviderRunRequest {
   cwd: string;
   artifactDirectory: string;
   outputSchemaPath: string;
+  workspaceAccess?: "read-only" | "workspace-write";
+  allowedRepositoryRoots?: readonly string[];
+  contextBudget?: number;
   additionalWritableDirectories?: readonly string[];
 }
 
@@ -74,7 +85,9 @@ export interface CodexCliAdapterConfig {
   model?: string | null;
   sandbox: "read-only" | "workspace-write";
   startupTimeoutMs?: number;
+  idleTimeoutMs?: number;
   absoluteTimeoutMs?: number;
+  cancellationGraceMs?: number;
   environment?: NodeJS.ProcessEnv;
 }
 
@@ -113,10 +126,13 @@ export class CodexCliAdapter implements ProviderAdapter {
   private readonly model: string | null;
   private readonly sandbox: CodexCliAdapterConfig["sandbox"];
   private readonly startupTimeoutMs: number;
+  private readonly idleTimeoutMs: number;
   private readonly absoluteTimeoutMs: number;
+  private readonly cancellationGraceMs: number;
   private readonly environment: NodeJS.ProcessEnv;
   private readonly active = new Map<string, ChildProcessWithoutNullStreams>();
   private readonly cancellationRequests = new Set<string>();
+  private readonly forcedCancellationTimers = new Map<string, NodeJS.Timeout>();
   private version: string | null = null;
 
   constructor(config: CodexCliAdapterConfig) {
@@ -131,7 +147,9 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.model = config.model ?? null;
     this.sandbox = config.sandbox;
     this.startupTimeoutMs = config.startupTimeoutMs ?? 30_000;
+    this.idleTimeoutMs = config.idleTimeoutMs ?? 5 * 60_000;
     this.absoluteTimeoutMs = config.absoluteTimeoutMs ?? 30 * 60_000;
+    this.cancellationGraceMs = config.cancellationGraceMs ?? 5_000;
   }
 
   async probe(): Promise<ProviderProbe> {
@@ -161,7 +179,12 @@ export class CodexCliAdapter implements ProviderAdapter {
     const child = this.active.get(invocationId);
     if (!child) return false;
     const signalled = child.kill("SIGTERM");
-    if (signalled) this.cancellationRequests.add(invocationId);
+    if (signalled) {
+      this.cancellationRequests.add(invocationId);
+      this.forcedCancellationTimers.set(invocationId, setTimeout(() => {
+        if (this.active.get(invocationId) === child) child.kill("SIGKILL");
+      }, this.cancellationGraceMs));
+    }
     return signalled;
   }
 
@@ -189,9 +212,11 @@ export class CodexCliAdapter implements ProviderAdapter {
       "--ignore-user-config",
       "--json",
       "--sandbox",
-      this.sandbox,
+      request.workspaceAccess ?? this.sandbox,
       ...(this.model ? ["--model", this.model] : []),
-      ...additionalWritableDirectoryArgs(request.additionalWritableDirectories),
+      ...additionalWritableDirectoryArgs(
+        request.workspaceAccess === "read-only" ? undefined : request.additionalWritableDirectories,
+      ),
       "-c",
       'approval_policy="never"',
       ...windowsSandboxConfigArgs(process.platform, this.environment),
@@ -228,14 +253,23 @@ export class CodexCliAdapter implements ProviderAdapter {
         child.stdin.end(request.prompt);
         let startupTimer: NodeJS.Timeout | null = setTimeout(() => {
           timedOut = true;
-          child.kill("SIGTERM");
+          terminateWithGrace(child, this.cancellationGraceMs);
         }, this.startupTimeoutMs);
+        let idleTimer: NodeJS.Timeout | null = null;
+        const noteActivity = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            timedOut = true;
+            terminateWithGrace(child, this.cancellationGraceMs);
+          }, this.idleTimeoutMs);
+        };
         const absoluteTimer = setTimeout(() => {
           timedOut = true;
-          child.kill("SIGTERM");
+          terminateWithGrace(child, this.cancellationGraceMs);
         }, this.absoluteTimeoutMs);
         const lines = createInterface({ input: child.stdout });
         lines.on("line", (line) => {
+          noteActivity();
           eventText += `${line}\n`;
           try {
             const event = JSON.parse(line) as Record<string, unknown>;
@@ -257,6 +291,7 @@ export class CodexCliAdapter implements ProviderAdapter {
           }
         });
         child.stderr.on("data", (chunk: Buffer) => {
+          noteActivity();
           stderr += chunk.toString("utf8");
         });
         child.once("error", (error) => {
@@ -264,7 +299,11 @@ export class CodexCliAdapter implements ProviderAdapter {
         });
         child.once("close", (exitCode, signal) => {
           if (startupTimer) clearTimeout(startupTimer);
+          if (idleTimer) clearTimeout(idleTimer);
           clearTimeout(absoluteTimer);
+          const forcedCancellationTimer = this.forcedCancellationTimers.get(request.invocationId);
+          if (forcedCancellationTimer) clearTimeout(forcedCancellationTimer);
+          this.forcedCancellationTimers.delete(request.invocationId);
           const cancellationRequested = this.cancellationRequests.delete(request.invocationId);
           cancelled = !timedOut && cancellationRequested;
           this.active.delete(request.invocationId);
@@ -334,8 +373,8 @@ export function classifyProviderFailure(text: string): ProviderFailureClass {
   if (/quota|usage limit|insufficient (credit|balance)|hard limit/u.test(value)) return "quota";
   if (/rate.?limit|too many requests|\b429\b/u.test(value)) return "rate_limit";
   if (/authentication|not logged in|unauthorized|forbidden|invalid api key|\b401\b|\b403\b/u.test(value)) return "auth";
-  if (/unavailable|not found|enoent/u.test(value)) return "unavailable";
   if (/temporar|overload|\b503\b|connection reset|network/u.test(value)) return "transient";
+  if (/unavailable|not found|enoent/u.test(value)) return "unavailable";
   if (/timed? ?out|timeout/u.test(value)) return "timeout";
   return "unknown";
 }
@@ -346,6 +385,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function numberValue(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
+}
+
+function terminateWithGrace(child: ChildProcessWithoutNullStreams, graceMs: number): void {
+  child.kill("SIGTERM");
+  const timer = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }, graceMs);
+  timer.unref();
 }
 
 function launchForOverride(
@@ -363,3 +410,12 @@ function launchForOverride(
   }
   return { executable, baseArgs: [] };
 }
+
+export {
+  buildClaudeCodeArgs,
+  ClaudeCodeAdapter,
+  inferClaudeModelFamily,
+  type ClaudeCodeAdapterConfig,
+} from "./claude-provider.js";
+
+export { PiAdapter, type PiAdapterConfig, type PiModelConfig, type PiRoutes } from "./pi-provider.js";

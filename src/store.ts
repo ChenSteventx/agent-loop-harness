@@ -14,6 +14,38 @@ import {
 
 type Sqlite = InstanceType<typeof Database>;
 
+export const outboxEventTypes = ["blocked", "needs-human", "provider-fallback", "ready", "done"] as const;
+export type OutboxEventType = (typeof outboxEventTypes)[number];
+
+export interface OutboxRecord {
+  id: number; runId: string; type: OutboxEventType; payload: unknown; createdAt: string;
+  deliveredAt: string | null; attempts: number; lastError: string | null;
+}
+
+export interface HumanInboxInput {
+  question: string;
+  options: readonly string[];
+  recommendation: string;
+  evidence: unknown;
+  risk: string;
+  consequence: string;
+  resumeCommand: string;
+}
+
+export interface HumanInboxRecord extends HumanInboxInput {
+  id: number; runId: string; createdAt: string; resolvedAt: string | null;
+}
+
+export interface RunMetrics {
+  agentCalls: number;
+  latencyMs: number;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  outputTokens: number | null;
+  confirmedFindings: number;
+  falsePositives: number;
+}
+
 export class SqliteStore {
   readonly database: Sqlite;
 
@@ -68,6 +100,9 @@ export class SqliteStore {
       const updated = transitionRun(current, target, options);
       this.writeRun(updated);
       this.insertEvent(id, `run.${target}`, eventData, updated.updatedAt);
+      if (target === "blocked" || target === "ready" || target === "done") {
+        this.insertOutbox(id, target, eventData, updated.updatedAt);
+      }
       return updated;
     });
     try {
@@ -237,6 +272,83 @@ export class SqliteStore {
       .run(now, runId, ...validDependencyHashes).changes;
   }
 
+  enqueueOutbox(runId: string, type: OutboxEventType, payload: unknown, now = new Date().toISOString()): OutboxRecord {
+    this.requireRun(runId);
+    const transaction = this.database.transaction(() => this.requireOutbox(this.insertOutbox(runId, type, payload, now)));
+    return transaction();
+  }
+
+  createHumanInbox(runId: string, input: HumanInboxInput, now = new Date().toISOString()): HumanInboxRecord {
+    this.requireRun(runId);
+    validateHumanInbox(input);
+    const transaction = this.database.transaction(() => {
+      const result = this.database.prepare(
+        `INSERT INTO human_inbox
+         (run_id, question, options_json, recommendation, evidence_json, risk, consequence, resume_command, created_at, resolved_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+      ).run(runId, input.question, JSON.stringify(input.options), input.recommendation,
+        JSON.stringify(input.evidence), input.risk, input.consequence, input.resumeCommand, now);
+      this.insertOutbox(runId, "needs-human", input, now);
+      return this.requireHumanInbox(Number(result.lastInsertRowid));
+    });
+    return transaction();
+  }
+
+  listHumanInbox(runId: string): HumanInboxRecord[] {
+    return (this.database.prepare("SELECT * FROM human_inbox WHERE run_id = ? ORDER BY id").all(runId) as HumanInboxRow[]).map(mapHumanInbox);
+  }
+
+  listPendingOutbox(): OutboxRecord[] {
+    return (this.database.prepare("SELECT * FROM outbox WHERE delivered_at IS NULL ORDER BY id").all() as OutboxRow[]).map(mapOutbox);
+  }
+
+  markOutboxDelivered(id: number, now = new Date().toISOString()): void {
+    this.database.prepare("UPDATE outbox SET delivered_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?").run(now, id);
+  }
+
+  markOutboxFailed(id: number, error: string): void {
+    this.database.prepare("UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?").run(error, id);
+  }
+
+  recordAgentCall(runId: string, input: {
+    role: string; provider: string; latencyMs: number;
+    usage: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number } | null;
+  }, now = new Date().toISOString()): void {
+    this.requireRun(runId);
+    if (!Number.isFinite(input.latencyMs) || input.latencyMs < 0) throw new Error("Agent call latency must be non-negative");
+    this.database.prepare(
+      `INSERT INTO agent_call_metrics
+       (run_id, role, provider, latency_ms, input_tokens, cached_input_tokens, output_tokens, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(runId, input.role, input.provider, input.latencyMs, input.usage?.inputTokens ?? null,
+      input.usage?.cachedInputTokens ?? null, input.usage?.outputTokens ?? null, now);
+  }
+
+  recordFindingOutcome(runId: string, findingId: string, outcome: "confirmed" | "false_positive", now = new Date().toISOString()): void {
+    this.requireRun(runId);
+    this.database.prepare(
+      `INSERT INTO finding_metrics (run_id, finding_id, outcome, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(run_id, finding_id) DO UPDATE SET outcome = excluded.outcome, created_at = excluded.created_at`,
+    ).run(runId, findingId, outcome, now);
+  }
+
+  getRunMetrics(runId: string): RunMetrics {
+    this.requireRun(runId);
+    const calls = this.database.prepare(
+      `SELECT COUNT(*) AS calls, COALESCE(SUM(latency_ms), 0) AS latency,
+       SUM(input_tokens) AS input_tokens, SUM(cached_input_tokens) AS cached_input_tokens,
+       SUM(output_tokens) AS output_tokens FROM agent_call_metrics WHERE run_id = ?`,
+    ).get(runId) as MetricAggregateRow;
+    const findings = this.database.prepare(
+      `SELECT COALESCE(SUM(outcome = 'confirmed'), 0) AS confirmed,
+       COALESCE(SUM(outcome = 'false_positive'), 0) AS false_positives
+       FROM finding_metrics WHERE run_id = ?`,
+    ).get(runId) as FindingAggregateRow;
+    return { agentCalls: calls.calls, latencyMs: calls.latency, inputTokens: calls.input_tokens,
+      cachedInputTokens: calls.cached_input_tokens, outputTokens: calls.output_tokens,
+      confirmedFindings: findings.confirmed, falsePositives: findings.false_positives };
+  }
+
   private requireRun(id: string): Run {
     const run = this.getRun(id);
     if (!run) throw new Error(`Run not found: ${id}`);
@@ -262,6 +374,25 @@ export class SqliteStore {
       .prepare("INSERT INTO events (run_id, type, data_json, created_at) VALUES (?, ?, ?, ?)")
       .run(runId, type, JSON.stringify(data), now);
     return Number(result.lastInsertRowid);
+  }
+
+  private insertOutbox(runId: string, type: OutboxEventType, payload: unknown, now: string): number {
+    const result = this.database.prepare(
+      "INSERT INTO outbox (run_id, type, payload_json, created_at, delivered_at, attempts, last_error) VALUES (?, ?, ?, ?, NULL, 0, NULL)",
+    ).run(runId, type, JSON.stringify(payload), now);
+    return Number(result.lastInsertRowid);
+  }
+
+  private requireOutbox(id: number): OutboxRecord {
+    const row = this.database.prepare("SELECT * FROM outbox WHERE id = ?").get(id) as OutboxRow | undefined;
+    if (!row) throw new Error(`Outbox record not found: ${id}`);
+    return mapOutbox(row);
+  }
+
+  private requireHumanInbox(id: number): HumanInboxRecord {
+    const row = this.database.prepare("SELECT * FROM human_inbox WHERE id = ?").get(id) as HumanInboxRow | undefined;
+    if (!row) throw new Error(`Human Inbox record not found: ${id}`);
+    return mapHumanInbox(row);
   }
 
   private operationByKey(key: string): Operation | null {
@@ -326,9 +457,53 @@ export class SqliteStore {
         invalidated_at TEXT,
         UNIQUE(run_id, kind, dependency_hash)
       );
+      CREATE TABLE IF NOT EXISTS outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        delivered_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
+      );
+      CREATE TABLE IF NOT EXISTS human_inbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        question TEXT NOT NULL,
+        options_json TEXT NOT NULL,
+        recommendation TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        risk TEXT NOT NULL,
+        consequence TEXT NOT NULL,
+        resume_command TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS agent_call_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        role TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        latency_ms REAL NOT NULL,
+        input_tokens INTEGER,
+        cached_input_tokens INTEGER,
+        output_tokens INTEGER,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS finding_metrics (
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        finding_id TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK(outcome IN ('confirmed', 'false_positive')),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(run_id, finding_id)
+      );
     `);
   }
 }
+
+interface MetricAggregateRow { calls: number; latency: number; input_tokens: number | null; cached_input_tokens: number | null; output_tokens: number | null }
+interface FindingAggregateRow { confirmed: number; false_positives: number }
 
 interface RunRow {
   id: string;
@@ -374,6 +549,9 @@ interface EvidenceRow {
   invalidated_at: string | null;
 }
 
+interface OutboxRow { id: number; run_id: string; type: OutboxEventType; payload_json: string; created_at: string; delivered_at: string | null; attempts: number; last_error: string | null }
+interface HumanInboxRow { id: number; run_id: string; question: string; options_json: string; recommendation: string; evidence_json: string; risk: string; consequence: string; resume_command: string; created_at: string; resolved_at: string | null }
+
 function mapRun(row: RunRow): Run {
   return {
     id: row.id,
@@ -414,6 +592,21 @@ function mapEvidence(row: EvidenceRow): Evidence {
     createdAt: row.created_at,
     invalidatedAt: row.invalidated_at,
   };
+}
+
+function mapOutbox(row: OutboxRow): OutboxRecord {
+  return { id: row.id, runId: row.run_id, type: row.type, payload: parseJson(row.payload_json), createdAt: row.created_at, deliveredAt: row.delivered_at, attempts: row.attempts, lastError: row.last_error };
+}
+
+function mapHumanInbox(row: HumanInboxRow): HumanInboxRecord {
+  return { id: row.id, runId: row.run_id, question: row.question, options: parseJson(row.options_json) as string[], recommendation: row.recommendation, evidence: parseJson(row.evidence_json), risk: row.risk, consequence: row.consequence, resumeCommand: row.resume_command, createdAt: row.created_at, resolvedAt: row.resolved_at };
+}
+
+function validateHumanInbox(input: HumanInboxInput): void {
+  if (!input.question.trim() || input.options.length === 0 || input.options.some((option) => !option.trim()) ||
+      !input.recommendation.trim() || !input.risk.trim() || !input.consequence.trim() || !input.resumeCommand.trim()) {
+    throw new Error("Human Inbox requires question, options, recommendation, risk, consequence, and resume command");
+  }
 }
 
 function parseJson(value: string): unknown {
