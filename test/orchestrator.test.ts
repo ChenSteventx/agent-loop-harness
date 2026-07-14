@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -302,12 +302,12 @@ describe("Orchestrator", () => {
     ).rejects.toThrow("simulated crash");
     expect(orchestrator.status("run-crash").operations[0]?.status).toBe("running");
 
-    const resumed = await orchestrator.resume("run-crash", fixture.taskPath);
+    const resumed = await orchestrator.resume("run-crash");
     expect(resumed.run.status).toBe("ready");
     expect(provider.calls).toBe(1);
     expect(resumed.events.some((event) => event.type === "author.recovered")).toBe(true);
     const counts = [resumed.operations.length, resumed.evidence.length, resumed.events.length];
-    const repeated = await orchestrator.resume("run-crash", fixture.taskPath);
+    const repeated = await orchestrator.resume("run-crash");
     expect([repeated.operations.length, repeated.evidence.length, repeated.events.length]).toEqual(counts);
     orchestrator.close();
   }, 20_000);
@@ -332,6 +332,35 @@ describe("Orchestrator", () => {
     expect(reverified.evidence.filter((item) => item.status === "valid")).toHaveLength(1);
     const eventCount = reverified.events.length;
     expect((await orchestrator.resume("run-invalidate", fixture.taskPath)).events).toHaveLength(eventCount);
+    orchestrator.close();
+  }, 20_000);
+
+  it("resumes from the saved task snapshot and fails closed if the task source is rebound", async () => {
+    const fixture = targetRepository();
+    const orchestrator = createOrchestrator(fixture, new FakeAuthor());
+    const ready = await orchestrator.start({
+      runId: "run-bound", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+    expect(ready.run.binding).toMatchObject({
+      taskSpecHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      acceptanceHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      baselineCommit: expect.stringMatching(/^[0-9a-f]{40}$/u),
+      risk: "low",
+      executionTemplate: "solo",
+      projectAdapterName: "generic-node",
+      policyVersion: "generic-node/v1",
+    });
+    expect((await orchestrator.resume("run-bound")).run.status).toBe("ready");
+
+    const changedTask = readFileSync(fixture.taskPath, "utf8").replace(
+      "  - changed.txt exists",
+      "  - a different acceptance must hold",
+    );
+    writeFileSync(fixture.taskPath, changedTask);
+    const blocked = await orchestrator.resume("run-bound");
+    expect(blocked.run.status).toBe("blocked");
+    expect(blocked.run.blocked?.reason).toContain("task spec");
+    expect(blocked.evidence.every((item) => item.status === "invalid")).toBe(true);
     orchestrator.close();
   }, 20_000);
 

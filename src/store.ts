@@ -6,11 +6,14 @@ import {
   transitionRun,
   type Event,
   type Evidence,
+  type EvidenceDependencies,
   type Operation,
   type Run,
+  type RunBinding,
   type RunStatus,
   type TransitionOptions,
 } from "./domain.js";
+import { evidenceDependencyHash, operationInputHash } from "./bindings.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -59,17 +62,34 @@ export class SqliteStore {
     this.database.close();
   }
 
-  createRun(id: string, taskId: string, now = new Date().toISOString()): Run {
-    const run = newRun(id, taskId, now);
+  createRun(
+    id: string,
+    taskId: string,
+    now = new Date().toISOString(),
+    binding: RunBinding | null = null,
+  ): Run {
+    const run = newRun(id, taskId, now, binding);
     const transaction = this.database.transaction(() => {
       this.database
         .prepare(
           `INSERT INTO runs
-           (id, task_id, status, blocked_json, merge_sha, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (id, task_id, binding_json, status, blocked_json, merge_sha, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(run.id, run.taskId, run.status, null, null, run.createdAt, run.updatedAt);
-      this.insertEvent(run.id, "run.created", { taskId }, now);
+        .run(
+          run.id,
+          run.taskId,
+          run.binding ? JSON.stringify(run.binding) : null,
+          run.status,
+          null,
+          null,
+          run.createdAt,
+          run.updatedAt,
+        );
+      this.insertEvent(run.id, "run.created", {
+        taskId,
+        taskSpecHash: run.binding?.taskSpecHash ?? null,
+      }, now);
     });
     try {
       transaction();
@@ -77,6 +97,15 @@ export class SqliteStore {
       throw contextualize(error, `Cannot create run ${id}`);
     }
     return run;
+  }
+
+  createBoundRun(
+    id: string,
+    taskId: string,
+    binding: RunBinding,
+    now = new Date().toISOString(),
+  ): Run {
+    return this.createRun(id, taskId, now, binding);
   }
 
   getRun(id: string): Run | null {
@@ -156,12 +185,18 @@ export class SqliteStore {
     runId: string;
     kind: string;
     idempotencyKey: string;
+    input?: unknown;
     now?: string;
   }): Operation {
+    const inputValue = input.input === undefined ? null : input.input;
+    const inputHash = input.input === undefined ? null : operationInputHash(input.input);
     const existing = this.operationByKey(input.idempotencyKey);
     if (existing) {
       if (existing.runId !== input.runId || existing.kind !== input.kind) {
         throw new Error(`Idempotency key ${input.idempotencyKey} belongs to another operation`);
+      }
+      if (existing.inputHash !== inputHash) {
+        throw new Error(`Idempotency key ${input.idempotencyKey} was created for different input`);
       }
       return existing;
     }
@@ -171,10 +206,18 @@ export class SqliteStore {
       this.database
         .prepare(
           `INSERT INTO operations
-           (id, run_id, kind, idempotency_key, status, result_json, started_at, finished_at)
-           VALUES (?, ?, ?, ?, 'running', NULL, ?, NULL)`,
+           (id, run_id, kind, idempotency_key, input_json, input_hash, status, result_json, started_at, finished_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, ?, NULL)`,
         )
-        .run(input.id, input.runId, input.kind, input.idempotencyKey, startedAt);
+        .run(
+          input.id,
+          input.runId,
+          input.kind,
+          input.idempotencyKey,
+          input.input === undefined ? null : JSON.stringify(inputValue),
+          inputHash,
+          startedAt,
+        );
     } catch (error) {
       throw contextualize(error, `Cannot create operation ${input.id}`);
     }
@@ -213,19 +256,41 @@ export class SqliteStore {
     return this.requireOperation(id);
   }
 
-  installEvidence(input: Omit<Evidence, "status" | "createdAt" | "invalidatedAt"> & { now?: string }): Evidence {
+  installEvidence(input: Omit<
+    Evidence,
+    "status" | "createdAt" | "invalidatedAt" | "dependencyVersion" | "dependencies"
+  > & {
+    dependencies?: EvidenceDependencies;
+    dependencyVersion?: 1;
+    now?: string;
+  }): Evidence {
+    const run = this.requireRun(input.runId);
+    if (run.binding && !input.dependencies) {
+      throw new Error("Bound runs require fully bound Evidence dependencies");
+    }
+    if (input.dependencies) {
+      if (
+        input.dependencies.commitSha !== input.commitSha ||
+        input.dependencies.policyVersion !== input.policyVersion ||
+        input.dependencies.stepId !== input.stepId
+      ) {
+        throw new Error("Evidence dependency fields do not match the Evidence receipt");
+      }
+      if (evidenceDependencyHash(input.dependencies) !== input.dependencyHash) {
+        throw new Error("Evidence dependency hash does not match canonical dependencies");
+      }
+    }
     const existing = this.database
       .prepare("SELECT * FROM evidence WHERE run_id = ? AND kind = ? AND dependency_hash = ?")
       .get(input.runId, input.kind, input.dependencyHash) as EvidenceRow | undefined;
     if (existing) return mapEvidence(existing);
-    this.requireRun(input.runId);
     const now = input.now ?? new Date().toISOString();
     this.database
       .prepare(
         `INSERT INTO evidence
          (id, run_id, operation_id, kind, status, commit_sha, policy_version, step_id,
-          dependency_hash, data_json, created_at, invalidated_at)
-         VALUES (?, ?, ?, ?, 'valid', ?, ?, ?, ?, ?, ?, NULL)`,
+          dependency_hash, dependency_version, dependencies_json, data_json, created_at, invalidated_at)
+         VALUES (?, ?, ?, ?, 'valid', ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
       )
       .run(
         input.id,
@@ -236,6 +301,8 @@ export class SqliteStore {
         input.policyVersion,
         input.stepId,
         input.dependencyHash,
+        input.dependencies ? (input.dependencyVersion ?? 1) : null,
+        input.dependencies ? JSON.stringify(input.dependencies) : null,
         JSON.stringify(input.data),
         now,
       );
@@ -270,6 +337,13 @@ export class SqliteStore {
          WHERE run_id = ? AND status = 'valid' AND dependency_hash NOT IN (${placeholders})`,
       )
       .run(now, runId, ...validDependencyHashes).changes;
+  }
+
+  invalidateAllEvidence(runId: string, now = new Date().toISOString()): number {
+    this.requireRun(runId);
+    return this.database
+      .prepare("UPDATE evidence SET status = 'invalid', invalidated_at = ? WHERE run_id = ? AND status = 'valid'")
+      .run(now, runId).changes;
   }
 
   enqueueOutbox(runId: string, type: OutboxEventType, payload: unknown, now = new Date().toISOString()): OutboxRecord {
@@ -419,6 +493,7 @@ export class SqliteStore {
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL,
+        binding_json TEXT,
         status TEXT NOT NULL,
         blocked_json TEXT,
         merge_sha TEXT,
@@ -430,6 +505,8 @@ export class SqliteStore {
         run_id TEXT NOT NULL REFERENCES runs(id),
         kind TEXT NOT NULL,
         idempotency_key TEXT NOT NULL UNIQUE,
+        input_json TEXT,
+        input_hash TEXT,
         status TEXT NOT NULL,
         result_json TEXT,
         started_at TEXT NOT NULL,
@@ -452,6 +529,8 @@ export class SqliteStore {
         policy_version TEXT NOT NULL,
         step_id TEXT NOT NULL,
         dependency_hash TEXT NOT NULL,
+        dependency_version INTEGER,
+        dependencies_json TEXT,
         data_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         invalidated_at TEXT,
@@ -499,6 +578,27 @@ export class SqliteStore {
         PRIMARY KEY(run_id, finding_id)
       );
     `);
+    this.ensureColumn("runs", "binding_json", "TEXT");
+    this.ensureColumn("operations", "input_json", "TEXT");
+    this.ensureColumn("operations", "input_hash", "TEXT");
+    this.ensureColumn("evidence", "dependency_version", "INTEGER");
+    this.ensureColumn("evidence", "dependencies_json", "TEXT");
+    const version = this.database.pragma("user_version", { simple: true }) as number;
+    if (version < 2) {
+      const now = new Date().toISOString();
+      this.database.transaction(() => {
+        this.database.prepare(
+          "UPDATE evidence SET status = 'invalid', invalidated_at = COALESCE(invalidated_at, ?) WHERE status = 'valid' AND dependencies_json IS NULL",
+        ).run(now);
+        this.database.pragma("user_version = 2");
+      })();
+    }
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.database.pragma(`table_info(${table})`) as Array<{ name: string }>;
+    if (columns.some((item) => item.name === column)) return;
+    this.database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }
 
@@ -508,6 +608,7 @@ interface FindingAggregateRow { confirmed: number; false_positives: number }
 interface RunRow {
   id: string;
   task_id: string;
+  binding_json: string | null;
   status: RunStatus;
   blocked_json: string | null;
   merge_sha: string | null;
@@ -520,6 +621,8 @@ interface OperationRow {
   run_id: string;
   kind: string;
   idempotency_key: string;
+  input_json: string | null;
+  input_hash: string | null;
   status: Operation["status"];
   result_json: string | null;
   started_at: string;
@@ -544,6 +647,8 @@ interface EvidenceRow {
   policy_version: string;
   step_id: string;
   dependency_hash: string;
+  dependency_version: number | null;
+  dependencies_json: string | null;
   data_json: string;
   created_at: string;
   invalidated_at: string | null;
@@ -556,6 +661,7 @@ function mapRun(row: RunRow): Run {
   return {
     id: row.id,
     taskId: row.task_id,
+    binding: row.binding_json ? parseJson(row.binding_json) as Run["binding"] : null,
     status: row.status,
     blocked: row.blocked_json ? parseJson(row.blocked_json) as Run["blocked"] : null,
     mergeSha: row.merge_sha,
@@ -570,6 +676,8 @@ function mapOperation(row: OperationRow): Operation {
     runId: row.run_id,
     kind: row.kind,
     idempotencyKey: row.idempotency_key,
+    input: row.input_json === null ? null : parseJson(row.input_json),
+    inputHash: row.input_hash,
     status: row.status,
     result: row.result_json === null ? null : parseJson(row.result_json),
     startedAt: row.started_at,
@@ -588,6 +696,10 @@ function mapEvidence(row: EvidenceRow): Evidence {
     policyVersion: row.policy_version,
     stepId: row.step_id,
     dependencyHash: row.dependency_hash,
+    dependencyVersion: row.dependency_version === 1 ? 1 : null,
+    dependencies: row.dependencies_json
+      ? parseJson(row.dependencies_json) as Evidence["dependencies"]
+      : null,
     data: parseJson(row.data_json),
     createdAt: row.created_at,
     invalidatedAt: row.invalidated_at,

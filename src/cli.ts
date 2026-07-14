@@ -55,22 +55,22 @@ program
 program
   .command("resume")
   .requiredOption("--run-id <id>")
-  .requiredOption("--task <path>")
+  .option("--task <path>", "deprecated compatibility check; the saved Run binding is authoritative")
   .description("inspect durable facts and continue the next deterministic action")
-  .action(async (options: { runId: string; task: string }) => {
+  .action(async (options: { runId: string; task?: string }) => {
     await withOrchestrator(async (orchestrator) =>
-      print(await orchestrator.resume(options.runId, resolve(options.task))),
+      print(await orchestrator.resume(options.runId, options.task ? resolve(options.task) : undefined)),
     );
   });
 
 program
   .command("verify")
   .requiredOption("--run-id <id>")
-  .requiredOption("--task <path>")
+  .option("--task <path>", "deprecated compatibility check; the saved Run binding is authoritative")
   .description("run configured verification in the task worktree")
-  .action(async (options: { runId: string; task: string }) => {
+  .action(async (options: { runId: string; task?: string }) => {
     await withOrchestrator(async (orchestrator) =>
-      print(await orchestrator.verify(options.runId, resolve(options.task))),
+      print(await orchestrator.verify(options.runId, options.task ? resolve(options.task) : undefined)),
     );
   });
 

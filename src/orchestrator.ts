@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -12,6 +12,14 @@ import type { Run } from "./domain.js";
 import { canBecomeReady } from "./routing.js";
 import { routeRisk } from "./routing.js";
 import { compactExplorerReport, runExplorer, type ExplorerReport } from "./explorer.js";
+import {
+  acceptanceHash,
+  createRunBinding,
+  evidenceDependencies,
+  evidenceDependencyHash,
+  operationInputHash,
+  taskSpecHash,
+} from "./bindings.js";
 import {
   authorOutputSchema,
   defaultRoleOutputSchemas,
@@ -29,6 +37,7 @@ export interface OrchestratorOptions {
   roleOutputSchemas?: Partial<RoleOutputSchemas>;
   /** @deprecated Supply roleOutputSchemas instead. */
   outputSchemaPath?: string;
+  providerProfileName?: string;
   commandRunner?: CommandRunner;
   explorerContextBudget?: number;
   faults?: {
@@ -60,6 +69,7 @@ export class Orchestrator {
   private readonly commandRunner: CommandRunner;
   private readonly afterProviderCompletion?: () => void;
   private readonly explorerContextBudget: number;
+  private readonly providerProfileName: string;
 
   constructor(options: OrchestratorOptions) {
     this.loopHome = resolve(options.loopHome ?? process.env.LOOP_HOME ?? defaultLoopHome());
@@ -77,6 +87,7 @@ export class Orchestrator {
     this.commandRunner = options.commandRunner ?? new CommandRunner();
     this.afterProviderCompletion = options.faults?.afterProviderCompletion;
     this.explorerContextBudget = options.explorerContextBudget ?? 8_000;
+    this.providerProfileName = options.providerProfileName ?? "LEGACY_SINGLE_PROVIDER";
   }
 
   close(): void {
@@ -84,12 +95,22 @@ export class Orchestrator {
   }
 
   async start(request: StartRunRequest): Promise<RunView> {
-    const task = loadTaskSpec(request.taskPath);
+    const taskPath = resolve(request.taskPath);
+    const task = loadTaskSpec(taskPath);
     const runId = request.runId ?? randomUUID();
     if (this.store.getRun(runId)) throw new Error(`Run already exists: ${runId}`);
     const sourceGit = new GitService(request.targetRepository);
     const worktreePath = this.worktreePath(runId);
-    this.store.createRun(runId, task.id);
+    const binding = createRunBinding({
+      taskSpecPath: taskPath,
+      taskSpec: task,
+      baselineCommit: sourceGit.head(),
+      sourceRepository: sourceGit.root,
+      worktreePath,
+      providerProfile: this.providerProfileName,
+      projectAdapter: this.projectAdapter,
+    });
+    this.store.createBoundRun(runId, task.id, binding);
     this.store.appendEvent(runId, "worktree.planned", {
       sourceRepository: sourceGit.root,
       worktreePath,
@@ -217,7 +238,7 @@ export class Orchestrator {
   status(runId: string): RunView {
     const run = this.store.getRun(runId);
     if (!run) throw new Error(`Run not found: ${runId}`);
-    const worktreePath = this.worktreePath(runId);
+    const worktreePath = run.binding?.worktreePath ?? this.worktreePath(runId);
     return {
       run,
       operations: this.store.listOperations(runId),
@@ -242,25 +263,29 @@ export class Orchestrator {
     return this.status(runId);
   }
 
-  async verify(runId: string, taskPath: string): Promise<RunView> {
+  async verify(runId: string, legacyTaskPath?: string): Promise<RunView> {
     const run = this.store.getRun(runId);
     if (!run) throw new Error(`Run not found: ${runId}`);
     if (run.status !== "open") throw new Error(`Run ${runId} must be open to verify; current status is ${run.status}`);
-    return this.verifyOpenRun(runId, taskPath);
+    const task = this.loadBoundTask(runId, legacyTaskPath);
+    if (!task) return this.status(runId);
+    return this.verifyOpenRun(runId, task);
   }
 
-  async resume(runId: string, taskPath: string): Promise<RunView> {
+  async resume(runId: string, legacyTaskPath?: string): Promise<RunView> {
     let run = this.store.getRun(runId);
     if (!run) throw new Error(`Run not found: ${runId}`);
     if (run.status === "done" || run.status === "failed" || run.status === "cancelled") return this.status(runId);
+    const task = this.loadBoundTask(runId, legacyTaskPath);
+    if (!task) return this.status(runId);
     if (run.status === "blocked") {
       const checkpoint = this.store.getOperation(run.blocked?.checkpointRef ?? "");
       if (checkpoint?.status === "failed") return this.status(runId);
       run = this.store.resumeRun(runId);
     }
 
-    if (run.status === "merged") return this.completeMergedRun(runId, taskPath);
-    const worktreePath = this.worktreePath(runId);
+    if (run.status === "merged") return this.completeMergedRun(runId, task);
+    const worktreePath = run.binding?.worktreePath ?? this.worktreePath(runId);
     if (!existsSync(worktreePath)) {
       this.block(runId, "Task worktree is missing", "worktree");
       return this.status(runId);
@@ -271,10 +296,9 @@ export class Orchestrator {
       return this.status(runId);
     }
 
-    const task = loadTaskSpec(taskPath);
     const commands = this.projectAdapter.verificationCommands(task);
     const expectedHashes = commands.map((command) =>
-      evidenceDependencyHash(git.head(), this.projectAdapter.policyVersion, `verify:${command.id}`),
+      this.commandEvidenceReceipt(runId, git.head(), worktreePath, "verify", command).dependencyHash,
     );
     this.store.invalidateEvidenceExcept(runId, expectedHashes);
     const validHashes = new Set(this.store.listEvidence(runId, "valid").map((item) => item.dependencyHash));
@@ -309,12 +333,12 @@ export class Orchestrator {
       });
       this.store.appendEvent(runId, "author.recovered", { operationId: author.id, commitSha: git.head() });
     }
-    return this.verifyOpenRun(runId, taskPath);
+    return this.verifyOpenRun(runId, task);
   }
 
-  private async verifyOpenRun(runId: string, taskPath: string): Promise<RunView> {
-    const task = loadTaskSpec(taskPath);
-    const worktreePath = this.worktreePath(runId);
+  private async verifyOpenRun(runId: string, task: ReturnType<typeof loadTaskSpec>): Promise<RunView> {
+    const run = this.requireBoundRun(runId);
+    const worktreePath = run.binding.worktreePath;
     const git = new GitService(worktreePath);
     if (git.isDirty()) {
       this.block(runId, "Task worktree is dirty; verification requires a committed state", "verify");
@@ -326,7 +350,7 @@ export class Orchestrator {
       return this.status(runId);
     }
     const expectedHashes = commands.map((command) =>
-      evidenceDependencyHash(git.head(), this.projectAdapter.policyVersion, `verify:${command.id}`),
+      this.commandEvidenceReceipt(runId, git.head(), worktreePath, "verify", command).dependencyHash,
     );
     this.store.invalidateEvidenceExcept(runId, expectedHashes);
     if (await this.verifyCommands(runId, worktreePath, commands, "verify")) {
@@ -339,7 +363,7 @@ export class Orchestrator {
     return this.status(runId);
   }
 
-  private async completeMergedRun(runId: string, taskPath: string): Promise<RunView> {
+  private async completeMergedRun(runId: string, task: ReturnType<typeof loadTaskSpec>): Promise<RunView> {
     const run = this.store.getRun(runId);
     if (!run || run.status !== "merged" || !run.mergeSha) throw new Error(`Run ${runId} is not merged`);
     const mergedEvent = [...this.store.listEvents(runId)].reverse().find((event) => event.type === "run.merged");
@@ -355,7 +379,6 @@ export class Orchestrator {
       this.block(runId, "Merged repository HEAD or dirty state no longer matches the recorded merge", "post-merge");
       return this.status(runId);
     }
-    const task = loadTaskSpec(taskPath);
     const commands = this.projectAdapter.postMergeCommands(task);
     if (commands.length === 0) {
       this.block(runId, "No post-merge checks were configured", "post-merge");
@@ -376,7 +399,8 @@ export class Orchestrator {
     const commitSha = new GitService(worktreePath).head();
     for (const command of commands) {
       const stepId = `${phase}:${command.id}`;
-      const dependencyHash = evidenceDependencyHash(commitSha, this.projectAdapter.policyVersion, stepId);
+      const receipt = this.commandEvidenceReceipt(runId, commitSha, worktreePath, phase, command);
+      const dependencyHash = receipt.dependencyHash;
       const existingEvidence = this.store
         .listEvidence(runId, "valid")
         .find((item) => item.dependencyHash === dependencyHash);
@@ -386,9 +410,10 @@ export class Orchestrator {
         runId,
         kind: `${phase}:${command.id}`,
         idempotencyKey: `${runId}:${phase}:${dependencyHash}`,
+        input: receipt.operationInput,
       });
       if (operation.status === "succeeded") {
-        if (isSuccessfulCommandResult(operation.result, commitSha)) {
+        if (isSuccessfulCommandResult(operation.result, commitSha, command.argv)) {
           this.store.installEvidence({
             id: `${runId}:evidence:${phase}:${command.id}:${dependencyHash.slice(0, 12)}`,
             runId,
@@ -398,6 +423,7 @@ export class Orchestrator {
             policyVersion: this.projectAdapter.policyVersion,
             stepId,
             dependencyHash,
+            dependencies: receipt.dependencies,
             data: operation.result,
           });
           continue;
@@ -432,6 +458,7 @@ export class Orchestrator {
           policyVersion: this.projectAdapter.policyVersion,
           stepId,
           dependencyHash,
+          dependencies: receipt.dependencies,
           data: result,
         });
       } catch (error) {
@@ -441,6 +468,92 @@ export class Orchestrator {
       }
     }
     return true;
+  }
+
+  private commandEvidenceReceipt(
+    runId: string,
+    commitSha: string,
+    cwd: string,
+    phase: "verify" | "post-merge",
+    command: VerificationCommand,
+  ): {
+    operationInput: unknown;
+    dependencies: ReturnType<typeof evidenceDependencies>;
+    dependencyHash: string;
+  } {
+    const run = this.requireBoundRun(runId);
+    const operationInput = {
+      kind: "command",
+      phase,
+      commandId: command.id,
+      argv: [...command.argv],
+      cwd: resolve(cwd),
+    };
+    const dependencies = evidenceDependencies({
+      commitSha,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+      stepId: `${phase}:${command.id}`,
+      operationInputHash: operationInputHash(operationInput),
+    });
+    return { operationInput, dependencies, dependencyHash: evidenceDependencyHash(dependencies) };
+  }
+
+  private loadBoundTask(
+    runId: string,
+    legacyTaskPath?: string,
+  ): ReturnType<typeof loadTaskSpec> | null {
+    const run = this.store.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    if (!run.binding) {
+      this.store.invalidateAllEvidence(runId);
+      this.block(runId, "Run predates immutable task binding; start a new run", "run-binding");
+      return null;
+    }
+
+    const mismatches: string[] = [];
+    if (run.binding.projectAdapterName !== this.projectAdapter.name) mismatches.push("project adapter");
+    if (run.binding.policyVersion !== this.projectAdapter.policyVersion) mismatches.push("policy version");
+    if (run.binding.providerProfile !== this.providerProfileName) mismatches.push("provider profile");
+    if (taskSpecHash(run.binding.taskSpec) !== run.binding.taskSpecHash) mismatches.push("task snapshot");
+    if (acceptanceHash(run.binding.taskSpec.acceptance) !== run.binding.acceptanceHash) {
+      mismatches.push("acceptance snapshot");
+    }
+
+    const pathToCheck = legacyTaskPath ? resolve(legacyTaskPath) : run.binding.taskSpecPath;
+    if (legacyTaskPath) {
+      if (!existsSync(pathToCheck) || normalizedExistingPath(pathToCheck) !== run.binding.taskSpecPath) {
+        mismatches.push("task path");
+      }
+    }
+    if (existsSync(pathToCheck)) {
+      try {
+        if (taskSpecHash(loadTaskSpec(pathToCheck)) !== run.binding.taskSpecHash) {
+          mismatches.push("task spec");
+        }
+      } catch {
+        mismatches.push("task spec");
+      }
+    }
+
+    if (mismatches.length > 0) {
+      this.store.invalidateAllEvidence(runId);
+      this.block(
+        runId,
+        `Immutable run binding mismatch: ${[...new Set(mismatches)].join(", ")}`,
+        "run-binding",
+      );
+      return null;
+    }
+    return run.binding.taskSpec;
+  }
+
+  private requireBoundRun(runId: string): Run & { binding: NonNullable<Run["binding"]> } {
+    const run = this.store.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    if (!run.binding) throw new Error(`Run ${runId} has no immutable binding`);
+    return run as Run & { binding: NonNullable<Run["binding"]> };
   }
 
   private block(runId: string, reason: string, checkpointRef: string): void {
@@ -465,11 +578,7 @@ export class Orchestrator {
   }
 }
 
-export function evidenceDependencyHash(commitSha: string, policyVersion: string, stepId: string): string {
-  return createHash("sha256")
-    .update(JSON.stringify({ commitSha, policyVersion, stepId }))
-    .digest("hex");
-}
+export { evidenceDependencyHash };
 
 function authorPrompt(task: ReturnType<typeof loadTaskSpec>, explorerReport: ExplorerReport | null): string {
   return [
@@ -507,6 +616,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isSuccessfulCommandResult(value: unknown, commitSha: string): boolean {
-  return isRecord(value) && value.exitCode === 0 && value.commitBefore === commitSha;
+function isSuccessfulCommandResult(
+  value: unknown,
+  commitSha: string,
+  argv: readonly string[],
+): boolean {
+  return isRecord(value) &&
+    value.exitCode === 0 &&
+    value.commitBefore === commitSha &&
+    value.timedOut === false &&
+    value.signal === null &&
+    Array.isArray(value.argv) &&
+    JSON.stringify(value.argv) === JSON.stringify(argv);
+}
+
+function normalizedExistingPath(path: string): string {
+  const normalized = realpathSync(resolve(path));
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }

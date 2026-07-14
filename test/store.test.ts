@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import { SqliteStore } from "../src/store.js";
 
 const temporaryDirectories: string[] = [];
@@ -19,6 +20,44 @@ afterEach(() => {
 });
 
 describe("SqliteStore", () => {
+  it("migrates legacy databases fail-closed without inventing bindings or Evidence dependencies", () => {
+    const path = databasePath();
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, status TEXT NOT NULL, blocked_json TEXT,
+        merge_sha TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE operations (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL, result_json TEXT,
+        started_at TEXT NOT NULL, finished_at TEXT
+      );
+      CREATE TABLE evidence (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), operation_id TEXT REFERENCES operations(id),
+        kind TEXT NOT NULL, status TEXT NOT NULL, commit_sha TEXT NOT NULL, policy_version TEXT NOT NULL,
+        step_id TEXT NOT NULL, dependency_hash TEXT NOT NULL, data_json TEXT NOT NULL,
+        created_at TEXT NOT NULL, invalidated_at TEXT, UNIQUE(run_id, kind, dependency_hash)
+      );
+      INSERT INTO runs VALUES ('legacy', 'task', 'open', NULL, NULL, '2026-01-01', '2026-01-01');
+      INSERT INTO evidence VALUES (
+        'legacy-e', 'legacy', NULL, 'command', 'valid', 'head', 'v1', 'verify:test',
+        'old-hash', '{}', '2026-01-01', NULL
+      );
+    `);
+    legacy.close();
+
+    const migrated = new SqliteStore(path);
+    expect(migrated.getRun("legacy")?.binding).toBeNull();
+    expect(migrated.listEvidence("legacy")[0]).toMatchObject({
+      status: "invalid", dependencyVersion: null, dependencies: null,
+    });
+    const operationColumns = migrated.database.pragma("table_info(operations)") as Array<{ name: string }>;
+    expect(operationColumns.map(({ name }) => name)).toEqual(expect.arrayContaining(["input_json", "input_hash"]));
+    expect(migrated.database.pragma("user_version", { simple: true })).toBe(2);
+    migrated.close();
+  });
+
   it("rolls back the run update when its event cannot be serialized", () => {
     const store = new SqliteStore(databasePath());
     store.createRun("run-1", "task-1");

@@ -21,11 +21,28 @@ export interface BlockedRunMetadata {
 export interface Run {
   id: string;
   taskId: string;
+  binding: RunBinding | null;
   status: RunStatus;
   blocked: BlockedRunMetadata | null;
   mergeSha: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface RunBinding {
+  version: 1;
+  taskSpecPath: string;
+  taskSpec: import("./task-spec.js").TaskSpec;
+  taskSpecHash: string;
+  acceptanceHash: string;
+  baselineCommit: string;
+  sourceRepository: string;
+  worktreePath: string;
+  risk: import("./routing.js").Risk;
+  executionTemplate: import("./routing.js").ExecutionTemplateName;
+  providerProfile: string;
+  projectAdapterName: string;
+  policyVersion: string;
 }
 
 export type OperationStatus = "running" | "succeeded" | "failed";
@@ -35,10 +52,22 @@ export interface Operation {
   runId: string;
   kind: string;
   idempotencyKey: string;
+  input: unknown | null;
+  inputHash: string | null;
   status: OperationStatus;
   result: unknown | null;
   startedAt: string;
   finishedAt: string | null;
+}
+
+export interface EvidenceDependencies {
+  version: 1;
+  commitSha: string;
+  taskSpecHash: string;
+  acceptanceHash: string;
+  policyVersion: string;
+  stepId: string;
+  operationInputHash: string;
 }
 
 export type EvidenceStatus = "valid" | "invalid";
@@ -53,6 +82,8 @@ export interface Evidence {
   policyVersion: string;
   stepId: string;
   dependencyHash: string;
+  dependencyVersion: 1 | null;
+  dependencies: EvidenceDependencies | null;
   data: unknown;
   createdAt: string;
   invalidatedAt: string | null;
@@ -78,10 +109,16 @@ const normalNext: Record<ActiveRunStatus, RunStatus> = {
   merged: "done",
 };
 
-export function createRun(id: string, taskId: string, now = new Date().toISOString()): Run {
+export function createRun(
+  id: string,
+  taskId: string,
+  now = new Date().toISOString(),
+  binding: RunBinding | null = null,
+): Run {
   return {
     id,
     taskId,
+    binding,
     status: "open",
     blocked: null,
     mergeSha: null,
