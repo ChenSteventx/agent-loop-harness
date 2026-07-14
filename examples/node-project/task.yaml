@@ -1,0 +1,13 @@
+id: EXAMPLE-ADD
+goal: Add a subtract function beside the existing add function.
+acceptance:
+  - subtract(5, 3) returns 2
+scope:
+  - math.js
+  - math.test.js
+outOfScope:
+  - dependencies
+risk: low
+verification:
+  - id: node-test
+    argv: [node, --test, math.node.mjs]
