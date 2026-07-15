@@ -3,6 +3,8 @@ import { canonicalJson } from "../bindings.js";
 import type { SanitizedFactBundle } from "./facts.js";
 import type { RunMetricsProjection } from "./metrics.js";
 import type { ReadinessReport } from "./readiness.js";
+import type { EvaluationDataset } from "./datasets.js";
+import type { EvaluationRun } from "./replay.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -83,6 +85,57 @@ export class EvaluationStore {
     return row ? JSON.parse(row.report_json) as ReadinessReport : null;
   }
 
+  installDataset(dataset: EvaluationDataset, createdAt = new Date().toISOString()): EvaluationDataset {
+    const existing = this.getDataset(dataset.id);
+    if (existing) {
+      if (existing.contentHash !== dataset.contentHash || canonicalJson(existing) !== canonicalJson(dataset)) {
+        throw new Error(`Evaluation Dataset ${dataset.id} is immutable`);
+      }
+      return existing;
+    }
+    this.database.prepare(
+      "INSERT INTO evaluation_datasets (id, kind, version, content_hash, dataset_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(dataset.id, dataset.kind, dataset.version, dataset.contentHash, JSON.stringify(dataset), createdAt);
+    return this.getDataset(dataset.id)!;
+  }
+
+  getDataset(id: string): EvaluationDataset | null {
+    const row = this.database.prepare("SELECT dataset_json FROM evaluation_datasets WHERE id = ?")
+      .get(id) as { dataset_json: string } | undefined;
+    return row ? JSON.parse(row.dataset_json) as EvaluationDataset : null;
+  }
+
+  listDatasets(): EvaluationDataset[] {
+    return (this.database.prepare("SELECT dataset_json FROM evaluation_datasets ORDER BY id").all() as
+      Array<{ dataset_json: string }>).map((row) => JSON.parse(row.dataset_json) as EvaluationDataset);
+  }
+
+  installEvaluationRun(run: EvaluationRun): EvaluationRun {
+    const existing = this.getEvaluationRun(run.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(run)) throw new Error(`Evaluation Run ${run.id} is immutable`);
+      return existing;
+    }
+    this.database.prepare(
+      `INSERT INTO evaluation_runs
+       (id, source_run_id, source_fact_hash, mode, replayability, status, run_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(run.id, run.sourceRunId, run.sourceFactHash, run.mode, run.replayability,
+      run.status, JSON.stringify(run), run.createdAt);
+    return this.getEvaluationRun(run.id)!;
+  }
+
+  getEvaluationRun(id: string): EvaluationRun | null {
+    const row = this.database.prepare("SELECT run_json FROM evaluation_runs WHERE id = ?")
+      .get(id) as { run_json: string } | undefined;
+    return row ? JSON.parse(row.run_json) as EvaluationRun : null;
+  }
+
+  listEvaluationRuns(): EvaluationRun[] {
+    return (this.database.prepare("SELECT run_json FROM evaluation_runs ORDER BY created_at, id").all() as
+      Array<{ run_json: string }>).map((row) => JSON.parse(row.run_json) as EvaluationRun);
+  }
+
   private migrate(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS fact_bundles (
@@ -105,6 +158,25 @@ export class EvaluationStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         report_json TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS evaluation_datasets (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK(kind IN ('historical', 'golden', 'holdout', 'failure-injection')),
+        version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        dataset_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS evaluation_runs (
+        id TEXT PRIMARY KEY,
+        source_run_id TEXT NOT NULL,
+        source_fact_hash TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('full', 'verify-only')),
+        replayability TEXT NOT NULL CHECK(replayability IN ('exact', 'verify-only', 'partial', 'none')),
+        status TEXT NOT NULL CHECK(status IN ('completed', 'failed', 'not-replayable')),
+        run_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(source_run_id, source_fact_hash) REFERENCES fact_bundles(run_id, fact_hash)
       );
     `);
   }

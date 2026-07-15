@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "phase3-holdout-v1",
+  "kind": "holdout",
+  "version": "1",
+  "tasks": [
+    {
+      "id": "holdout-independent-ready",
+      "projectScope": "generic-node",
+      "inputHash": "91b7d935b7ad7cd028a85199c06f8a98e42bc79d2ff71a478c9ea04bd6dc8861",
+      "expected": { "ready": true, "done": false }
+    }
+  ]
+}

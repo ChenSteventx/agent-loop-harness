@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "phase3-failure-injection-v1",
+  "kind": "failure-injection",
+  "version": "1",
+  "tasks": [
+    {
+      "id": "provider-quota-fallback",
+      "projectScope": "generic-node",
+      "inputHash": "659f19809f4a25928b4ffb993c0cd4869e9f2b9dbb4230e9b675e0ac25a25853",
+      "expected": { "providerFailureClass": "quota" }
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "phase3-golden-v1",
+  "kind": "golden",
+  "version": "1",
+  "tasks": [
+    {
+      "id": "golden-ready-basic",
+      "projectScope": "generic-node",
+      "inputHash": "f5a87c72d2bc81d424e263b9e40d0f1c6e6b0e75e0ef310c7386c76874f4c454",
+      "expected": { "ready": true, "done": false }
+    }
+  ]
+}

@@ -18,8 +18,11 @@ import { SqliteStore } from "./store.js";
 import { exportRunFacts } from "./evaluation/facts.js";
 import { projectRunMetrics, summarizeMetrics } from "./evaluation/metrics.js";
 import { evaluateReadiness } from "./evaluation/readiness.js";
-import { gradeReplayability } from "./evaluation/manifests.js";
 import { EvaluationStore } from "./evaluation/store.js";
+import { DatasetCatalog } from "./evaluation/datasets.js";
+import { HistoricalReplay, pinnedVerificationCommit, type ReplayMode } from "./evaluation/replay.js";
+import { CommandRunner, GitService } from "./execution.js";
+import { operationInputHash } from "./bindings.js";
 import {
   createProviderProfile,
   providerProfileNames,
@@ -148,25 +151,77 @@ evaluation
     withEvaluationStores((development, evaluationStore) => {
       const realRuns = development.listRuns();
       const projections = realRuns.map((run) => projectRunMetrics(exportRunFacts(development, run.id)));
+      const datasets = DatasetCatalog.loadDirectory(resolve("eval")).list("readiness");
       const report = evaluateReadiness({
         realRunCount: realRuns.length,
         resolvedFindingCount: projections.reduce((total, value) =>
           total + value.reviewerFindings.confirmed + value.reviewerFindings.rejected, 0),
-        exactReplayCount: realRuns.filter((run) => gradeReplayability({
-          binding: run.binding,
-          manifests: development.listInvocationManifests(run.id),
-          requiredOperationIds: development.listOperations(run.id)
-            .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
-            .map((operation) => operation.id),
-        }).grade === "exact").length,
-        goldenTaskCount: 0,
-        holdoutTaskCount: 0,
+        exactReplayCount: evaluationStore.listEvaluationRuns()
+          .filter((run) => run.status === "completed" && run.replayability === "exact").length,
+        goldenTaskCount: datasets.filter((dataset) => dataset.kind === "golden")
+          .reduce((total, dataset) => total + dataset.tasks.length, 0),
+        holdoutTaskCount: datasets.filter((dataset) => dataset.kind === "holdout")
+          .reduce((total, dataset) => total + dataset.tasks.length, 0),
         completedOfflineComparisons: 0,
         completedShadowRuns: 0,
         humanCanaryApproval: false,
       });
       evaluationStore.recordReadiness(report);
       print(report);
+    });
+  });
+
+evaluation
+  .command("replay")
+  .requiredOption("--run-id <id>")
+  .option("--mode <mode>", "verify-only; full requires an injected full Replay executor", "verify-only")
+  .option("--evaluation-id <id>")
+  .description("create a separate immutable Evaluation Run without mutating the development Run")
+  .action(async (options: { runId: string; mode: string; evaluationId?: string }) => {
+    const mode = parseReplayMode(options.mode);
+    await withEvaluationStoresAsync(async (development, evaluationStore, home) => {
+      const run = development.getRun(options.runId);
+      if (!run) throw new Error(`Run not found: ${options.runId}`);
+      const facts = evaluationStore.installFactBundle(exportRunFacts(development, options.runId));
+      const evaluationId = options.evaluationId ?? `replay:${options.runId}:${Date.now()}`;
+      const replay = new HistoricalReplay(evaluationStore, async (replayFacts, replayMode, binding) => {
+        if (replayMode === "full") throw new Error("FullReplayExecutorUnavailable");
+        const commit = pinnedVerificationCommit(replayFacts);
+        if (!commit || new GitService(binding.worktreePath).head() !== commit) {
+          throw new Error("PinnedVerificationCommitUnavailable");
+        }
+        const runner = new CommandRunner();
+        const receipts = [];
+        for (const command of binding.taskSpec.verification) {
+          const result = await runner.run({
+            argv: command.argv,
+            cwd: binding.worktreePath,
+            artifactDirectory: resolve(home, "evaluation-runs", evaluationId, command.id),
+            environmentAllowlist: ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE"],
+            timeoutMs: 60_000,
+            outputLimitBytes: 1024 * 1024,
+            shell: false,
+          });
+          receipts.push({ commandId: command.id, exitCode: result.exitCode, signal: result.signal,
+            timedOut: result.timedOut, commitBefore: result.commitBefore });
+        }
+        const passed = receipts.every((receipt) => receipt.exitCode === 0 && receipt.signal === null &&
+          !receipt.timedOut && receipt.commitBefore === commit);
+        return {
+          passed,
+          evidenceHash: operationInputHash(receipts),
+          diagnostics: receipts.filter((receipt) => receipt.exitCode !== 0).map((receipt) => receipt.commandId),
+        };
+      });
+      print(await replay.run({
+        id: evaluationId,
+        facts,
+        binding: run.binding,
+        mode,
+        requiredOperationIds: development.listOperations(options.runId)
+          .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
+          .map((operation) => operation.id),
+      }));
     });
   });
 
@@ -245,6 +300,21 @@ function withEvaluationStores(action: (development: SqliteStore, evaluation: Eva
   }
 }
 
+async function withEvaluationStoresAsync(
+  action: (development: SqliteStore, evaluation: EvaluationStore, home: string) => Promise<void>,
+): Promise<void> {
+  const home = resolve(program.opts<{ loopHome: string }>().loopHome);
+  mkdirSync(home, { recursive: true });
+  const development = new SqliteStore(resolve(home, "state.sqlite"));
+  const evaluationStore = new EvaluationStore(resolve(home, "evaluation.sqlite"));
+  try {
+    await action(development, evaluationStore, home);
+  } finally {
+    evaluationStore.close();
+    development.close();
+  }
+}
+
 function print(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
@@ -252,6 +322,11 @@ function print(value: unknown): void {
 function parseProviderProfileName(value: string): ProviderProfileName {
   if (providerProfileNames.includes(value as ProviderProfileName)) return value as ProviderProfileName;
   throw new Error(`Unknown Provider profile: ${value}`);
+}
+
+function parseReplayMode(value: string): ReplayMode {
+  if (value === "full" || value === "verify-only") return value;
+  throw new Error(`Unknown Replay mode: ${value}`);
 }
 
 function configuredPiAdapter(): ProviderAdapter {
