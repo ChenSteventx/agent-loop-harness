@@ -9,8 +9,8 @@ const commit = "abc123";
 function finding(overrides: Partial<Finding> = {}): Finding {
   return {
     id: "F1", category: "correctness", severity: "high", claim: "behavior is wrong", location: "src/a.ts:1",
-    reproductionCommand: "npm test", expectedResult: "exit 0", observedResult: "exit 1", confidence: 0.9,
-    proposedVerification: "run npm test", reviewerIdentity: identity, reviewedCommit: commit, status: "open", ...overrides,
+    reproductionCommand: ["npm", "test"], evidenceIds: [], expectedResult: "exit 0", observedResult: "exit 1", confidence: 0.9,
+    proposedVerification: "run npm test", reviewerIdentity: identity, reviewedCommit: commit, status: "proposed", ...overrides,
   };
 }
 
@@ -25,8 +25,8 @@ class FakeReviewer implements ProviderAdapter {
       finalOutput: {
         findings: [{
           id: "F1", category: "correctness", severity: "high", claim: "behavior is wrong", location: "src/a.ts:1",
-          reproductionCommand: "npm test", expectedResult: "exit 0", observedResult: "exit 1", confidence: 0.9,
-          proposedVerification: "run npm test", status: "open",
+          reproductionCommand: ["npm", "test"], evidenceIds: [], expectedResult: "exit 0", observedResult: "exit 1", confidence: 0.9,
+          proposedVerification: "run npm test", status: "proposed",
         }],
       }, stderr: "", exitCode: 0, signal: null, durationMs: 1, usage: null,
       failureClass: null, eventsPath: "events", finalOutputPath: "final", stderrPath: "stderr" };
@@ -36,7 +36,7 @@ class FakeReviewer implements ProviderAdapter {
 
 function input() {
   return { task: { id: "T", goal: "fix", acceptance: ["works"], risk: "high" as const, verification: [{ id: "test", argv: ["npm", "test"] as [string, ...string[]] }] },
-    diff, reviewedCommit: commit, diffHash: hashReviewDiff(diff), verificationEvidence: [{ command: ["npm", "test"], exitCode: 0, commitSha: commit, result: "passed" }],
+    diff, reviewedCommit: commit, diffHash: hashReviewDiff(diff), verificationEvidence: [{ evidenceId: "E1", command: ["npm", "test"], exitCode: 0, commitSha: commit, result: "passed" }],
     allowedRepositoryRoots: ["/repo"], contextBudget: 100, controlStateHash: "control-1" };
 }
 
@@ -77,10 +77,11 @@ describe("independent reviewer", () => {
     expect(invalidateStaleReview(clean, { commit: "new", diffHash: state.diffHash })).toMatchObject({ stale: true, report: null });
   });
 
-  it("keeps findings without evidence non-blocking unless policy explicitly requires it", () => {
+  it("requires a Harness-confirmed lifecycle state before a finding can block", () => {
     const unsupported = finding({ reproductionCommand: null, expectedResult: null, observedResult: null });
     expect(isBlockingFinding(unsupported)).toBe(false);
-    expect(isBlockingFinding(unsupported, { blockWithoutEvidence: true })).toBe(true);
+    expect(isBlockingFinding(finding())).toBe(false);
+    expect(isBlockingFinding(finding({ status: "confirmed" }))).toBe(true);
     expect(conflictResolution(unsupported)).toBe("evidence_request");
     expect(conflictResolution(finding())).toBe("deterministic_experiment");
   });

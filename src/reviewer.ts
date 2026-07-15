@@ -5,9 +5,10 @@ import type { TaskSpec } from "./task-spec.js";
 
 export const findingCategories = ["correctness", "acceptance", "security", "reliability", "test", "maintainability"] as const;
 export const findingSeverities = ["low", "medium", "high", "critical"] as const;
-export const findingStatuses = ["open", "evidence_requested", "verified", "dismissed"] as const;
+export const findingStatuses = ["proposed", "confirmed", "rejected", "fixed"] as const;
 
 const optionalText = z.string().trim().min(1).nullable();
+const optionalArgv = z.tuple([z.string().trim().min(1)]).rest(z.string()).nullable();
 
 export const reviewerFindingOutputSchema = z.object({
   id: z.string().trim().min(1),
@@ -15,12 +16,13 @@ export const reviewerFindingOutputSchema = z.object({
   severity: z.enum(findingSeverities),
   claim: z.string().trim().min(1),
   location: z.string().trim().min(1),
-  reproductionCommand: optionalText,
+  reproductionCommand: optionalArgv,
+  evidenceIds: z.array(z.string().trim().min(1)),
   expectedResult: optionalText,
   observedResult: optionalText,
   confidence: z.number().min(0).max(1),
   proposedVerification: z.string().trim().min(1),
-  status: z.enum(findingStatuses),
+  status: z.literal("proposed"),
 }).strict();
 
 const reviewerIdentitySchema = z.object({
@@ -33,6 +35,7 @@ const reviewerIdentitySchema = z.object({
 export const reviewerOutputSchema = z.object({ findings: z.array(reviewerFindingOutputSchema) }).strict();
 
 export const findingSchema = reviewerFindingOutputSchema.extend({
+  status: z.enum(findingStatuses),
   reviewerIdentity: z.object({
     provider: z.string().trim().min(1),
     model: z.string().nullable(),
@@ -47,6 +50,7 @@ export type Finding = z.infer<typeof findingSchema>;
 export type ReviewReport = z.infer<typeof reviewReportSchema>;
 
 export interface VerificationEvidence {
+  evidenceId: string;
   command: readonly string[];
   exitCode: number;
   commitSha: string;
@@ -127,14 +131,14 @@ export function invalidateStaleReview(result: ReviewerResult, current: Pick<Revi
 }
 
 export function isBlockingFinding(finding: Finding, policy: FindingPolicy = {}): boolean {
-  if (finding.status === "dismissed") return false;
-  const hasEvidence = finding.reproductionCommand !== null && finding.expectedResult !== null && finding.observedResult !== null;
-  if (!hasEvidence && !policy.blockWithoutEvidence) return false;
+  if (finding.status !== "confirmed") return false;
   return (policy.blockingSeverities ?? ["high", "critical"]).includes(finding.severity);
 }
 
 export function conflictResolution(finding: Finding): "evidence_request" | "deterministic_experiment" {
-  return finding.reproductionCommand === null ? "evidence_request" : "deterministic_experiment";
+  return finding.reproductionCommand === null && finding.evidenceIds.length === 0
+    ? "evidence_request"
+    : "deterministic_experiment";
 }
 
 export async function runReviewedRepair<T>(initial: T, repair: (value: T) => Promise<T>, verify: (value: T) => Promise<boolean>): Promise<{ value: T; repairs: 0 | 1; verified: boolean }> {
@@ -168,6 +172,9 @@ function reviewerPrompt(input: ReviewerInput): string {
     `Diff SHA-256: ${input.diffHash}`,
     `Diff: ${input.diff}`,
     `Verification evidence: ${JSON.stringify(input.verificationEvidence)}`,
+    "Every Finding must have status proposed. The Harness alone may confirm, reject, or fix it.",
+    "A reproductionCommand is an argv array executed without a shell and must exit 0 only when the claimed defect is reproduced.",
+    "Use evidenceIds only for machine Evidence IDs present in the supplied verification evidence.",
     "Return only structured findings. Do not report provider identity or the reviewed commit; the Harness binds those facts.",
     "Do not vote. For conflicts request evidence or propose a deterministic experiment.",
   ].join("\n");

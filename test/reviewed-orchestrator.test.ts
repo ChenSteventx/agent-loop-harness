@@ -104,7 +104,7 @@ class RepairingAuthor implements ProviderAdapter {
   }
 }
 
-type ReviewOutcome = "clean" | "blocking" | "quota";
+type ReviewOutcome = "clean" | "blocking" | "unsupported" | "quota";
 
 class Reviewer implements ProviderAdapter {
   readonly workspaceIsolation;
@@ -127,18 +127,23 @@ class Reviewer implements ProviderAdapter {
     const outcome = this.outcomes.shift() ?? "clean";
     if (outcome === "quota") return result(request, this.providerName, null, "quota");
     return result(request, this.providerName, {
-      findings: outcome === "blocking" ? [{
+      findings: outcome === "blocking" || outcome === "unsupported" ? [{
         id: "F-1",
         category: "acceptance",
         severity: "high",
         claim: "changed.txt still contains the unreviewed value",
         location: "changed.txt:1",
-        reproductionCommand: "node -e read changed.txt",
+        reproductionCommand: outcome === "blocking" ? [
+            process.execPath,
+            "-e",
+            "const fs=require('fs');process.exit(fs.readFileSync('changed.txt','utf8').includes('broken')?0:1)",
+          ] : null,
+        evidenceIds: [],
         expectedResult: "fixed",
         observedResult: "broken",
         confidence: 1,
         proposedVerification: "read changed.txt after Repair",
-        status: "open",
+        status: "proposed",
       }] : [],
     });
   }
@@ -213,7 +218,9 @@ describe("reviewed Orchestrator profile", () => {
     expect(author.requests).toHaveLength(2);
     expect(reviewer.requests).toHaveLength(2);
     expect(author.requests[1]?.prompt).toContain("changed.txt still contains the unreviewed value");
+    expect(reviewer.requests[0]?.cwd).toBe(view.worktreePath);
     expect(view.operations.filter((item) => item.kind === "repair")).toHaveLength(1);
+    expect(view.operations.filter((item) => item.kind === "finding-validation")).toHaveLength(1);
     expect(view.operations.filter((item) => item.kind === "verify:check")).toHaveLength(2);
     expect(view.operations.filter((item) => item.kind === "independent-review")).toHaveLength(2);
     expect(Number(git(view.worktreePath, ["rev-list", "--count", "HEAD"]))).toBe(3);
@@ -245,6 +252,28 @@ describe("reviewed Orchestrator profile", () => {
     expect(view.evidence.filter((item) => item.kind === "independent_review" && item.status === "invalid")).toHaveLength(1);
     loop.close();
   }, 180_000);
+
+  it("rejects an unsupported model-only Finding without triggering automatic Repair", async () => {
+    const target = fixture();
+    const author = new RepairingAuthor();
+    const reviewer = new Reviewer("unsupported-claim-reviewer", ["unsupported"]);
+    const loop = orchestrator(author, reviewer, new Reviewer("unused-fallback", ["clean"]));
+    const view = await loop.start({
+      runId: "reviewed-unconfirmed-claim", taskPath: target.taskPath, targetRepository: target.root,
+    });
+
+    expect(view.run.status).toBe("ready");
+    expect(author.requests).toHaveLength(1);
+    expect(view.operations.filter((item) => item.kind === "repair")).toHaveLength(0);
+    expect(view.operations.find((item) => item.kind === "finding-validation")?.result).toMatchObject({
+      status: "rejected",
+    });
+    expect(view.evidence.find((item) => item.kind === "independent_review")?.data).toMatchObject({
+      blocking: false,
+      report: { findings: [expect.objectContaining({ status: "rejected" })] },
+    });
+    loop.close();
+  }, 120_000);
 
   it("persists quota fallback facts and binds the receipt to the selected configured family", async () => {
     const target = fixture();
@@ -413,7 +442,7 @@ describe("reviewed Orchestrator profile", () => {
     const view = await loop.start({ runId, taskPath: target.taskPath, targetRepository: target.root });
 
     expect(view.run.status).toBe("blocked");
-    expect(view.run.blocked?.reason).toContain("boundary check failed");
+    expect(view.run.blocked?.reason).toContain("evidence check failed");
     expect(reviewer.requests).toHaveLength(1);
     expect(view.operations.find((item) => item.kind === "independent-review")?.status).toBe("failed");
     expect(view.evidence.some((item) => item.kind === "independent_review" && item.status === "valid")).toBe(false);

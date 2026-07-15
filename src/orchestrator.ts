@@ -49,6 +49,8 @@ import {
   reviewReportSchema,
   reviewerOutputSchema,
   runReviewer,
+  type Finding,
+  type ReviewReport,
   type VerificationEvidence,
 } from "./reviewer.js";
 
@@ -736,7 +738,7 @@ export class Orchestrator {
 
     const savedCompletion = this.reviewProviderCompletion(runId, operation.id);
     if (savedCompletion) {
-      this.recoverReviewOperation(runId, operation, candidates, savedCompletion);
+      await this.recoverReviewOperation(runId, operation, candidates, savedCompletion);
       return;
     }
 
@@ -777,8 +779,7 @@ export class Orchestrator {
     const supervised = new SupervisedReviewerAdapter(supervisor);
     const verificationEvidence = this.reviewVerificationEvidence(runId, reviewedCommit);
     const reviewDirectory = resolve(this.loopHome, "runs", runId, "review", reviewedCommit);
-    const reviewerCwd = resolve(reviewDirectory, "workspace");
-    mkdirSync(reviewerCwd, { recursive: true });
+    const reviewerCwd = binding.worktreePath;
     try {
       const result = await runReviewer(supervised, {
         task: binding.taskSpec,
@@ -823,9 +824,16 @@ export class Orchestrator {
         latencyMs: result.provider.durationMs,
         usage: result.provider.usage,
       });
-      const blockingFindings = result.report.findings.filter((finding) => isBlockingFinding(finding));
+      const validatedReport = await this.validateReviewFindings(
+        runId,
+        operation,
+        result.report,
+        reviewedCommit,
+        git,
+      );
+      const blockingFindings = validatedReport.findings.filter((finding) => isBlockingFinding(finding));
       operation = this.store.finishOperation(operation.id, "succeeded", {
-        report: result.report,
+        report: validatedReport,
         blocking: blockingFindings.length > 0,
         blockingFindingIds: blockingFindings.map((finding) => finding.id),
         reviewedCommit,
@@ -848,9 +856,9 @@ export class Orchestrator {
     } catch (error) {
       if (error instanceof ReviewProviderCompletionInterruption) throw error;
       operation = this.store.finishOperation(operation.id, "failed", {
-        reason: `Independent Reviewer violated its boundary or the review binding changed: ${errorMessage(error)}`,
+        reason: `Independent review or Finding validation failed closed: ${errorMessage(error)}`,
       });
-      this.requireHumanReview(runId, "Independent Reviewer boundary check failed", operation.result, operation.id);
+      this.requireHumanReview(runId, "Independent review evidence check failed", operation.result, operation.id);
     }
   }
 
@@ -1128,8 +1136,147 @@ export class Orchestrator {
       if (!Array.isArray(item.data.argv) || item.data.argv.some((part) => typeof part !== "string") || item.data.exitCode !== 0) {
         return [];
       }
-      return [{ command: item.data.argv as string[], exitCode: 0, commitSha, result: "passed" }];
+      return [{ evidenceId: item.id, command: item.data.argv as string[], exitCode: 0, commitSha, result: "passed" }];
     });
+  }
+
+  private async validateReviewFindings(
+    runId: string,
+    reviewOperation: Operation,
+    report: ReviewReport,
+    reviewedCommit: string,
+    git: GitService,
+  ): Promise<ReviewReport> {
+    const findings: Finding[] = [];
+    for (const finding of report.findings) {
+      findings.push(await this.validateFinding(runId, reviewOperation, finding, reviewedCommit, git));
+    }
+    return reviewReportSchema.parse({ findings });
+  }
+
+  private async validateFinding(
+    runId: string,
+    reviewOperation: Operation,
+    finding: Finding,
+    reviewedCommit: string,
+    git: GitService,
+  ): Promise<Finding> {
+    const run = this.requireBoundRun(runId);
+    const input = {
+      role: "finding-validation",
+      reviewOperationId: reviewOperation.id,
+      reviewedCommit,
+      findingId: finding.id,
+      claim: finding.claim,
+      severity: finding.severity,
+      reproductionCommand: finding.reproductionCommand,
+      evidenceIds: finding.evidenceIds,
+    };
+    const inputHash = operationInputHash(input);
+    const operationId = `${reviewOperation.id}:finding-validation:${inputHash.slice(0, 16)}`;
+    let operation = this.store.createOperation({
+      id: operationId,
+      runId,
+      kind: "finding-validation",
+      idempotencyKey: operationId,
+      input,
+    });
+    if (operation.status === "failed") {
+      throw new Error(`Finding validation previously failed: ${finding.id}`);
+    }
+    if (operation.status === "running") {
+      const validEvidence = this.store.listEvidence(runId, "valid");
+      const referenced = finding.evidenceIds.map((id) => validEvidence.find((item) => item.id === id));
+      const referencesConfirmed = referenced.length > 0 && referenced.every((item) =>
+        item !== undefined &&
+        item.commitSha === reviewedCommit &&
+        (item.kind === "command" || item.kind === "verification_failure")
+      );
+      let commandResult: Awaited<ReturnType<CommandRunner["run"]>> | null = null;
+      let commandError: string | null = null;
+      let reproduced = referencesConfirmed;
+      if (!referencesConfirmed && finding.reproductionCommand) {
+        const before = {
+          head: git.head(),
+          dirty: git.isDirty(),
+          diffHash: git.diffHash(),
+          controlStateHash: git.controlStateHash(),
+        };
+        try {
+          commandResult = await this.commandRunner.run({
+            argv: finding.reproductionCommand,
+            cwd: run.binding.worktreePath,
+            artifactDirectory: resolve(
+              this.loopHome,
+              "runs",
+              runId,
+              "review",
+              reviewedCommit,
+              "finding-validation",
+              inputHash.slice(0, 16),
+            ),
+            environmentAllowlist: commandEnvironmentAllowlist(),
+            timeoutMs: 60_000,
+            outputLimitBytes: 1024 * 1024,
+            shell: false,
+          });
+          const boundaryChanged =
+            before.head !== git.head() ||
+            before.dirty !== git.isDirty() ||
+            before.diffHash !== git.diffHash() ||
+            before.controlStateHash !== git.controlStateHash();
+          if (boundaryChanged) {
+            operation = this.store.finishOperation(operation.id, "failed", {
+              reason: "Finding reproduction command changed the reviewed worktree or Git control state",
+              commandResult,
+            });
+            throw new Error(String((operation.result as { reason: string }).reason));
+          }
+          reproduced = commandResult.commitBefore === reviewedCommit &&
+            commandResult.exitCode === 0 &&
+            commandResult.signal === null &&
+            !commandResult.timedOut;
+        } catch (error) {
+          if (this.store.getOperation(operation.id)?.status === "failed") throw error;
+          commandError = errorMessage(error);
+        }
+      }
+      const status = reproduced ? "confirmed" : "rejected";
+      operation = this.store.finishOperation(operation.id, "succeeded", {
+        findingId: finding.id,
+        status,
+        machineEvidenceIds: referencesConfirmed ? finding.evidenceIds : [],
+        commandResult,
+        commandError,
+      });
+    }
+    if (!isRecord(operation.result) ||
+      (operation.result.status !== "confirmed" && operation.result.status !== "rejected")) {
+      throw new Error(`Finding validation result is invalid: ${finding.id}`);
+    }
+    const stepId = `finding-validation:${finding.id}`;
+    const dependencies = evidenceDependencies({
+      commitSha: reviewedCommit,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      operationInputHash: operation.inputHash ?? inputHash,
+    });
+    const dependencyHash = evidenceDependencyHash(dependencies);
+    this.store.installEvidence({
+      id: `${runId}:evidence:finding-validation:${dependencyHash.slice(0, 12)}`,
+      runId,
+      operationId: operation.id,
+      kind: "finding_validation",
+      commitSha: reviewedCommit,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      dependencyHash,
+      dependencies,
+      data: operation.result,
+    });
+    return { ...finding, status: operation.result.status };
   }
 
   private reviewProviderCompletion(runId: string, operationId: string): ReviewProviderCompletion | null {
@@ -1165,12 +1312,12 @@ export class Orchestrator {
     };
   }
 
-  private recoverReviewOperation(
+  private async recoverReviewOperation(
     runId: string,
     operation: Operation,
     candidates: readonly ConfiguredProvider[],
     completion: ReviewProviderCompletion,
-  ): void {
+  ): Promise<void> {
     const run = this.requireBoundRun(runId);
     const input = reviewOperationData(operation.input);
     const selected = candidates[completion.selectedAdapterIndex];
@@ -1203,9 +1350,16 @@ export class Orchestrator {
       latencyMs: completion.result.durationMs,
       usage: completion.result.usage,
     });
-    const blockingFindings = report.findings.filter((finding) => isBlockingFinding(finding));
-    const completed = this.store.finishOperation(operation.id, "succeeded", {
+    const validatedReport = await this.validateReviewFindings(
+      runId,
+      operation,
       report,
+      input.reviewedCommit,
+      git,
+    );
+    const blockingFindings = validatedReport.findings.filter((finding) => isBlockingFinding(finding));
+    const completed = this.store.finishOperation(operation.id, "succeeded", {
+      report: validatedReport,
       blocking: blockingFindings.length > 0,
       blockingFindingIds: blockingFindings.map((finding) => finding.id),
       reviewedCommit: input.reviewedCommit,
@@ -1249,6 +1403,7 @@ export class Orchestrator {
       "candidate_commit",
       "command",
       "verification_failure",
+      "finding_validation",
       "independent_review",
       "acceptance_binding",
     ];
@@ -1585,7 +1740,7 @@ export class Orchestrator {
       dependencyHash,
       dependencies,
       data: candidate,
-    }, ["candidate_commit", "command", "verification_failure", "independent_review", "acceptance_binding"]);
+    }, ["candidate_commit", "command", "verification_failure", "finding_validation", "independent_review", "acceptance_binding"]);
     return candidate;
   }
 
