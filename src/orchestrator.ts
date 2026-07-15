@@ -39,6 +39,7 @@ import {
 import {
   independentReviewCandidates,
   withFallbackOutbox,
+  workspaceRoleCandidates,
   type ConfiguredProvider,
   type ProviderProfile,
 } from "./profiles.js";
@@ -106,6 +107,19 @@ interface WriterProviderCompletion {
   failureClass: string | null;
   identity: unknown;
   outputHash: string;
+  selectedAdapterIndex?: number;
+  attempt?: number;
+  configuredAuthor?: { family: string; name: string };
+  result?: ProviderRunResult;
+}
+
+interface ExplorerProviderCompletion {
+  operationId: string;
+  operationInputHash: string;
+  selectedAdapterIndex: number;
+  attempt: number;
+  configuredExplorer: { family: string; name: string };
+  result: ProviderRunResult;
 }
 
 interface ReviewProviderCompletion {
@@ -383,7 +397,7 @@ export class Orchestrator {
 
     let review: ProofGapSnapshot["review"] = "not-required";
     if (binding.executionTemplate === "reviewed" && acceptance === "satisfied" && verification === "passed") {
-      const candidates = this.safeReviewCandidates();
+      const candidates = this.safeReviewCandidates(runId);
       const reviewInput = this.reviewOperationInput(
         runId,
         git.head(),
@@ -432,15 +446,24 @@ export class Orchestrator {
   private async executeExplorer(runId: string): Promise<void> {
     const run = this.requireBoundRun(runId);
     const binding = run.binding;
-    if (this.providerProfile && this.provider.workspaceIsolation?.readOnly !== "enforced") {
+    const candidates = this.providerProfile
+      ? workspaceRoleCandidates(this.providerProfile, "read-only")
+      : [];
+    if (this.providerProfile && candidates.length === 0) {
       this.requireHumanReview(
         runId,
-        "The configured Explorer cannot prove read-only isolation",
-        { profile: this.providerProfile.name, author: configuredProviderFact(this.providerProfile.author) },
+        "No configured Explorer can prove read-only isolation",
+        {
+          profile: this.providerProfile.name,
+          configuredExplorers: [this.providerProfile.author, this.providerProfile.fallbackAuthor].map(configuredProviderFact),
+        },
         "provider-isolation",
       );
       return;
     }
+    const git = new GitService(binding.worktreePath);
+    const before = git.state();
+    const beforeControlState = git.controlStateHash();
     const operation = this.store.createOperation({
       id: `${runId}:explorer`,
       runId,
@@ -449,6 +472,8 @@ export class Orchestrator {
       input: {
         taskSpecHash: binding.taskSpecHash,
         baselineCommit: binding.baselineCommit,
+        currentCommit: before.head,
+        gitControlHash: beforeControlState,
         contextBudget: this.explorerContextBudget,
       },
     });
@@ -457,10 +482,76 @@ export class Orchestrator {
       return;
     }
     if (operation.status !== "running") return;
-    const git = new GitService(binding.worktreePath);
-    const before = git.state();
-    const beforeControlState = git.controlStateHash();
-    const result = await runExplorer(this.provider, {
+    const savedCompletion = this.explorerProviderCompletion(runId, operation.id);
+    if (savedCompletion) {
+      const selected = candidates[savedCompletion.selectedAdapterIndex];
+      const input = explorerOperationInput(operation.input);
+      const report = explorerReportSchema.safeParse(savedCompletion.result.finalOutput);
+      if (
+        savedCompletion.operationInputHash !== operation.inputHash ||
+        !selected ||
+        selected.family !== savedCompletion.configuredExplorer.family ||
+        selected.name !== savedCompletion.configuredExplorer.name ||
+        !report.success ||
+        git.head() !== input.currentCommit ||
+        git.isDirty() ||
+        git.controlStateHash() !== input.gitControlHash
+      ) {
+        this.store.finishOperation(operation.id, "failed", {
+          reason: "Recovered Explorer completion no longer matches its read-only boundary",
+          providerCompletion: savedCompletion,
+        });
+        return;
+      }
+      const completed = this.store.finishOperation(operation.id, "succeeded", {
+        report: report.data,
+        costTokens: providerUsageTokens(savedCompletion.result),
+        latencyMs: savedCompletion.result.durationMs,
+        used: true,
+        selectedExplorer: configuredProviderFact(selected),
+        recoveredAfterProviderCompletion: true,
+      });
+      this.installExplorationEvidence(runId, completed);
+      return;
+    }
+
+    let provider = this.provider;
+    let supervised: SupervisedRoleAdapter | null = null;
+    if (this.providerProfile) {
+      const persistence = withFallbackOutbox({
+        saveCheckpoint: (checkpoint) => {
+          const selected = candidates[checkpoint.selectedAdapterIndex];
+          if (!selected) throw new Error("Provider Supervisor selected an unknown Explorer adapter");
+          this.store.appendEvent(runId, "explorer.provider-completed", {
+            operationId: operation.id,
+            operationInputHash: operation.inputHash,
+            selectedAdapterIndex: checkpoint.selectedAdapterIndex,
+            attempt: checkpoint.attempt,
+            configuredExplorer: configuredProviderFact(selected),
+            result: checkpoint.result,
+          });
+          this.store.appendEvent(runId, "provider.checkpoint", {
+            invocationId: checkpoint.invocationId,
+            provider: checkpoint.provider,
+            threadId: checkpoint.threadId,
+            selectedAdapterIndex: checkpoint.selectedAdapterIndex,
+            attempt: checkpoint.attempt,
+            role: "explorer",
+          });
+        },
+        saveFailure: (failure) => this.store.appendEvent(runId, "provider.failure", { role: "explorer", ...failure }),
+        saveFallback: (fallback) => this.store.appendEvent(runId, "provider.fallback", { role: "explorer", ...fallback }),
+      }, this.store, runId);
+      supervised = new SupervisedRoleAdapter(new ProviderSupervisor({
+        adapters: candidates.map((candidate) => candidate.adapter),
+        persistence,
+        authRecoveryCommand: `Authenticate a configured Explorer, then run: agent-loop resume --run-id ${runId}`,
+        unknownRecoveryCommand: `Inspect Explorer artifacts, then run: agent-loop resume --run-id ${runId}`,
+      }), (result) => explorerReportSchema.safeParse(result.finalOutput).success, "Explorer");
+      provider = supervised;
+    }
+
+    const result = await runExplorer(provider, {
       task: binding.taskSpec,
       baselineCommit: binding.baselineCommit,
       currentCommit: before.head,
@@ -472,6 +563,22 @@ export class Orchestrator {
       artifactDirectory: resolve(this.loopHome, "runs", runId, "explorer"),
       outputSchemaPath: this.roleOutputSchemas.explorer,
     });
+    const selected = supervised?.outcome?.selectedAdapterIndex === null || supervised?.outcome?.selectedAdapterIndex === undefined
+      ? null
+      : candidates[supervised.outcome.selectedAdapterIndex] ?? null;
+    if (this.providerProfile && (!result.report || !supervised?.outcome?.result || !selected)) {
+      const providerBlock = {
+        reason: "No configured Explorer produced a valid structured report",
+        supervisor: supervised?.outcome ?? null,
+      };
+      this.store.appendEvent(runId, "explorer.provider-blocked", {
+        operationId: operation.id,
+        operationInputHash: operation.inputHash,
+        ...providerBlock,
+      });
+      this.requireHumanReview(runId, "Explorer is unavailable", providerBlock, "provider-recovery");
+      return;
+    }
     this.store.recordAgentCall(runId, {
       role: "explorer",
       provider: result.provider.identity.provider,
@@ -497,6 +604,7 @@ export class Orchestrator {
       latencyMs: result.latencyMs,
       used: result.used,
       failureClass: result.provider.failureClass,
+      selectedExplorer: selected ? configuredProviderFact(selected) : null,
     });
     this.afterExplorerOperationCompleted?.();
     if (completed.status === "succeeded") this.installExplorationEvidence(runId, completed);
@@ -509,11 +617,17 @@ export class Orchestrator {
   ): Promise<void> {
     const run = this.requireBoundRun(runId);
     const binding = run.binding;
-    if (this.providerProfile && this.provider.workspaceIsolation?.workspaceWrite !== "enforced") {
+    const candidates = this.providerProfile
+      ? workspaceRoleCandidates(this.providerProfile, "workspace-write")
+      : [];
+    if (this.providerProfile && candidates.length === 0) {
       this.requireHumanReview(
         runId,
-        "The configured Author cannot prove workspace-write isolation",
-        { profile: this.providerProfile.name, author: configuredProviderFact(this.providerProfile.author) },
+        "No configured Author can prove workspace-write isolation",
+        {
+          profile: this.providerProfile.name,
+          configuredAuthors: [this.providerProfile.author, this.providerProfile.fallbackAuthor].map(configuredProviderFact),
+        },
         "provider-isolation",
       );
       return;
@@ -539,6 +653,7 @@ export class Orchestrator {
       taskSpecHash: binding.taskSpecHash,
       acceptanceHash: binding.acceptanceHash,
       configuredAuthor: this.providerProfile ? configuredProviderFact(this.providerProfile.author) : null,
+      configuredAuthors: candidates.map(configuredProviderFact),
       failureEvidenceIds: failureEvidence.map((item) => item.id),
       failureSignatures: failureEvidence.map(failureEvidenceSignature).filter((value): value is string => value !== null),
     };
@@ -553,17 +668,12 @@ export class Orchestrator {
     if (operation.status !== "running") return;
     const completedReceipt = this.writerProviderReceipt(runId, operation.id);
     if (completedReceipt) {
-      this.store.finishOperation(operation.id, "failed", {
-        reason: completedReceipt.ok
-          ? "Completed Writer call produced no recoverable working diff"
-          : "Writer Provider call completed unsuccessfully",
-        providerCompletion: completedReceipt,
-      });
+      this.recoverWriterOperation(runId, operation, git);
       return;
     }
     if (!existingOperation) this.afterWriterOperationCreated?.(role);
     const explorerReport = this.savedExplorerReport(runId);
-    const providerResult = await this.provider.run({
+    const request: ProviderRunRequest = {
       invocationId: operation.id,
       prompt: role === "author"
         ? authorPrompt(binding.taskSpec, explorerReport)
@@ -573,25 +683,85 @@ export class Orchestrator {
       outputSchemaPath: this.roleOutputSchemas.author,
       workspaceAccess: "workspace-write",
       allowedRepositoryRoots: [binding.worktreePath],
-    });
+    };
+    let providerResult: ProviderRunResult;
+    let selectedAuthor: ConfiguredProvider | null = null;
+    if (this.providerProfile) {
+      const persistence = withFallbackOutbox({
+        saveCheckpoint: (checkpoint) => {
+          const selected = candidates[checkpoint.selectedAdapterIndex];
+          if (!selected) throw new Error("Provider Supervisor selected an unknown Author adapter");
+          this.store.appendEvent(runId, "writer.provider-completed", {
+            operationId: operation.id,
+            invocationId: checkpoint.result.invocationId,
+            operationInputHash: operation.inputHash,
+            ok: checkpoint.result.ok,
+            exitCode: checkpoint.result.exitCode,
+            signal: checkpoint.result.signal,
+            failureClass: checkpoint.result.failureClass,
+            identity: checkpoint.result.identity,
+            outputHash: operationInputHash(checkpoint.result.finalOutput),
+            selectedAdapterIndex: checkpoint.selectedAdapterIndex,
+            attempt: checkpoint.attempt,
+            configuredAuthor: configuredProviderFact(selected),
+            result: checkpoint.result,
+          });
+          this.store.appendEvent(runId, "provider.checkpoint", {
+            invocationId: checkpoint.invocationId,
+            provider: checkpoint.provider,
+            threadId: checkpoint.threadId,
+            selectedAdapterIndex: checkpoint.selectedAdapterIndex,
+            attempt: checkpoint.attempt,
+            role,
+          });
+          this.afterProviderCompletion?.();
+        },
+        saveFailure: (failure) => this.store.appendEvent(runId, "provider.failure", { role, ...failure }),
+        saveFallback: (fallback) => this.store.appendEvent(runId, "provider.fallback", { role, ...fallback }),
+      }, this.store, runId);
+      const outcome = await new ProviderSupervisor({
+        adapters: candidates.map((candidate) => candidate.adapter),
+        persistence,
+        authRecoveryCommand: `Authenticate a configured Author, then run: agent-loop resume --run-id ${runId}`,
+        unknownRecoveryCommand: `Inspect Author artifacts, then run: agent-loop resume --run-id ${runId}`,
+      }).run(request, (result) => authorOutputSchema.safeParse(result.finalOutput).success);
+      selectedAuthor = outcome.selectedAdapterIndex === null ? null : candidates[outcome.selectedAdapterIndex] ?? null;
+      if (outcome.disposition !== "succeeded" || !outcome.result || !selectedAuthor) {
+        const providerBlock = {
+          reason: "No configured Author produced a valid structured result",
+          supervisor: outcome,
+        };
+        this.store.appendEvent(runId, "writer.provider-blocked", {
+          operationId: operation.id,
+          operationInputHash: operation.inputHash,
+          role,
+          ...providerBlock,
+        });
+        this.requireHumanReview(runId, "Author is unavailable", providerBlock, "provider-recovery");
+        return;
+      }
+      providerResult = outcome.result;
+    } else {
+      providerResult = await this.provider.run(request);
+      this.store.appendEvent(runId, "writer.provider-completed", {
+        operationId: operation.id,
+        invocationId: providerResult.invocationId,
+        operationInputHash: operation.inputHash,
+        ok: providerResult.ok,
+        exitCode: providerResult.exitCode,
+        signal: providerResult.signal,
+        failureClass: providerResult.failureClass,
+        identity: providerResult.identity,
+        outputHash: operationInputHash(providerResult.finalOutput),
+      });
+      this.afterProviderCompletion?.();
+    }
     this.store.recordAgentCall(runId, {
       role,
       provider: providerResult.identity.provider,
       latencyMs: providerResult.durationMs,
       usage: providerResult.usage,
     });
-    this.store.appendEvent(runId, "writer.provider-completed", {
-      operationId: operation.id,
-      invocationId: providerResult.invocationId,
-      operationInputHash: operation.inputHash,
-      ok: providerResult.ok,
-      exitCode: providerResult.exitCode,
-      signal: providerResult.signal,
-      failureClass: providerResult.failureClass,
-      identity: providerResult.identity,
-      outputHash: operationInputHash(providerResult.finalOutput),
-    });
-    this.afterProviderCompletion?.();
     if (!providerResult.ok) {
       this.store.finishOperation(operation.id, "failed", providerResult);
       return;
@@ -608,6 +778,7 @@ export class Orchestrator {
       worktreePath: binding.worktreePath,
       baseCommit: input.baseCommit,
       workingDiffHash: git.diffHash(),
+      selectedAuthor: selectedAuthor ? configuredProviderFact(selectedAuthor) : null,
     });
   }
 
@@ -677,14 +848,15 @@ export class Orchestrator {
 
   private async executeReview(runId: string): Promise<void> {
     const run = this.requireBoundRun(runId);
-    const candidates = this.safeReviewCandidates();
+    const candidates = this.safeReviewCandidates(runId);
+    const actualAuthor = this.actualAuthor(runId);
     if (!this.providerProfile || candidates.length === 0) {
       this.requireHumanReview(
         runId,
         "No independently configured Reviewer can prove read-only isolation",
         {
           profile: this.providerProfile?.name ?? null,
-          author: this.providerProfile ? configuredProviderFact(this.providerProfile.author) : null,
+          author: actualAuthor ? configuredProviderFact(actualAuthor) : null,
           configuredReviewers: this.providerProfile
             ? [this.providerProfile.reviewer, this.providerProfile.fallbackReviewer].map(configuredProviderFact)
             : [],
@@ -882,8 +1054,13 @@ export class Orchestrator {
 
   private recoverWriterOperation(runId: string, operation: Operation, git: GitService): Operation {
     const input = writerOperationInput(operation.input);
-    const output = this.readWriterOutput(runId, operation.kind as "author" | "repair", input.attempt);
     const completion = this.writerProviderReceipt(runId, operation.id);
+    const durableOutput = completion?.result
+      ? authorOutputSchema.safeParse(completion.result.finalOutput)
+      : null;
+    const output = durableOutput?.success
+      ? durableOutput.data
+      : this.readWriterOutput(runId, operation.kind as "author" | "repair", input.attempt);
     const completionReason = !completion
       ? "Writer recovery is missing a durable Provider completion receipt"
       : completion.invocationId !== operation.id || completion.operationInputHash !== operation.inputHash
@@ -910,6 +1087,8 @@ export class Orchestrator {
       baseCommit: input.baseCommit,
       workingDiffHash: git.diffHash(),
       report: output,
+      selectedAuthor: completion?.configuredAuthor ?? null,
+      provider: completion?.result ?? null,
     });
     this.store.appendEvent(runId, `${operation.kind}.recovered`, {
       operationId: operation.id,
@@ -937,6 +1116,39 @@ export class Orchestrator {
       typeof data.outputHash !== "string"
     ) return null;
     return data as unknown as WriterProviderCompletion;
+  }
+
+  private explorerProviderCompletion(runId: string, operationId: string): ExplorerProviderCompletion | null {
+    const event = [...this.store.listEvents(runId)].reverse().find((item) =>
+      item.type === "explorer.provider-completed" &&
+      isRecord(item.data) &&
+      item.data.operationId === operationId
+    );
+    if (!event || !isRecord(event.data)) return null;
+    const data = event.data;
+    const configuredExplorer = isRecord(data.configuredExplorer) ? data.configuredExplorer : null;
+    const result = providerRunResultFromUnknown(data.result);
+    if (
+      typeof data.operationId !== "string" ||
+      typeof data.operationInputHash !== "string" ||
+      typeof data.selectedAdapterIndex !== "number" ||
+      !Number.isSafeInteger(data.selectedAdapterIndex) ||
+      data.selectedAdapterIndex < 0 ||
+      typeof data.attempt !== "number" ||
+      !Number.isSafeInteger(data.attempt) ||
+      data.attempt <= 0 ||
+      typeof configuredExplorer?.family !== "string" ||
+      typeof configuredExplorer.name !== "string" ||
+      !result
+    ) return null;
+    return {
+      operationId: data.operationId,
+      operationInputHash: data.operationInputHash,
+      selectedAdapterIndex: data.selectedAdapterIndex,
+      attempt: data.attempt,
+      configuredExplorer: { family: configuredExplorer.family, name: configuredExplorer.name },
+      result,
+    };
   }
 
   private explorationEvidenceReceipt(
@@ -1007,8 +1219,25 @@ export class Orchestrator {
     return { operationId, operationInput, dependencies, dependencyHash: evidenceDependencyHash(dependencies), stepId };
   }
 
-  private safeReviewCandidates(): ConfiguredProvider[] {
-    return this.providerProfile ? independentReviewCandidates(this.providerProfile) : [];
+  private safeReviewCandidates(runId: string): ConfiguredProvider[] {
+    return this.providerProfile
+      ? independentReviewCandidates(this.providerProfile, this.actualAuthor(runId) ?? this.providerProfile.author)
+      : [];
+  }
+
+  private actualAuthor(runId: string): ConfiguredProvider | null {
+    if (!this.providerProfile) return null;
+    const configured = [this.providerProfile.author, this.providerProfile.fallbackAuthor];
+    const writer = [...this.store.listOperations(runId)].reverse().find((operation) =>
+      (operation.kind === "author" || operation.kind === "repair") && operation.status === "succeeded"
+    );
+    const selected = writer && isRecord(writer.result) && isRecord(writer.result.selectedAuthor)
+      ? writer.result.selectedAuthor
+      : null;
+    if (!selected) return this.providerProfile.author;
+    return configured.find((candidate) =>
+      candidate.family === selected.family && candidate.name === selected.name
+    ) ?? null;
   }
 
   private reviewOperationId(runId: string, commitSha: string, operationInput: unknown): string {
@@ -1036,7 +1265,7 @@ export class Orchestrator {
         .filter((item) => item.kind === "command" && item.commitSha === reviewedCommit && item.stepId.startsWith("verify:"))
         .map((item) => item.dependencyHash)
         .sort(),
-      configuredAuthor: this.providerProfile ? configuredProviderFact(this.providerProfile.author) : null,
+      configuredAuthor: this.actualAuthor(runId) ? configuredProviderFact(this.actualAuthor(runId)!) : null,
       configuredReviewers: candidates.map(configuredProviderFact),
     };
   }
@@ -1989,6 +2218,15 @@ function writerOperationInput(value: unknown): { baseCommit: string; attempt: nu
   return { baseCommit: value.baseCommit, attempt: value.attempt, gitControlHash: value.gitControlHash };
 }
 
+function explorerOperationInput(value: unknown): { currentCommit: string; gitControlHash: string } {
+  if (
+    !isRecord(value) ||
+    typeof value.currentCommit !== "string" ||
+    typeof value.gitControlHash !== "string"
+  ) throw new Error("Explorer operation has invalid persisted input");
+  return { currentCommit: value.currentCommit, gitControlHash: value.gitControlHash };
+}
+
 function writerBoundaryViolation(
   git: GitService,
   baseCommit: string,
@@ -2073,6 +2311,33 @@ class SupervisedReviewerAdapter implements ProviderAdapter {
   }
 }
 
+class SupervisedRoleAdapter implements ProviderAdapter {
+  readonly workspaceIsolation = { readOnly: "enforced", workspaceWrite: "unverified" } as const;
+  outcome: ProviderSupervisorResult | null = null;
+
+  constructor(
+    private readonly supervisor: ProviderSupervisor,
+    private readonly validate: (result: ProviderRunResult) => boolean,
+    private readonly role: string,
+  ) {}
+
+  async probe() {
+    return { available: true, identity: supervisorIdentity(), error: null };
+  }
+
+  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    this.outcome = await this.supervisor.run(request, this.validate);
+    return this.outcome.result ?? unavailableProviderResult(
+      request,
+      `No configured ${this.role} produced a valid result`,
+    );
+  }
+
+  async cancel(): Promise<boolean> {
+    return false;
+  }
+}
+
 class ReviewProviderCompletionInterruption extends Error {
   constructor(message: string) {
     super(message);
@@ -2134,6 +2399,10 @@ function reviewReportFromProvider(result: ProviderRunResult, reviewedCommit: str
 }
 
 function unavailableReviewResult(request: ProviderRunRequest): ProviderRunResult {
+  return unavailableProviderResult(request, "No configured independent Reviewer produced a valid result");
+}
+
+function unavailableProviderResult(request: ProviderRunRequest, message: string): ProviderRunResult {
   return {
     invocationId: request.invocationId,
     ok: false,
@@ -2142,7 +2411,7 @@ function unavailableReviewResult(request: ProviderRunRequest): ProviderRunResult
     threadId: null,
     events: [],
     finalOutput: null,
-    stderr: "No configured independent Reviewer produced a valid result",
+    stderr: message,
     exitCode: null,
     signal: null,
     durationMs: 0,
@@ -2152,6 +2421,10 @@ function unavailableReviewResult(request: ProviderRunRequest): ProviderRunResult
     finalOutputPath: resolve(request.artifactDirectory, "final.json"),
     stderrPath: resolve(request.artifactDirectory, "stderr.log"),
   };
+}
+
+function providerUsageTokens(result: ProviderRunResult): number {
+  return (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0);
 }
 
 function supervisorIdentity() {

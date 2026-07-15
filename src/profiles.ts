@@ -20,6 +20,7 @@ export interface ConfiguredProvider {
 export interface ProviderProfile {
   name: ProviderProfileName;
   author: ConfiguredProvider;
+  fallbackAuthor: ConfiguredProvider;
   reviewer: ConfiguredProvider;
   fallbackReviewer: ConfiguredProvider;
 }
@@ -34,8 +35,20 @@ export function createProviderProfile(
     }
   }
   return name === "CODEX_PRIMARY"
-    ? { name, author: providers.codex, reviewer: providers.claude, fallbackReviewer: providers.deepseek }
-    : { name, author: providers.claude, reviewer: providers.codex, fallbackReviewer: providers.deepseek };
+    ? {
+        name,
+        author: providers.codex,
+        fallbackAuthor: providers.claude,
+        reviewer: providers.claude,
+        fallbackReviewer: providers.deepseek,
+      }
+    : {
+        name,
+        author: providers.claude,
+        fallbackAuthor: providers.codex,
+        reviewer: providers.codex,
+        fallbackReviewer: providers.deepseek,
+      };
 }
 
 export interface ReviewAvailability {
@@ -67,10 +80,23 @@ export function isIndependentReceipt(author: ConfiguredProvider, reviewer: Confi
   return author.family !== reviewer.family && author.adapter !== reviewer.adapter;
 }
 
-export function independentReviewCandidates(profile: ProviderProfile): ConfiguredProvider[] {
+export function independentReviewCandidates(
+  profile: ProviderProfile,
+  actualAuthor: ConfiguredProvider = profile.author,
+): ConfiguredProvider[] {
   return [profile.reviewer, profile.fallbackReviewer].filter((candidate, index, candidates) =>
-    isIndependentReceipt(profile.author, candidate) &&
+    isIndependentReceipt(actualAuthor, candidate) &&
     candidate.adapter.workspaceIsolation?.readOnly === "enforced" &&
+    candidates.findIndex((item) => item.adapter === candidate.adapter) === index
+  );
+}
+
+export function workspaceRoleCandidates(
+  profile: ProviderProfile,
+  access: "read-only" | "workspace-write",
+): ConfiguredProvider[] {
+  return [profile.author, profile.fallbackAuthor].filter((candidate, index, candidates) =>
+    candidate.adapter.workspaceIsolation?.[access === "read-only" ? "readOnly" : "workspaceWrite"] === "enforced" &&
     candidates.findIndex((item) => item.adapter === candidate.adapter) === index
   );
 }

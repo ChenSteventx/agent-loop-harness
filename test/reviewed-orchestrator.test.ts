@@ -24,7 +24,7 @@ function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-function fixture(): { root: string; taskPath: string } {
+function fixture(risk: "normal" | "high" = "high"): { root: string; taskPath: string } {
   const root = mkdtempSync(join(tmpdir(), "agent-loop-reviewed-target-"));
   temporaryDirectories.push(root);
   git(root, ["init", "-b", "main"]);
@@ -40,7 +40,7 @@ function fixture(): { root: string; taskPath: string } {
     "goal: Add a reviewed change",
     "acceptance:",
     "  - changed.txt exists and contains the reviewed result",
-    "risk: high",
+    `risk: ${risk}`,
     "verification:",
     "  - id: check",
     "    argv: [node, check.mjs]",
@@ -102,6 +102,50 @@ class RepairingAuthor implements ProviderAdapter {
   private identity() {
     return { provider: "observed-author", model: "fixture", executable: "in-process", version: "1" };
   }
+}
+
+class QuotaAuthor implements ProviderAdapter {
+  readonly workspaceIsolation = { readOnly: "enforced", workspaceWrite: "enforced" } as const;
+  readonly requests: ProviderRunRequest[] = [];
+
+  async probe() {
+    return { available: true, identity: { provider: "quota-author", model: null, executable: "fixture", version: "1" }, error: null };
+  }
+
+  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    this.requests.push(request);
+    return result(request, "quota-author", null, "quota");
+  }
+
+  async cancel() { return false; }
+}
+
+class FallbackAuthor implements ProviderAdapter {
+  readonly workspaceIsolation = { readOnly: "enforced", workspaceWrite: "enforced" } as const;
+  readonly requests: ProviderRunRequest[] = [];
+
+  async probe() {
+    return { available: true, identity: { provider: "fallback-author", model: null, executable: "fixture", version: "1" }, error: null };
+  }
+
+  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    this.requests.push(request);
+    if (request.workspaceAccess === "read-only") {
+      return result(request, "fallback-author", {
+        relevantFiles: [{ path: "check.mjs", symbols: [] }],
+        likelyAffectedTests: ["check.mjs"],
+        evidence: [{ path: "check.mjs", observation: "Verification expects changed.txt" }],
+        importantUnknowns: [],
+      });
+    }
+    writeFileSync(join(request.cwd, "changed.txt"), "fallback author\n");
+    return result(request, "fallback-author", {
+      summary: "Completed the change after primary Author quota exhaustion",
+      changedFiles: ["changed.txt"],
+    });
+  }
+
+  async cancel() { return false; }
 }
 
 type ReviewOutcome = "clean" | "blocking" | "unsupported" | "quota";
@@ -207,6 +251,72 @@ afterEach(() => {
 });
 
 describe("reviewed Orchestrator profile", () => {
+  it("falls back the read-only Explorer without widening its workspace boundary", async () => {
+    const target = fixture("normal");
+    const primary = new QuotaAuthor();
+    const fallback = new FallbackAuthor();
+    const loop = orchestrator(primary, fallback, new Reviewer("unused-reviewer", ["clean"]));
+    const view = await loop.start({
+      runId: "assisted-explorer-fallback", taskPath: target.taskPath, targetRepository: target.root,
+    });
+
+    expect(view.run).toMatchObject({ status: "ready", binding: { executionTemplate: "assisted" } });
+    expect(primary.requests.map((request) => request.workspaceAccess)).toEqual(["read-only", "workspace-write"]);
+    expect(fallback.requests.map((request) => request.workspaceAccess)).toEqual(["read-only", "workspace-write"]);
+    expect(view.operations.find((item) => item.kind === "explorer")?.result).toMatchObject({
+      selectedExplorer: { family: "claude" },
+    });
+    expect(view.operations.find((item) => item.kind === "author")?.result).toMatchObject({
+      selectedAuthor: { family: "claude" },
+    });
+    loop.close();
+  }, 120_000);
+
+  it("falls back the Author and filters review against the actual successful family", async () => {
+    const target = fixture();
+    const primaryAuthor = new QuotaAuthor();
+    const fallbackAuthor = new FallbackAuthor();
+    const independentReviewer = new Reviewer("deepseek-after-claude-author", ["clean"]);
+    const loop = orchestrator(primaryAuthor, fallbackAuthor, independentReviewer);
+    const view = await loop.start({
+      runId: "reviewed-author-fallback", taskPath: target.taskPath, targetRepository: target.root,
+    });
+
+    expect(view.run.status).toBe("ready");
+    expect(primaryAuthor.requests).toHaveLength(1);
+    expect(fallbackAuthor.requests.filter((request) => request.workspaceAccess === "workspace-write")).toHaveLength(1);
+    expect(fallbackAuthor.requests.filter((request) => request.workspaceAccess === "read-only")).toHaveLength(0);
+    expect(independentReviewer.requests).toHaveLength(1);
+    expect(view.operations.find((item) => item.kind === "author")?.result).toMatchObject({
+      selectedAuthor: { family: "claude", name: "Configured Claude Reviewer" },
+    });
+    expect(view.evidence.find((item) => item.kind === "independent_review")?.data).toMatchObject({
+      selectedReviewer: {
+        configuredFamily: "deepseek",
+        observedIdentity: { provider: "deepseek-after-claude-author" },
+      },
+    });
+    expect(view.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "provider.fallback", data: expect.objectContaining({ role: "author", reason: "quota" }) }),
+    ]));
+    loop.close();
+  }, 120_000);
+
+  it("keeps an unavailable Author operation recoverable", async () => {
+    const target = fixture();
+    const primaryAuthor = new QuotaAuthor();
+    const fallbackAuthor = new QuotaAuthor();
+    const loop = orchestrator(primaryAuthor, fallbackAuthor, new Reviewer("unused-reviewer", ["clean"]));
+    const view = await loop.start({
+      runId: "reviewed-author-recovery", taskPath: target.taskPath, targetRepository: target.root,
+    });
+
+    expect(view.run).toMatchObject({ status: "blocked", blocked: { checkpointRef: "provider-recovery" } });
+    expect(view.operations.find((item) => item.kind === "author")?.status).toBe("running");
+    expect(view.events.some((item) => item.type === "writer.provider-blocked")).toBe(true);
+    loop.close();
+  }, 60_000);
+
   it("repairs one blocking independent finding, then re-verifies and re-reviews the same Run", async () => {
     const target = fixture();
     const author = new RepairingAuthor();

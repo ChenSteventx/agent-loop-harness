@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProviderAdapter } from "../src/provider.js";
-import { createProviderProfile, independentReviewCandidates, isIndependentReceipt, selectReviewer, withFallbackOutbox } from "../src/profiles.js";
+import { createProviderProfile, independentReviewCandidates, isIndependentReceipt, selectReviewer, withFallbackOutbox, workspaceRoleCandidates } from "../src/profiles.js";
 import { SqliteStore } from "../src/store.js";
 
 const providers = {
@@ -13,8 +13,8 @@ describe("provider profiles", () => {
   it("has the fixed cross-family author, reviewer, and fallback assignments", () => {
     const codex = createProviderProfile("CODEX_PRIMARY", providers);
     const claude = createProviderProfile("CLAUDE_PRIMARY", providers);
-    expect([codex.author.family, codex.reviewer.family, codex.fallbackReviewer.family]).toEqual(["codex", "claude", "deepseek"]);
-    expect([claude.author.family, claude.reviewer.family, claude.fallbackReviewer.family]).toEqual(["claude", "codex", "deepseek"]);
+    expect([codex.author.family, codex.fallbackAuthor.family, codex.reviewer.family, codex.fallbackReviewer.family]).toEqual(["codex", "claude", "claude", "deepseek"]);
+    expect([claude.author.family, claude.fallbackAuthor.family, claude.reviewer.family, claude.fallbackReviewer.family]).toEqual(["claude", "codex", "codex", "deepseek"]);
   });
 
   it("uses configured family identity instead of model output claims", () => {
@@ -40,7 +40,21 @@ describe("provider profiles", () => {
     const author = { ...providers.codex, adapter: { workspaceIsolation: { readOnly: "enforced" as const, workspaceWrite: "enforced" as const } } as ProviderAdapter };
     const reviewer = { ...providers.claude, adapter: { workspaceIsolation: { readOnly: "enforced" as const, workspaceWrite: "unverified" as const } } as ProviderAdapter };
     const fallbackReviewer = { ...providers.deepseek, adapter: { workspaceIsolation: { readOnly: "unverified" as const, workspaceWrite: "unverified" as const } } as ProviderAdapter };
-    expect(independentReviewCandidates({ name: "CODEX_PRIMARY", author, reviewer, fallbackReviewer })).toEqual([reviewer]);
+    expect(independentReviewCandidates({ name: "CODEX_PRIMARY", author, fallbackAuthor: reviewer, reviewer, fallbackReviewer })).toEqual([reviewer]);
+    expect(independentReviewCandidates(
+      { name: "CODEX_PRIMARY", author, fallbackAuthor: reviewer, reviewer, fallbackReviewer },
+      reviewer,
+    )).toEqual([]);
+  });
+
+  it("offers only Author and Explorer adapters that enforce the requested workspace boundary", () => {
+    const profile = createProviderProfile("CODEX_PRIMARY", {
+      codex: { ...providers.codex, adapter: { workspaceIsolation: { readOnly: "enforced", workspaceWrite: "enforced" } } as ProviderAdapter },
+      claude: { ...providers.claude, adapter: { workspaceIsolation: { readOnly: "enforced", workspaceWrite: "unverified" } } as ProviderAdapter },
+      deepseek: providers.deepseek,
+    });
+    expect(workspaceRoleCandidates(profile, "read-only").map((item) => item.family)).toEqual(["codex", "claude"]);
+    expect(workspaceRoleCandidates(profile, "workspace-write").map((item) => item.family)).toEqual(["codex"]);
   });
 
   it("binds Provider Supervisor fallback records to the Outbox", () => {
