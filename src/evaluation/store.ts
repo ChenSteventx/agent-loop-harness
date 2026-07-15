@@ -12,6 +12,7 @@ import type {
   PromotionDecision,
   RollbackDecision,
 } from "../evolution/proposals.js";
+import type { OfflineComparison, ShadowEvaluation } from "./compare.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -353,6 +354,67 @@ export class EvaluationStore {
     return transaction();
   }
 
+  installOfflineComparison(comparison: OfflineComparison): OfflineComparison {
+    const existing = this.getOfflineComparison(comparison.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(comparison)) throw new Error(`Offline Comparison ${comparison.id} is immutable`);
+      return existing;
+    }
+    this.database.prepare(
+      `INSERT INTO offline_comparisons
+       (id, project_scope, proposal_id, champion_id, challenger_id, status, comparison_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(comparison.id, comparison.projectScope, comparison.proposalId, comparison.championId,
+      comparison.challengerId, comparison.status, JSON.stringify(comparison), comparison.createdAt);
+    return this.getOfflineComparison(comparison.id)!;
+  }
+
+  getOfflineComparison(id: string): OfflineComparison | null {
+    const row = this.database.prepare("SELECT comparison_json FROM offline_comparisons WHERE id = ?")
+      .get(id) as { comparison_json: string } | undefined;
+    return row ? JSON.parse(row.comparison_json) as OfflineComparison : null;
+  }
+
+  listOfflineComparisons(projectScope?: string): OfflineComparison[] {
+    const rows = (projectScope
+      ? this.database.prepare("SELECT comparison_json FROM offline_comparisons WHERE project_scope = ? ORDER BY created_at, id").all(projectScope)
+      : this.database.prepare("SELECT comparison_json FROM offline_comparisons ORDER BY project_scope, created_at, id").all()) as
+      Array<{ comparison_json: string }>;
+    return rows.map((row) => JSON.parse(row.comparison_json) as OfflineComparison);
+  }
+
+  installShadowEvaluation(shadow: ShadowEvaluation): ShadowEvaluation {
+    const existing = this.getShadowEvaluation(shadow.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(shadow)) throw new Error(`Shadow Evaluation ${shadow.id} is immutable`);
+      return existing;
+    }
+    if (shadow.authoritative !== false || shadow.providerRoutingChanged !== false || shadow.runStateChanged !== false) {
+      throw new Error("Shadow Evaluation must be non-authoritative");
+    }
+    this.database.prepare(
+      `INSERT INTO shadow_evaluations
+       (id, source_run_id, source_fact_hash, project_scope, champion_id, challenger_id, agrees, shadow_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(shadow.id, shadow.sourceRunId, shadow.sourceFactHash, shadow.projectScope,
+      shadow.championId, shadow.challengerId, shadow.agrees ? 1 : 0, JSON.stringify(shadow), shadow.createdAt);
+    return this.getShadowEvaluation(shadow.id)!;
+  }
+
+  getShadowEvaluation(id: string): ShadowEvaluation | null {
+    const row = this.database.prepare("SELECT shadow_json FROM shadow_evaluations WHERE id = ?")
+      .get(id) as { shadow_json: string } | undefined;
+    return row ? JSON.parse(row.shadow_json) as ShadowEvaluation : null;
+  }
+
+  listShadowEvaluations(projectScope?: string): ShadowEvaluation[] {
+    const rows = (projectScope
+      ? this.database.prepare("SELECT shadow_json FROM shadow_evaluations WHERE project_scope = ? ORDER BY created_at, id").all(projectScope)
+      : this.database.prepare("SELECT shadow_json FROM shadow_evaluations ORDER BY project_scope, created_at, id").all()) as
+      Array<{ shadow_json: string }>;
+    return rows.map((row) => JSON.parse(row.shadow_json) as ShadowEvaluation);
+  }
+
   private migrate(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS fact_bundles (
@@ -438,6 +500,28 @@ export class EvaluationStore {
         kind TEXT NOT NULL CHECK(kind IN ('promotion', 'rollback')),
         decision_json TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS offline_comparisons (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        proposal_id TEXT NOT NULL REFERENCES change_proposals(id),
+        champion_id TEXT NOT NULL REFERENCES configuration_variants(id),
+        challenger_id TEXT NOT NULL REFERENCES configuration_variants(id),
+        status TEXT NOT NULL CHECK(status IN ('completed', 'insufficient-samples', 'guardrail-failed')),
+        comparison_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS shadow_evaluations (
+        id TEXT PRIMARY KEY,
+        source_run_id TEXT NOT NULL,
+        source_fact_hash TEXT NOT NULL,
+        project_scope TEXT NOT NULL,
+        champion_id TEXT NOT NULL REFERENCES configuration_variants(id),
+        challenger_id TEXT NOT NULL REFERENCES configuration_variants(id),
+        agrees INTEGER NOT NULL CHECK(agrees IN (0, 1)),
+        shadow_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(source_run_id, source_fact_hash) REFERENCES fact_bundles(run_id, fact_hash)
       );
     `);
   }

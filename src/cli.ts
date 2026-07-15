@@ -168,8 +168,9 @@ evaluation
           .reduce((total, dataset) => total + dataset.tasks.length, 0),
         holdoutTaskCount: datasets.filter((dataset) => dataset.kind === "holdout")
           .reduce((total, dataset) => total + dataset.tasks.length, 0),
-        completedOfflineComparisons: 0,
-        completedShadowRuns: 0,
+        completedOfflineComparisons: evaluationStore.listOfflineComparisons()
+          .filter((comparison) => comparison.status === "completed" && comparison.guardrailsSatisfied).length,
+        completedShadowRuns: evaluationStore.listShadowEvaluations().length,
         humanCanaryApproval: false,
       });
       evaluationStore.recordReadiness(report);
