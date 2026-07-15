@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "KISS evidence-driven harness for coding agents",
+  "packageManager": "npm@10.9.0",
   "engines": {
     "node": ">=20"
   },
@@ -19,16 +20,16 @@
     "codex:status": "node automation/status.mjs"
   },
   "dependencies": {
-    "better-sqlite3": "latest",
-    "commander": "latest",
-    "yaml": "latest",
-    "zod": "latest"
+    "better-sqlite3": "12.11.1",
+    "commander": "15.0.0",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "latest",
-    "@types/node": "latest",
-    "tsx": "latest",
-    "typescript": "latest",
-    "vitest": "latest"
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "26.1.1",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
   }
 }
