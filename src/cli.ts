@@ -39,6 +39,8 @@ import {
   type EvolutionTarget,
 } from "./evolution/proposals.js";
 import { disabledCanaryPolicy } from "./evolution/canary.js";
+import { SmtpEmailTransport } from "./email.js";
+import { NotificationDispatcher, type NotificationDispatcherOptions } from "./notifications.js";
 import {
   createProviderProfile,
   providerProfileNames,
@@ -335,6 +337,36 @@ canary.command("status").option("--project <scope>").action((options: { project?
   }));
 });
 
+const notify = program.command("notify").description("dispatch existing transactional Outbox notifications");
+notify
+  .command("dispatch")
+  .description("send currently due Outbox records through environment-configured SMTP")
+  .action(async () => {
+    await withDevelopmentStoreAsync(async (store) => {
+      const dispatcher = new NotificationDispatcher(
+        store,
+        SmtpEmailTransport.fromEnvironment(),
+        notificationOptionsFromEnvironment(),
+      );
+      print(await dispatcher.dispatch());
+    });
+  });
+notify
+  .command("status")
+  .description("show pending, due, delivered, and dead-letter counts without exposing SMTP secrets")
+  .action(() => {
+    withDevelopmentStore((store) => print({
+      ...store.outboxStatus(),
+      emailConfigured: smtpEnvironmentConfigured(process.env),
+    }));
+  });
+notify
+  .command("dead-letters")
+  .description("list exhausted notifications for operator inspection")
+  .action(() => {
+    withDevelopmentStore((store) => print(store.listDeadLetterOutbox()));
+  });
+
 const human = program.command("human").description("record explicit human decisions");
 
 human
@@ -532,6 +564,28 @@ function withEvaluationStores(action: (development: SqliteStore, evaluation: Eva
   }
 }
 
+function withDevelopmentStore(action: (store: SqliteStore) => void): void {
+  const home = resolve(program.opts<{ loopHome: string }>().loopHome);
+  mkdirSync(home, { recursive: true });
+  const store = new SqliteStore(resolve(home, "state.sqlite"));
+  try {
+    action(store);
+  } finally {
+    store.close();
+  }
+}
+
+async function withDevelopmentStoreAsync(action: (store: SqliteStore) => Promise<void>): Promise<void> {
+  const home = resolve(program.opts<{ loopHome: string }>().loopHome);
+  mkdirSync(home, { recursive: true });
+  const store = new SqliteStore(resolve(home, "state.sqlite"));
+  try {
+    await action(store);
+  } finally {
+    store.close();
+  }
+}
+
 async function withEvaluationStoresAsync(
   action: (development: SqliteStore, evaluation: EvaluationStore, home: string) => Promise<void>,
 ): Promise<void> {
@@ -579,6 +633,23 @@ function positiveInteger(value: string, label: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${label} must be a positive integer`);
   return parsed;
+}
+
+function notificationOptionsFromEnvironment(environment: NodeJS.ProcessEnv = process.env): NotificationDispatcherOptions {
+  return {
+    maxAttempts: positiveInteger(environment.AGENT_LOOP_NOTIFY_MAX_ATTEMPTS ?? "5", "maximum notification attempts"),
+    baseDelayMs: positiveInteger(environment.AGENT_LOOP_NOTIFY_BASE_DELAY_MS ?? "60000", "notification base delay"),
+    maximumDelayMs: positiveInteger(
+      environment.AGENT_LOOP_NOTIFY_MAX_DELAY_MS ?? "3600000",
+      "notification maximum delay",
+    ),
+    batchSize: positiveInteger(environment.AGENT_LOOP_NOTIFY_BATCH_SIZE ?? "100", "notification batch size"),
+  };
+}
+
+function smtpEnvironmentConfigured(environment: NodeJS.ProcessEnv): boolean {
+  return ["AGENT_LOOP_SMTP_HOST", "AGENT_LOOP_EMAIL_FROM", "AGENT_LOOP_EMAIL_TO"]
+    .every((name) => Boolean(environment[name]?.trim()));
 }
 
 function requiredReadinessCoverage(

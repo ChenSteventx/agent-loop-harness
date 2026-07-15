@@ -25,6 +25,15 @@ export type OutboxEventType = (typeof outboxEventTypes)[number];
 export interface OutboxRecord {
   id: number; runId: string; type: OutboxEventType; payload: unknown; createdAt: string;
   deliveredAt: string | null; attempts: number; lastError: string | null;
+  nextAttemptAt: string; deduplicationKey: string; deadLetteredAt: string | null;
+  providerMessageId: string | null;
+}
+
+export interface OutboxStatus {
+  pending: number;
+  dispatchable: number;
+  delivered: number;
+  deadLettered: number;
 }
 
 export interface HumanInboxInput {
@@ -487,9 +496,16 @@ export class SqliteStore {
     ).run(now, runId, ...kinds, ...validDependencyHashes).changes;
   }
 
-  enqueueOutbox(runId: string, type: OutboxEventType, payload: unknown, now = new Date().toISOString()): OutboxRecord {
+  enqueueOutbox(
+    runId: string,
+    type: OutboxEventType,
+    payload: unknown,
+    now = new Date().toISOString(),
+    deduplicationKey?: string,
+  ): OutboxRecord {
     this.requireRun(runId);
-    const transaction = this.database.transaction(() => this.requireOutbox(this.insertOutbox(runId, type, payload, now)));
+    const transaction = this.database.transaction(() =>
+      this.requireOutbox(this.insertOutbox(runId, type, payload, now, deduplicationKey)));
     return transaction();
   }
 
@@ -543,15 +559,78 @@ export class SqliteStore {
   }
 
   listPendingOutbox(): OutboxRecord[] {
-    return (this.database.prepare("SELECT * FROM outbox WHERE delivered_at IS NULL ORDER BY id").all() as OutboxRow[]).map(mapOutbox);
+    return (this.database.prepare(
+      "SELECT * FROM outbox WHERE delivered_at IS NULL AND dead_lettered_at IS NULL ORDER BY id",
+    ).all() as OutboxRow[]).map(mapOutbox);
   }
 
-  markOutboxDelivered(id: number, now = new Date().toISOString()): void {
-    this.database.prepare("UPDATE outbox SET delivered_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?").run(now, id);
+  getOutbox(id: number): OutboxRecord | null {
+    const row = this.database.prepare("SELECT * FROM outbox WHERE id = ?").get(id) as OutboxRow | undefined;
+    return row ? mapOutbox(row) : null;
   }
 
-  markOutboxFailed(id: number, error: string): void {
-    this.database.prepare("UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?").run(error, id);
+  listDispatchableOutbox(now = new Date().toISOString(), limit = 100): OutboxRecord[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_000) {
+      throw new Error("Outbox dispatch limit must be between 1 and 1000");
+    }
+    return (this.database.prepare(
+      `SELECT * FROM outbox
+       WHERE delivered_at IS NULL AND dead_lettered_at IS NULL AND next_attempt_at <= ?
+       ORDER BY next_attempt_at, id LIMIT ?`,
+    ).all(now, limit) as OutboxRow[]).map(mapOutbox);
+  }
+
+  listDeadLetterOutbox(): OutboxRecord[] {
+    return (this.database.prepare(
+      "SELECT * FROM outbox WHERE dead_lettered_at IS NOT NULL ORDER BY dead_lettered_at, id",
+    ).all() as OutboxRow[]).map(mapOutbox);
+  }
+
+  outboxStatus(now = new Date().toISOString()): OutboxStatus {
+    const row = this.database.prepare(`
+      SELECT
+        SUM(CASE WHEN delivered_at IS NULL AND dead_lettered_at IS NULL THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN delivered_at IS NULL AND dead_lettered_at IS NULL AND next_attempt_at <= ? THEN 1 ELSE 0 END) AS dispatchable,
+        SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END) AS delivered,
+        SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END) AS dead_lettered
+      FROM outbox
+    `).get(now) as { pending: number | null; dispatchable: number | null; delivered: number | null; dead_lettered: number | null };
+    return {
+      pending: row.pending ?? 0,
+      dispatchable: row.dispatchable ?? 0,
+      delivered: row.delivered ?? 0,
+      deadLettered: row.dead_lettered ?? 0,
+    };
+  }
+
+  markOutboxDelivered(
+    id: number,
+    providerMessageId: string | null = null,
+    now = new Date().toISOString(),
+  ): void {
+    this.database.prepare(
+      `UPDATE outbox
+       SET delivered_at = ?, attempts = attempts + 1, last_error = NULL, provider_message_id = ?
+       WHERE id = ? AND delivered_at IS NULL AND dead_lettered_at IS NULL`,
+    ).run(now, providerMessageId, id);
+  }
+
+  markOutboxFailed(id: number, error: string, now = new Date().toISOString()): void {
+    this.scheduleOutboxRetry(id, error, now, null);
+  }
+
+  scheduleOutboxRetry(
+    id: number,
+    error: string,
+    nextAttemptAt: string,
+    deadLetteredAt: string | null,
+  ): void {
+    if (!error.trim()) throw new Error("Outbox failure requires an error");
+    this.database.prepare(
+      `UPDATE outbox
+       SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?, dead_lettered_at = ?
+       WHERE id = ? AND delivered_at IS NULL AND dead_lettered_at IS NULL`,
+    ).run(error, nextAttemptAt, deadLetteredAt, id);
   }
 
   recordAgentCall(runId: string, input: {
@@ -627,10 +706,33 @@ export class SqliteStore {
     return Number(result.lastInsertRowid);
   }
 
-  private insertOutbox(runId: string, type: OutboxEventType, payload: unknown, now: string): number {
+  private insertOutbox(
+    runId: string,
+    type: OutboxEventType,
+    payload: unknown,
+    now: string,
+    requestedDeduplicationKey?: string,
+  ): number {
+    const deduplicationKey = requestedDeduplicationKey ??
+      `outbox:${operationInputHash({ runId, type, payload, createdAt: now })}`;
+    if (!deduplicationKey.trim()) throw new Error("Outbox deduplication key is required");
+    const existing = this.database.prepare(
+      "SELECT id, run_id, type, payload_json FROM outbox WHERE deduplication_key = ?",
+    ).get(deduplicationKey) as
+      { id: number; run_id: string; type: OutboxEventType; payload_json: string } | undefined;
+    if (existing) {
+      if (existing.run_id !== runId || existing.type !== type ||
+          canonicalJson(parseJson(existing.payload_json)) !== canonicalJson(payload)) {
+        throw new Error(`Outbox deduplication key ${deduplicationKey} was used for different content`);
+      }
+      return existing.id;
+    }
     const result = this.database.prepare(
-      "INSERT INTO outbox (run_id, type, payload_json, created_at, delivered_at, attempts, last_error) VALUES (?, ?, ?, ?, NULL, 0, NULL)",
-    ).run(runId, type, JSON.stringify(payload), now);
+      `INSERT INTO outbox
+       (run_id, type, payload_json, created_at, delivered_at, attempts, last_error,
+        next_attempt_at, deduplication_key, dead_lettered_at, provider_message_id)
+       VALUES (?, ?, ?, ?, NULL, 0, NULL, ?, ?, NULL, NULL)`,
+    ).run(runId, type, JSON.stringify(payload), now, now, deduplicationKey);
     return Number(result.lastInsertRowid);
   }
 
@@ -721,7 +823,11 @@ export class SqliteStore {
         created_at TEXT NOT NULL,
         delivered_at TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT
+        last_error TEXT,
+        next_attempt_at TEXT NOT NULL,
+        deduplication_key TEXT NOT NULL UNIQUE,
+        dead_lettered_at TEXT,
+        provider_message_id TEXT
       );
       CREATE TABLE IF NOT EXISTS human_inbox (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -770,6 +876,17 @@ export class SqliteStore {
     this.ensureColumn("evidence", "dependency_version", "INTEGER");
     this.ensureColumn("evidence", "dependencies_json", "TEXT");
     this.ensureColumn("human_inbox", "resolution_json", "TEXT");
+    this.ensureColumn("outbox", "next_attempt_at", "TEXT");
+    this.ensureColumn("outbox", "deduplication_key", "TEXT");
+    this.ensureColumn("outbox", "dead_lettered_at", "TEXT");
+    this.ensureColumn("outbox", "provider_message_id", "TEXT");
+    this.database.prepare("UPDATE outbox SET next_attempt_at = created_at WHERE next_attempt_at IS NULL").run();
+    const legacyOutbox = this.database.prepare(
+      "SELECT id FROM outbox WHERE deduplication_key IS NULL OR deduplication_key = '' ORDER BY id",
+    ).all() as Array<{ id: number }>;
+    const setLegacyKey = this.database.prepare("UPDATE outbox SET deduplication_key = ? WHERE id = ?");
+    for (const item of legacyOutbox) setLegacyKey.run(`outbox:legacy:${item.id}`, item.id);
+    this.database.exec("CREATE UNIQUE INDEX IF NOT EXISTS outbox_deduplication_key ON outbox(deduplication_key)");
     const version = this.database.pragma("user_version", { simple: true }) as number;
     if (version < 2) {
       const now = new Date().toISOString();
@@ -850,7 +967,12 @@ interface EvidenceRow {
   invalidated_at: string | null;
 }
 
-interface OutboxRow { id: number; run_id: string; type: OutboxEventType; payload_json: string; created_at: string; delivered_at: string | null; attempts: number; last_error: string | null }
+interface OutboxRow {
+  id: number; run_id: string; type: OutboxEventType; payload_json: string; created_at: string;
+  delivered_at: string | null; attempts: number; last_error: string | null;
+  next_attempt_at: string | null; deduplication_key: string | null; dead_lettered_at: string | null;
+  provider_message_id: string | null;
+}
 interface HumanInboxRow { id: number; run_id: string; question: string; options_json: string; recommendation: string; evidence_json: string; risk: string; consequence: string; resume_command: string; created_at: string; resolved_at: string | null; resolution_json: string | null }
 interface AgentCallRow { id: number; run_id: string; role: string; provider: string; latency_ms: number; input_tokens: number | null; cached_input_tokens: number | null; output_tokens: number | null; created_at: string }
 
@@ -904,7 +1026,20 @@ function mapEvidence(row: EvidenceRow): Evidence {
 }
 
 function mapOutbox(row: OutboxRow): OutboxRecord {
-  return { id: row.id, runId: row.run_id, type: row.type, payload: parseJson(row.payload_json), createdAt: row.created_at, deliveredAt: row.delivered_at, attempts: row.attempts, lastError: row.last_error };
+  return {
+    id: row.id,
+    runId: row.run_id,
+    type: row.type,
+    payload: parseJson(row.payload_json),
+    createdAt: row.created_at,
+    deliveredAt: row.delivered_at,
+    attempts: row.attempts,
+    lastError: row.last_error,
+    nextAttemptAt: row.next_attempt_at ?? row.created_at,
+    deduplicationKey: row.deduplication_key ?? `outbox:legacy:${row.id}`,
+    deadLetteredAt: row.dead_lettered_at,
+    providerMessageId: row.provider_message_id,
+  };
 }
 
 function mapHumanInbox(row: HumanInboxRow): HumanInboxRecord {
