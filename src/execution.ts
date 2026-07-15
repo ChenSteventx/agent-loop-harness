@@ -92,9 +92,16 @@ export class GitService {
   }
 
   controlStateHash(): string {
-    const refs = this.git(["for-each-ref", "--format=%(refname)%00%(objectname)"]);
-    const reflogs = this.git(["reflog", "show", "--all", "--format=%gd%00%H%00%gs"]);
-    return createHash("sha256").update(refs).update("\0").update(reflogs).digest("hex");
+    const head = this.head();
+    const branch = this.branch();
+    const index = this.git(["ls-files", "--stage", "-z"]);
+    const headReflog = this.git(["reflog", "show", "HEAD", "--format=%H%x00%gD%x00%gs"]);
+    return createHash("sha256")
+      .update(head).update("\0")
+      .update(branch).update("\0")
+      .update(index).update("\0")
+      .update(headReflog)
+      .digest("hex");
   }
 
   commitCandidate(input: {

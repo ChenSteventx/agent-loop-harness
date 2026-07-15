@@ -81,6 +81,26 @@ describe("GitService and WorktreeService", () => {
       baseCommit: service.head(), message: "must not commit",
     })).toThrow("only the Harness may stage");
   }, 20_000);
+
+  it("scopes the control hash to the current worktree", () => {
+    const root = repository();
+    const other = join(root, "..", `unrelated-worktree-${Date.now()}`);
+    temporaryDirectories.push(other);
+    git(root, ["worktree", "add", "-b", "unrelated", other]);
+    const service = new GitService(root);
+    const originalHead = service.head();
+    const initial = service.controlStateHash();
+
+    git(other, ["commit", "--allow-empty", "-m", "unrelated worktree commit"]);
+    expect(service.controlStateHash()).toBe(initial);
+
+    git(root, ["commit", "--allow-empty", "-m", "current worktree control change"]);
+    git(root, ["reset", "--hard", originalHead]);
+    expect(service.head()).toBe(originalHead);
+    expect(service.controlStateHash()).not.toBe(initial);
+
+    git(root, ["worktree", "remove", "--force", other]);
+  }, 20_000);
 });
 
 describe("CommandRunner", () => {
