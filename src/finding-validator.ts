@@ -3,7 +3,12 @@ import { readFileSync } from "node:fs";
 import type { Evidence } from "./domain.js";
 import type { CommandRequest, CommandResult, CommandRunner, GitService } from "./execution.js";
 import { operationInputHash } from "./bindings.js";
-import type { FindingVerificationRequest, ProjectAdapter, VerificationCommand } from "./ports.js";
+import type {
+  FindingValidationPlan,
+  FindingVerificationRequest,
+  ProjectAdapter,
+  VerificationCommand,
+} from "./ports.js";
 import type { Finding } from "./reviewer.js";
 import type { TaskSpec } from "./task-spec.js";
 
@@ -21,10 +26,13 @@ export interface PredicateEvaluation {
     timedOut: boolean;
     stdoutSha256: string;
     stderrSha256: string;
+    stdoutTruncated: boolean;
+    stderrTruncated: boolean;
     exitCodeMatched: boolean;
     stdoutMatched: boolean;
     stderrMatched: boolean;
   };
+  inconclusive: boolean;
   matched: boolean;
 }
 
@@ -35,6 +43,7 @@ export interface FindingValidationDecision {
   status: FindingValidationStatus;
   reason: string;
   verificationRequest: FindingVerificationRequest | null;
+  validationPlan: FindingValidationPlan | null;
   machineEvidenceIds: string[];
   commandResult: CommandResult | null;
   commandError: string | null;
@@ -61,30 +70,43 @@ export class FindingValidator {
 
   async validate(input: FindingValidationInput): Promise<FindingValidationDecision> {
     const claimHash = findingClaimHash(input.finding);
-    const resolved = resolveVerificationRequest(this.projectAdapter, input.task, input.finding.verificationRequest);
+    const resolved = resolveValidationPlan(
+      this.projectAdapter,
+      input.task,
+      input.finding,
+      input.finding.verificationRequest,
+    );
+    const decide = (
+      status: FindingValidationStatus,
+      reason: string,
+      override: Partial<Pick<
+        FindingValidationDecision,
+        "machineEvidenceIds" | "commandResult" | "commandError" | "predicateEvaluation"
+      >> = {},
+    ) => decision(input, claimHash, status, reason, { ...override, validationPlan: resolved.plan });
     const referenced = input.finding.evidenceIds.map((id) => input.evidence.find((item) => item.id === id));
     const referencesConfirmed = referenced.length > 0 && referenced.every((item) =>
       item !== undefined && evidenceConfirmsFinding(item, input.finding, claimHash, input.reviewedCommit, resolved)
     );
     if (referencesConfirmed) {
-      return decision(input, claimHash, "confirmed", "All cited machine Evidence is bound to this Finding claim", {
+      return decide("confirmed", "All cited machine Evidence is bound to this Finding claim", {
         machineEvidenceIds: [...input.finding.evidenceIds],
       });
     }
-    if (!resolved.allowed || !resolved.command || !input.finding.verificationRequest) {
-      return decision(input, claimHash, "inconclusive", resolved.reason);
+    if (!resolved.allowed || !resolved.plan || !input.finding.verificationRequest) {
+      return decide("inconclusive", resolved.reason);
     }
 
     const before = gitBoundary(input.git);
     let commandResult: CommandResult;
     try {
       commandResult = await this.commandRunner.run(commandRequest(
-        resolved.command,
+        resolved.plan.command,
         input.worktreePath,
         input.artifactDirectory,
       ));
     } catch (error) {
-      return decision(input, claimHash, "inconclusive", "The approved diagnostic command could not be executed", {
+      return decide("inconclusive", "The approved diagnostic command could not be executed", {
         commandError: errorMessage(error),
       });
     }
@@ -97,25 +119,30 @@ export class FindingValidator {
     const stdout = artifactText(commandResult.stdoutPath);
     const stderr = artifactText(commandResult.stderrPath);
     const predicateEvaluation = evaluatePredicate(
-      input.finding.verificationRequest,
+      resolved.plan.expected,
       commandResult,
       stdout,
       stderr,
       input.reviewedCommit,
     );
     if (commandResult.signal !== null || commandResult.timedOut || commandResult.commitBefore !== input.reviewedCommit) {
-      return decision(input, claimHash, "inconclusive", "The diagnostic process receipt is incomplete or stale", {
+      return decide("inconclusive", "The diagnostic process receipt is incomplete or stale", {
         commandResult,
         predicateEvaluation,
       });
     }
-    return decision(
-      input,
-      claimHash,
+    if (predicateEvaluation.inconclusive) {
+      return decide(
+        "inconclusive",
+        "A required output predicate was not observed because the diagnostic output was truncated",
+        { commandResult, predicateEvaluation },
+      );
+    }
+    return decide(
       predicateEvaluation.matched ? "confirmed" : "rejected",
       predicateEvaluation.matched
-        ? "The approved diagnostic command satisfied every structured predicate"
-        : "The approved diagnostic command did not satisfy every structured predicate",
+        ? "The Project Adapter validation plan satisfied every structured predicate"
+        : "The Project Adapter validation plan did not satisfy every structured predicate",
       { commandResult, predicateEvaluation },
     );
   }
@@ -144,57 +171,67 @@ export function isBoundFindingValidationDecision(
     value.machineEvidenceIds.every((id) => typeof id === "string");
 }
 
-interface ResolvedVerificationRequest {
+interface ResolvedValidationPlan {
   allowed: boolean;
   reason: string;
-  command: VerificationCommand | null;
-  request: FindingVerificationRequest | null;
+  plan: FindingValidationPlan | null;
 }
 
-function resolveVerificationRequest(
+function resolveValidationPlan(
   adapter: ProjectAdapter,
   task: TaskSpec,
+  finding: Finding,
   request: FindingVerificationRequest | null,
-): ResolvedVerificationRequest {
-  if (!request) return { allowed: false, reason: "The Finding has no machine verification request", command: null, request };
-  if (request.stdoutIncludes === undefined && request.stderrIncludes === undefined) {
+): ResolvedValidationPlan {
+  if (!request) return { allowed: false, reason: "The Finding has no machine verification request", plan: null };
+  let plan: FindingValidationPlan | null;
+  try {
+    plan = adapter.resolveFindingValidation?.({
+      task,
+      finding: {
+        id: finding.id,
+        category: finding.category,
+        severity: finding.severity,
+        claim: finding.claim,
+        location: finding.location,
+      },
+      request,
+    }) ?? null;
+  } catch {
     return {
       allowed: false,
-      reason: "Exit code alone cannot confirm a Finding; an output predicate is required",
-      command: null,
-      request,
+      reason: "The Project Adapter could not resolve a Finding validation plan",
+      plan: null,
     };
   }
-  const declared = adapter.verificationCommands(task);
-  const byStep = request.verificationStepId
-    ? declared.find((command) => command.id === request.verificationStepId)
-    : undefined;
-  const byArgv = request.proposedArgv
-    ? declared.find((command) => sameArgv(command.argv, request.proposedArgv!))
-    : undefined;
-  const command = byStep ?? byArgv;
-  if (command && request.proposedArgv && !sameArgv(command.argv, request.proposedArgv)) {
+  if (!plan) {
     return {
       allowed: false,
-      reason: "The proposed argv does not match the declared verification step",
-      command: null,
-      request,
+      reason: "The Project Adapter did not provide a Finding validation plan",
+      plan: null,
     };
   }
-  if (command) return { allowed: true, reason: "Declared Project Adapter verification command", command, request };
-  if (request.proposedArgv && adapter.allowDiagnosticCommand?.(request) === true) {
+  if (plan.diagnosticSafe !== true) {
     return {
-      allowed: true,
-      reason: "Project Adapter explicitly allowed the diagnostic command",
-      command: { id: request.verificationStepId ?? "project-adapter-diagnostic", argv: request.proposedArgv },
-      request,
+      allowed: false,
+      reason: "The Project Adapter validation plan is not explicitly diagnostic-safe",
+      plan: null,
+    };
+  }
+  if (!validValidationPlan(plan)) {
+    return { allowed: false, reason: "The Project Adapter returned an invalid Finding validation plan", plan: null };
+  }
+  if (plan.expected.stdoutIncludes === undefined && plan.expected.stderrIncludes === undefined) {
+    return {
+      allowed: false,
+      reason: "Exit code alone cannot confirm a Finding; the Project Adapter plan requires an output predicate",
+      plan: null,
     };
   }
   return {
-    allowed: false,
-    reason: "The diagnostic command is not declared or explicitly allowed by the Project Adapter",
-    command: null,
-    request,
+    allowed: true,
+    reason: "Project Adapter supplied the diagnostic-safe command and predicate",
+    plan,
   };
 }
 
@@ -203,7 +240,7 @@ function evidenceConfirmsFinding(
   finding: Finding,
   claimHash: string,
   reviewedCommit: string,
-  resolved: ResolvedVerificationRequest,
+  resolved: ResolvedValidationPlan,
 ): boolean {
   if (evidence.status !== "valid" || evidence.commitSha !== reviewedCommit || !isRecord(evidence.data)) return false;
   if (evidence.kind === "finding_validation") {
@@ -212,18 +249,19 @@ function evidenceConfirmsFinding(
       evidence.data.reviewedCommit === reviewedCommit &&
       evidence.data.status === "confirmed";
   }
-  if (evidence.kind !== "verification_failure" || !resolved.allowed || !resolved.command || !resolved.request) return false;
+  if (evidence.kind !== "verification_failure" || !resolved.allowed || !resolved.plan) return false;
+  const { command, expected } = resolved.plan;
   if (
-    evidence.stepId !== `verification-failure:${resolved.command.id}` ||
-    evidence.data.commandId !== resolved.command.id ||
-    !sameArgvValue(evidence.data.argv, resolved.command.argv) ||
+    evidence.stepId !== `verification-failure:${command.id}` ||
+    evidence.data.commandId !== command.id ||
+    !sameArgvValue(evidence.data.argv, command.argv) ||
     !isRecord(evidence.data.result) ||
     typeof evidence.data.stdout !== "string" ||
     typeof evidence.data.stderr !== "string"
   ) return false;
-  const result = commandResultFromEvidence(evidence.data.result, resolved.command.argv);
+  const result = commandResultFromEvidence(evidence.data.result, command.argv);
   return result !== null && evaluatePredicate(
-    resolved.request,
+    expected,
     result,
     evidence.data.stdout,
     evidence.data.stderr,
@@ -232,21 +270,26 @@ function evidenceConfirmsFinding(
 }
 
 function evaluatePredicate(
-  request: FindingVerificationRequest,
+  expected: FindingValidationPlan["expected"],
   result: CommandResult,
   stdout: string,
   stderr: string,
   reviewedCommit: string,
 ): PredicateEvaluation {
-  const exitCodeMatched = request.expectedExitCode === undefined || result.exitCode === request.expectedExitCode;
-  const stdoutMatched = request.stdoutIncludes === undefined || stdout.includes(request.stdoutIncludes);
-  const stderrMatched = request.stderrIncludes === undefined || stderr.includes(request.stderrIncludes);
+  const exitCodeMatched = expected.exitCode === undefined || result.exitCode === expected.exitCode;
+  const stdoutMatched = expected.stdoutIncludes === undefined || stdout.includes(expected.stdoutIncludes);
+  const stderrMatched = expected.stderrIncludes === undefined || stderr.includes(expected.stderrIncludes);
+  const inconclusive = (
+    expected.stdoutIncludes !== undefined && !stdoutMatched && result.stdoutTruncated
+  ) || (
+    expected.stderrIncludes !== undefined && !stderrMatched && result.stderrTruncated
+  );
   const receiptMatched = result.commitBefore === reviewedCommit && result.signal === null && !result.timedOut;
   return {
     expected: {
-      ...(request.expectedExitCode === undefined ? {} : { exitCode: request.expectedExitCode }),
-      ...(request.stdoutIncludes === undefined ? {} : { stdoutIncludes: request.stdoutIncludes }),
-      ...(request.stderrIncludes === undefined ? {} : { stderrIncludes: request.stderrIncludes }),
+      ...(expected.exitCode === undefined ? {} : { exitCode: expected.exitCode }),
+      ...(expected.stdoutIncludes === undefined ? {} : { stdoutIncludes: expected.stdoutIncludes }),
+      ...(expected.stderrIncludes === undefined ? {} : { stderrIncludes: expected.stderrIncludes }),
     },
     observed: {
       exitCode: result.exitCode,
@@ -254,11 +297,14 @@ function evaluatePredicate(
       timedOut: result.timedOut,
       stdoutSha256: sha256(stdout),
       stderrSha256: sha256(stderr),
+      stdoutTruncated: result.stdoutTruncated,
+      stderrTruncated: result.stderrTruncated,
       exitCodeMatched,
       stdoutMatched,
       stderrMatched,
     },
-    matched: receiptMatched && exitCodeMatched && stdoutMatched && stderrMatched,
+    inconclusive,
+    matched: !inconclusive && receiptMatched && exitCodeMatched && stdoutMatched && stderrMatched,
   };
 }
 
@@ -267,7 +313,10 @@ function decision(
   claimHash: string,
   status: FindingValidationStatus,
   reason: string,
-  override: Partial<Pick<FindingValidationDecision, "machineEvidenceIds" | "commandResult" | "commandError" | "predicateEvaluation">> = {},
+  override: Partial<Pick<
+    FindingValidationDecision,
+    "validationPlan" | "machineEvidenceIds" | "commandResult" | "commandError" | "predicateEvaluation"
+  >> = {},
 ): FindingValidationDecision {
   return {
     findingId: input.finding.id,
@@ -276,11 +325,23 @@ function decision(
     status,
     reason,
     verificationRequest: input.finding.verificationRequest,
+    validationPlan: override.validationPlan ?? null,
     machineEvidenceIds: override.machineEvidenceIds ?? [],
     commandResult: override.commandResult ?? null,
     commandError: override.commandError ?? null,
     predicateEvaluation: override.predicateEvaluation ?? null,
   };
+}
+
+function validValidationPlan(plan: FindingValidationPlan): boolean {
+  return typeof plan.id === "string" && plan.id.trim().length > 0 &&
+    typeof plan.command?.id === "string" && plan.command.id.trim().length > 0 &&
+    Array.isArray(plan.command.argv) && plan.command.argv.length > 0 &&
+    plan.command.argv.every((part) => typeof part === "string" && part.length > 0) &&
+    isRecord(plan.expected) &&
+    (plan.expected.exitCode === undefined || Number.isSafeInteger(plan.expected.exitCode)) &&
+    (plan.expected.stdoutIncludes === undefined || plan.expected.stdoutIncludes.length > 0) &&
+    (plan.expected.stderrIncludes === undefined || plan.expected.stderrIncludes.length > 0);
 }
 
 function commandRequest(command: VerificationCommand, cwd: string, artifactDirectory: string): CommandRequest {

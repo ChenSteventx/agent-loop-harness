@@ -14,6 +14,29 @@ export interface FindingVerificationRequest {
   stderrIncludes?: string;
 }
 
+export interface FindingValidationPlan {
+  id: string;
+  command: VerificationCommand;
+  expected: {
+    exitCode?: number;
+    stdoutIncludes?: string;
+    stderrIncludes?: string;
+  };
+  diagnosticSafe: true;
+}
+
+export interface FindingValidationContext {
+  task: TaskSpec;
+  finding: {
+    id: string;
+    category: string;
+    severity: string;
+    claim: string;
+    location: string;
+  };
+  request: FindingVerificationRequest;
+}
+
 export interface ProjectAdapter {
   readonly name: string;
   readonly policyVersion: string;
@@ -23,5 +46,7 @@ export interface ProjectAdapter {
   }): Risk;
   verificationCommands(task: TaskSpec): readonly VerificationCommand[];
   postMergeCommands(task: TaskSpec): readonly VerificationCommand[];
+  resolveFindingValidation?(context: FindingValidationContext): FindingValidationPlan | null;
+  /** @deprecated Prefer resolveFindingValidation(), which owns both command and predicate. */
   allowDiagnosticCommand?(request: FindingVerificationRequest): boolean;
 }

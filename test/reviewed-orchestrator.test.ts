@@ -11,6 +11,7 @@ import {
 import { Orchestrator } from "../src/orchestrator.js";
 import { createProviderProfile } from "../src/profiles.js";
 import { GenericNodeProjectAdapter } from "../src/project.js";
+import type { FindingValidationContext, FindingValidationPlan } from "../src/ports.js";
 import type {
   ProviderAdapter,
   ProviderFailureClass,
@@ -19,6 +20,23 @@ import type {
 } from "../src/provider.js";
 
 const temporaryDirectories: string[] = [];
+
+class ReviewedFixtureProjectAdapter extends GenericNodeProjectAdapter {
+  resolveFindingValidation(context: FindingValidationContext): FindingValidationPlan | null {
+    if (
+      context.finding.id !== "F-1" ||
+      context.finding.claim !== "changed.txt still contains the unreviewed value" ||
+      context.request.verificationStepId !== "check"
+    ) return null;
+    const command = this.verificationCommands(context.task).find((item) => item.id === "check");
+    return command ? {
+      id: "reviewed-fixture:changed-txt",
+      command,
+      expected: { exitCode: 0, stdoutIncludes: "broken" },
+      diagnosticSafe: true,
+    } : null;
+  }
+}
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -238,7 +256,7 @@ function orchestrator(
       claude: { adapter: primary, family: "claude", name: "Configured Claude Reviewer" },
       deepseek: { adapter: fallback, family: "deepseek", name: "Configured DeepSeek Reviewer" },
     }),
-    projectAdapter: new GenericNodeProjectAdapter(),
+    projectAdapter: new ReviewedFixtureProjectAdapter(),
     faults,
   });
 }

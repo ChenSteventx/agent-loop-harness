@@ -9,7 +9,12 @@ import {
   findingClaimHash,
   isBoundFindingValidationDecision,
 } from "../src/finding-validator.js";
-import type { ProjectAdapter, VerificationCommand } from "../src/ports.js";
+import type {
+  FindingValidationContext,
+  FindingValidationPlan,
+  ProjectAdapter,
+  VerificationCommand,
+} from "../src/ports.js";
 import type { Finding } from "../src/reviewer.js";
 import type { TaskSpec } from "../src/task-spec.js";
 
@@ -35,11 +40,15 @@ class Adapter implements ProjectAdapter {
   readonly name = "test";
   readonly policyVersion = "test/v1";
 
-  constructor(private readonly commands: readonly VerificationCommand[]) {}
+  constructor(
+    private readonly commands: readonly VerificationCommand[],
+    private readonly resolver?: (context: FindingValidationContext) => FindingValidationPlan | null,
+  ) {}
 
   minimumRisk() { return "high" as const; }
   verificationCommands() { return this.commands; }
   postMergeCommands() { return this.commands; }
+  resolveFindingValidation(context: FindingValidationContext) { return this.resolver?.(context) ?? null; }
 }
 
 class RecordingRunner {
@@ -106,7 +115,13 @@ function input(currentFinding: Finding, currentEvidence: readonly Evidence[] = [
   };
 }
 
-function resultWithOutput(request: CommandRequest, stdout: string, stderr: string, exitCode: number): CommandResult {
+function resultWithOutput(
+  request: CommandRequest,
+  stdout: string,
+  stderr: string,
+  exitCode: number,
+  truncated: { stdout?: boolean; stderr?: boolean } = {},
+): CommandResult {
   const stdoutPath = join(request.artifactDirectory, "stdout.log");
   const stderrPath = join(request.artifactDirectory, "stderr.log");
   writeFileSync(stdoutPath, stdout);
@@ -120,10 +135,17 @@ function resultWithOutput(request: CommandRequest, stdout: string, stderr: strin
     timedOut: false,
     stdoutPath,
     stderrPath,
-    stdoutTruncated: false,
-    stderrTruncated: false,
+    stdoutTruncated: truncated.stdout ?? false,
+    stderrTruncated: truncated.stderr ?? false,
     commitBefore: commit,
   };
+}
+
+function validationPlan(
+  command: VerificationCommand,
+  expected: FindingValidationPlan["expected"],
+): FindingValidationPlan {
+  return { id: `validate:${command.id}`, command, expected, diagnosticSafe: true };
 }
 
 afterEach(() => {
@@ -140,6 +162,7 @@ describe("FindingValidator evidence and execution boundaries", () => {
       status: "confirmed",
       reason: "matched",
       verificationRequest: null,
+      validationPlan: null,
       machineEvidenceIds: ["E-1"],
       commandResult: null,
       commandError: null,
@@ -223,7 +246,10 @@ describe("FindingValidator evidence and execution boundaries", () => {
       },
     });
     const runner = new RecordingRunner();
-    const validator = new FindingValidator(new Adapter([command]), runner);
+    const validator = new FindingValidator(new Adapter(
+      [command],
+      () => validationPlan(command, { exitCode: 2, stderrIncludes: "bypass reproduced" }),
+    ), runner);
 
     expect((await validator.validate(input(currentFinding, [matchingEvidence]))).status).toBe("confirmed");
     expect((await validator.validate(input(currentFinding, [{
@@ -236,7 +262,10 @@ describe("FindingValidator evidence and execution boundaries", () => {
   it("does not confirm a declared node command solely because it exits zero", async () => {
     const command: VerificationCommand = { id: "empty-success", argv: ["node", "-e", "process.exit(0)"] };
     const runner = new RecordingRunner();
-    const decision = await new FindingValidator(new Adapter([command]), runner).validate(input(finding({
+    const decision = await new FindingValidator(new Adapter(
+      [command],
+      () => validationPlan(command, { exitCode: 0 }),
+    ), runner).validate(input(finding({
       verificationRequest: {
         verificationStepId: command.id,
         proposedArgv: command.argv,
@@ -249,18 +278,35 @@ describe("FindingValidator evidence and execution boundaries", () => {
     expect(runner.calls).toEqual([]);
   });
 
-  it.each(["curl", "rm", "python"])("never executes an undeclared %s diagnostic", async (executable) => {
+  it.each(["curl", "rm", "python"])("never executes a diagnostic without a Project Adapter plan (%s)", async (executable) => {
     const runner = new RecordingRunner();
     const decision = await new FindingValidator(new Adapter(task.verification), runner).validate(input(finding({
       verificationRequest: { proposedArgv: [executable, "unsafe"], stdoutIncludes: "reproduced" },
     })));
 
     expect(decision.status).toBe("inconclusive");
-    expect(decision.reason).toContain("not declared");
+    expect(decision.reason).toContain("did not provide");
     expect(runner.calls).toEqual([]);
   });
 
-  it("confirms a whitelisted command only when every structured predicate matches", async () => {
+  it("does not let a Reviewer-selected common output predicate confirm a security claim", async () => {
+    const command: VerificationCommand = { id: "typecheck", argv: ["npm", "run", "typecheck"] };
+    const runner = new RecordingRunner((request) => resultWithOutput(request, "passed\n", "", 0));
+    const decision = await new FindingValidator(new Adapter([command]), runner).validate(input(finding({
+      verificationRequest: {
+        verificationStepId: command.id,
+        proposedArgv: command.argv,
+        expectedExitCode: 0,
+        stdoutIncludes: "passed",
+      },
+    })));
+
+    expect(decision.status).toBe("inconclusive");
+    expect(decision.validationPlan).toBeNull();
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("uses the Project Adapter command and predicate instead of the Reviewer predicate", async () => {
     const command: VerificationCommand = { id: "security-check", argv: ["verify", "--check"] };
     const runner = new RecordingRunner((request) => resultWithOutput(
       request,
@@ -268,19 +314,83 @@ describe("FindingValidator evidence and execution boundaries", () => {
       "security finding reproduced\n",
       2,
     ));
-    const validator = new FindingValidator(new Adapter([command]), runner);
+    const validator = new FindingValidator(new Adapter(
+      [command],
+      () => validationPlan(command, { exitCode: 2, stderrIncludes: "security finding reproduced" }),
+    ), runner);
     const request = {
       verificationStepId: command.id,
       proposedArgv: command.argv,
       expectedExitCode: 2,
-      stderrIncludes: "security finding reproduced",
+      stderrIncludes: "Reviewer chose an unrelated predicate",
     };
 
     expect((await validator.validate(input(finding({ verificationRequest: request })))).status).toBe("confirmed");
-    expect((await validator.validate(input(finding({
-      verificationRequest: { ...request, stderrIncludes: "different defect" },
-    })))).status).toBe("rejected");
-    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("rejects when the machine output does not satisfy the Project Adapter plan", async () => {
+    const command: VerificationCommand = { id: "security-check", argv: ["verify", "--check"] };
+    const runner = new RecordingRunner((request) => resultWithOutput(request, "", "different defect\n", 2));
+    const validator = new FindingValidator(new Adapter(
+      [command],
+      () => validationPlan(command, { exitCode: 2, stderrIncludes: "security finding reproduced" }),
+    ), runner);
+
+    const decision = await validator.validate(input(finding({
+      verificationRequest: { verificationStepId: command.id, stderrIncludes: "different defect" },
+    })));
+
+    expect(decision.status).toBe("rejected");
+    expect(decision.predicateEvaluation).toMatchObject({ matched: false, inconclusive: false });
+  });
+
+  it.each([
+    { stream: "stdout" as const, stdout: "", stderr: "", truncated: { stdout: true } },
+    { stream: "stderr" as const, stdout: "", stderr: "", truncated: { stderr: true } },
+  ])("returns inconclusive when a required $stream predicate may be outside truncated output", async ({ stream, stdout, stderr, truncated }) => {
+    const command: VerificationCommand = { id: "security-check", argv: ["verify", "--check"] };
+    const expected = stream === "stdout" ? { stdoutIncludes: "needle" } : { stderrIncludes: "needle" };
+    const runner = new RecordingRunner((request) => resultWithOutput(request, stdout, stderr, 0, truncated));
+    const validator = new FindingValidator(new Adapter([command], () => validationPlan(command, expected)), runner);
+
+    const decision = await validator.validate(input(finding({
+      verificationRequest: { verificationStepId: command.id, [`${stream}Includes`]: "Reviewer value" },
+    })));
+
+    expect(decision.status).toBe("inconclusive");
+    expect(decision.predicateEvaluation).toMatchObject({ matched: false, inconclusive: true });
+  });
+
+  it("can confirm a predicate already found in truncated output", async () => {
+    const command: VerificationCommand = { id: "security-check", argv: ["verify", "--check"] };
+    const runner = new RecordingRunner((request) => resultWithOutput(request, "needle before limit", "", 0, { stdout: true }));
+    const validator = new FindingValidator(new Adapter(
+      [command],
+      () => validationPlan(command, { exitCode: 0, stdoutIncludes: "needle" }),
+    ), runner);
+
+    const decision = await validator.validate(input(finding({
+      verificationRequest: { verificationStepId: command.id, stdoutIncludes: "ignored" },
+    })));
+
+    expect(decision.status).toBe("confirmed");
+    expect(decision.predicateEvaluation).toMatchObject({ matched: true, inconclusive: false });
+  });
+
+  it("does not execute a plan without diagnosticSafe true", async () => {
+    const command: VerificationCommand = { id: "security-check", argv: ["verify", "--check"] };
+    const unsafePlan = { ...validationPlan(command, { stdoutIncludes: "needle" }), diagnosticSafe: false } as unknown as FindingValidationPlan;
+    const runner = new RecordingRunner();
+    const validator = new FindingValidator(new Adapter([command], () => unsafePlan), runner);
+
+    const decision = await validator.validate(input(finding({
+      verificationRequest: { verificationStepId: command.id, stdoutIncludes: "needle" },
+    })));
+
+    expect(decision.status).toBe("inconclusive");
+    expect(decision.reason).toContain("not explicitly diagnostic-safe");
+    expect(runner.calls).toEqual([]);
   });
 
   it("leaves Run facts, Git facts, Acceptance, and prior Evidence unchanged after an inconclusive validation", async () => {

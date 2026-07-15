@@ -1419,6 +1419,11 @@ export class Orchestrator {
       reviewedCommit,
       findingId: finding.id,
       claimHash: findingClaimHash(finding),
+      validationPolicy: "project-adapter-plan/v1",
+      projectAdapter: {
+        name: this.projectAdapter.name,
+        policyVersion: this.projectAdapter.policyVersion,
+      },
       verificationRequest: finding.verificationRequest,
       evidenceIds: finding.evidenceIds,
     };
