@@ -26,6 +26,7 @@ import { applyRiskEscalation, executionTemplates } from "./routing.js";
 import {
   compactExplorerReport,
   explorerReportSchema,
+  renderExplorerPrompt,
   runExplorer,
   type ExplorerReport,
 } from "./explorer.js";
@@ -62,12 +63,18 @@ import { WriterExecutor, writerBoundaryViolation } from "./writer-executor.js";
 import {
   hashReviewDiff,
   isBlockingFinding,
+  renderReviewerPrompt,
   reviewReportSchema,
   runReviewer,
   type Finding,
   type ReviewReport,
   type VerificationEvidence,
 } from "./reviewer.js";
+import {
+  createInvocationManifest,
+  type InvocationRole,
+  type ManifestContextInput,
+} from "./evaluation/manifests.js";
 
 export function defaultLoopHome(): string {
   return resolve(homedir(), ".agent-loop-harness");
@@ -107,6 +114,7 @@ export interface RunView {
   operations: ReturnType<SqliteStore["listOperations"]>;
   evidence: ReturnType<SqliteStore["listEvidence"]>;
   events: ReturnType<SqliteStore["listEvents"]>;
+  invocationManifests: ReturnType<SqliteStore["listInvocationManifests"]>;
   worktreePath: string;
   worktreeExists: boolean;
 }
@@ -240,6 +248,7 @@ export class Orchestrator {
       operations: this.store.listOperations(runId),
       evidence: this.store.listEvidence(runId),
       events: this.store.listEvents(runId),
+      invocationManifests: this.store.listInvocationManifests(runId),
       worktreePath,
       worktreeExists: existsSync(worktreePath),
     };
@@ -515,6 +524,22 @@ export class Orchestrator {
         });
         return;
       }
+      this.installRoleInvocationManifest({
+        runId,
+        operation,
+        role: "explorer",
+        renderedPrompt: renderExplorerPrompt({
+          task: binding.taskSpec,
+          baselineCommit: binding.baselineCommit,
+          currentCommit: input.currentCommit,
+          allowedRepositoryRoots: [binding.worktreePath],
+          contextBudget: this.explorerContextBudget,
+        }),
+        outputSchemaPath: this.roleOutputSchemas.explorer,
+        actualProvider: savedCompletion.result.identity,
+        configuredProvider: selected,
+        currentCommit: input.currentCommit,
+      });
       const completed = this.store.finishOperation(operation.id, "succeeded", {
         report: report.data,
         costTokens: providerUsageTokens(savedCompletion.result),
@@ -578,6 +603,18 @@ export class Orchestrator {
     const selected = supervised?.outcome?.selectedAdapterIndex === null || supervised?.outcome?.selectedAdapterIndex === undefined
       ? null
       : candidates[supervised.outcome.selectedAdapterIndex] ?? null;
+    if (!this.providerProfile || supervised?.outcome?.result) {
+      this.installRoleInvocationManifest({
+        runId,
+        operation,
+        role: "explorer",
+        renderedPrompt: result.renderedPrompt,
+        outputSchemaPath: this.roleOutputSchemas.explorer,
+        actualProvider: result.provider.identity,
+        configuredProvider: selected,
+        currentCommit: before.head,
+      });
+    }
     if (this.providerProfile && (!result.report || !supervised?.outcome?.result || !selected)) {
       const providerBlock = {
         reason: "No configured Explorer produced a valid structured report",
@@ -750,10 +787,39 @@ export class Orchestrator {
         failureClass: legacyResult.failureClass,
         identity: legacyResult.identity,
         outputHash: operationInputHash(legacyResult.finalOutput),
+        result: legacyResult,
       });
       this.afterProviderCompletion?.();
     }
-    if (execution.disposition === "blocked" || !execution.result) {
+    const providerResult = execution.result;
+    const selectedAuthor = execution.selectedAuthor;
+    if (providerResult) {
+      this.installRoleInvocationManifest({
+        runId,
+        operation,
+        role,
+        renderedPrompt: request.prompt,
+        outputSchemaPath: this.roleOutputSchemas.author,
+        actualProvider: providerResult.identity,
+        configuredProvider: selectedAuthor,
+        currentCommit: input.baseCommit,
+        context: [
+          ...(explorerReport ? [{
+            kind: "explorer-report",
+            reference: `${runId}:explorer`,
+            content: explorerReport,
+            trust: "untrusted" as const,
+          }] : []),
+          ...failureEvidence.map((item) => ({
+            kind: "failure-evidence",
+            reference: item.id,
+            content: item.data,
+            trust: "trusted" as const,
+          })),
+        ],
+      });
+    }
+    if (execution.disposition === "blocked" || !providerResult) {
       const providerBlock = {
         reason: "No configured Author produced a valid structured result",
         supervisor: execution.supervisor,
@@ -767,8 +833,6 @@ export class Orchestrator {
       this.requireHumanReview(runId, "Author is unavailable", providerBlock, "provider-recovery");
       return;
     }
-    const providerResult = execution.result;
-    const selectedAuthor = execution.selectedAuthor;
     this.store.recordAgentCall(runId, {
       role,
       provider: providerResult.identity.provider,
@@ -993,6 +1057,27 @@ export class Orchestrator {
       const selected = outcome?.selectedAdapterIndex === null || outcome?.selectedAdapterIndex === undefined
         ? null
         : candidates[outcome.selectedAdapterIndex] ?? null;
+      if (outcome?.result) {
+        this.installRoleInvocationManifest({
+          runId,
+          operation,
+          role: "reviewer",
+          renderedPrompt: result.renderedPrompt,
+          outputSchemaPath: this.roleOutputSchemas.reviewer,
+          actualProvider: outcome.result.identity,
+          configuredProvider: selected,
+          currentCommit: reviewedCommit,
+          context: [
+            { kind: "review-diff", reference: diffHash, content: diff, trust: "untrusted" },
+            ...verificationEvidence.map((item) => ({
+              kind: "verification-evidence",
+              reference: item.evidenceId,
+              content: item,
+              trust: "trusted" as const,
+            })),
+          ],
+        });
+      }
       if (!result.report || !outcome?.result || !selected) {
         const providerBlock = {
           reason: "No configured independent Reviewer produced a valid structured report",
@@ -1072,6 +1157,7 @@ export class Orchestrator {
   }
 
   private recoverWriterOperation(runId: string, operation: Operation, git: GitService): Operation {
+    const run = this.requireBoundRun(runId);
     const input = writerOperationInput(operation.input);
     const completion = this.writerProviderReceipt(runId, operation.id);
     const durableOutput = completion?.result
@@ -1099,6 +1185,39 @@ export class Orchestrator {
       return this.store.finishOperation(operation.id, "failed", {
         reason: reason ?? "Writer recovery is missing valid structured output",
         providerCompletion: completion,
+      });
+    }
+    if (completion?.result) {
+      const failureEvidenceIds = isRecord(operation.input) && Array.isArray(operation.input.failureEvidenceIds)
+        ? operation.input.failureEvidenceIds.filter((id): id is string => typeof id === "string")
+        : [];
+      const failureEvidence = this.store.listEvidence(runId).filter((item) => failureEvidenceIds.includes(item.id));
+      const explorerReport = this.savedExplorerReport(runId);
+      this.installRoleInvocationManifest({
+        runId,
+        operation,
+        role: operation.kind as "author" | "repair",
+        renderedPrompt: operation.kind === "author"
+          ? authorPrompt(run.binding.taskSpec, explorerReport)
+          : repairPrompt(run.binding.taskSpec, input.attempt, input.baseCommit, failureEvidence),
+        outputSchemaPath: this.roleOutputSchemas.author,
+        actualProvider: completion.result.identity,
+        configuredProvider: completion.configuredAuthor ?? null,
+        currentCommit: input.baseCommit,
+        context: [
+          ...(explorerReport ? [{
+            kind: "explorer-report",
+            reference: `${runId}:explorer`,
+            content: explorerReport,
+            trust: "untrusted" as const,
+          }] : []),
+          ...failureEvidence.map((item) => ({
+            kind: "failure-evidence",
+            reference: item.id,
+            content: item.data,
+            trust: "trusted" as const,
+          })),
+        ],
       });
     }
     const recovered = this.store.finishOperation(operation.id, "succeeded", {
@@ -1562,6 +1681,36 @@ export class Orchestrator {
       this.requireHumanReview(runId, "Independent Reviewer recovery failed closed", failed.result, failed.id);
       return;
     }
+    const diff = git.diffBetween(run.binding.baselineCommit, git.head());
+    const verificationEvidence = this.reviewVerificationEvidence(runId, input.reviewedCommit);
+    this.installRoleInvocationManifest({
+      runId,
+      operation,
+      role: "reviewer",
+      renderedPrompt: renderReviewerPrompt({
+        task: run.binding.taskSpec,
+        diff,
+        reviewedCommit: input.reviewedCommit,
+        diffHash: input.diffHash,
+        controlStateHash: input.controlStateHash,
+        verificationEvidence,
+        allowedRepositoryRoots: [run.binding.worktreePath],
+        contextBudget: this.explorerContextBudget,
+      }),
+      outputSchemaPath: this.roleOutputSchemas.reviewer,
+      actualProvider: completion.result.identity,
+      configuredProvider: selected,
+      currentCommit: input.reviewedCommit,
+      context: [
+        { kind: "review-diff", reference: input.diffHash, content: diff, trust: "untrusted" },
+        ...verificationEvidence.map((item) => ({
+          kind: "verification-evidence",
+          reference: item.evidenceId,
+          content: item,
+          trust: "trusted" as const,
+        })),
+      ],
+    });
     this.store.recordAgentCall(runId, {
       role: "reviewer",
       provider: completion.result.identity.provider,
@@ -1679,6 +1828,46 @@ export class Orchestrator {
     return role === "author"
       ? resolve(this.loopHome, "runs", runId, "author")
       : resolve(this.loopHome, "runs", runId, "repair", String(attempt));
+  }
+
+  private installRoleInvocationManifest(input: {
+    runId: string;
+    operation: Operation;
+    role: InvocationRole;
+    renderedPrompt: string;
+    outputSchemaPath: string;
+    actualProvider: ProviderRunResult["identity"];
+    configuredProvider: Pick<ConfiguredProvider, "name"> | null;
+    currentCommit: string;
+    context?: readonly ManifestContextInput[];
+  }): void {
+    const run = this.requireBoundRun(input.runId);
+    this.store.installInvocationManifest(createInvocationManifest({
+      id: `${input.operation.id}:manifest:v1`,
+      runId: input.runId,
+      operationId: input.operation.id,
+      role: input.role,
+      binding: run.binding,
+      renderedPrompt: input.renderedPrompt,
+      outputSchemaPath: input.outputSchemaPath,
+      configuredProvider: {
+        provider: input.configuredProvider?.name ?? this.providerProfileName,
+        model: null,
+      },
+      actualProvider: input.actualProvider,
+      currentCommit: input.currentCommit,
+      verificationPlan: this.projectAdapter.verificationCommands(run.binding.taskSpec),
+      context: [
+        {
+          kind: "task-spec",
+          reference: run.binding.taskSpecPath,
+          content: run.binding.taskSpec,
+          trust: "project",
+        },
+        ...(input.context ?? []),
+      ],
+      createdAt: input.operation.startedAt,
+    }));
   }
 
   private savedExplorerReport(runId: string): ExplorerReport | null {

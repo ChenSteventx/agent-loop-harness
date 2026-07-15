@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 function sourceFiles(directory: string): string[] {
@@ -11,14 +11,19 @@ function sourceFiles(directory: string): string[] {
 
 describe("generic architecture boundary", () => {
   it("contains no external project imports, absolute workspace paths, or hidden placeholders", () => {
-    const files = sourceFiles(resolve("src"));
+    const sourceRoot = resolve("src");
+    const files = sourceFiles(sourceRoot);
     expect(files.length).toBeGreaterThan(0);
     for (const file of files) {
       const source = readFileSync(file, "utf8");
       expect(source, file).not.toMatch(/[A-Z]:[\\/](?:ctx|Users)[\\/]/iu);
       expect(source, file).not.toMatch(/\b(?:TODO|FIXME|PLACEHOLDER)\b/iu);
       for (const match of source.matchAll(/from\s+["']([^"']+)["']/gu)) {
-        expect(match[1], `${file} imports outside src`).not.toMatch(/^\.\.\//u);
+        const specifier = match[1];
+        if (specifier?.startsWith(".")) {
+          const target = resolve(dirname(file), specifier);
+          expect(relative(sourceRoot, target), `${file} imports outside src`).not.toMatch(/^\.\.(?:[\\/]|$)/u);
+        }
       }
     }
   });

@@ -13,8 +13,9 @@ import {
   type RunStatus,
   type TransitionOptions,
 } from "./domain.js";
-import { evidenceDependencyHash, operationInputHash } from "./bindings.js";
+import { canonicalJson, evidenceDependencyHash, operationInputHash } from "./bindings.js";
 import { applyRiskEscalation, routeRisk, type Risk } from "./routing.js";
+import type { InvocationManifest } from "./evaluation/manifests.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -373,6 +374,55 @@ export class SqliteStore {
     return rows.map(mapEvidence);
   }
 
+  installInvocationManifest(manifest: InvocationManifest): InvocationManifest {
+    this.requireRun(manifest.runId);
+    const operation = this.requireOperation(manifest.operationId);
+    if (operation.runId !== manifest.runId) throw new Error("Invocation Manifest operation belongs to another Run");
+    const existing = this.getInvocationManifest(manifest.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(manifest)) {
+        throw new Error(`Invocation Manifest ${manifest.id} is immutable`);
+      }
+      return existing;
+    }
+    const byOperation = this.database.prepare(
+      "SELECT * FROM invocation_manifests WHERE operation_id = ?",
+    ).get(manifest.operationId) as InvocationManifestRow | undefined;
+    if (byOperation) {
+      const installed = mapInvocationManifest(byOperation);
+      if (canonicalJson(installed) !== canonicalJson(manifest)) {
+        throw new Error(`Operation ${manifest.operationId} already has a different Invocation Manifest`);
+      }
+      return installed;
+    }
+    this.database.prepare(
+      `INSERT INTO invocation_manifests
+       (id, run_id, operation_id, role, manifest_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      manifest.id,
+      manifest.runId,
+      manifest.operationId,
+      manifest.role,
+      JSON.stringify(manifest),
+      manifest.createdAt,
+    );
+    return this.getInvocationManifest(manifest.id)!;
+  }
+
+  getInvocationManifest(id: string): InvocationManifest | null {
+    const row = this.database.prepare("SELECT * FROM invocation_manifests WHERE id = ?")
+      .get(id) as InvocationManifestRow | undefined;
+    return row ? mapInvocationManifest(row) : null;
+  }
+
+  listInvocationManifests(runId: string): InvocationManifest[] {
+    this.requireRun(runId);
+    return (this.database.prepare(
+      "SELECT * FROM invocation_manifests WHERE run_id = ? ORDER BY created_at, id",
+    ).all(runId) as InvocationManifestRow[]).map(mapInvocationManifest);
+  }
+
   invalidateEvidenceExcept(
     runId: string,
     validDependencyHashes: readonly string[],
@@ -648,6 +698,14 @@ export class SqliteStore {
         created_at TEXT NOT NULL,
         PRIMARY KEY(run_id, finding_id)
       );
+      CREATE TABLE IF NOT EXISTS invocation_manifests (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id),
+        role TEXT NOT NULL CHECK(role IN ('explorer', 'author', 'repair', 'reviewer')),
+        manifest_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
     this.ensureColumn("runs", "binding_json", "TEXT");
     this.ensureColumn("operations", "input_json", "TEXT");
@@ -675,6 +733,15 @@ export class SqliteStore {
 
 interface MetricAggregateRow { calls: number; latency: number; input_tokens: number | null; cached_input_tokens: number | null; output_tokens: number | null }
 interface FindingAggregateRow { confirmed: number; false_positives: number }
+
+interface InvocationManifestRow {
+  id: string;
+  run_id: string;
+  operation_id: string;
+  role: string;
+  manifest_json: string;
+  created_at: string;
+}
 
 interface RunRow {
   id: string;
@@ -783,6 +850,19 @@ function mapOutbox(row: OutboxRow): OutboxRecord {
 
 function mapHumanInbox(row: HumanInboxRow): HumanInboxRecord {
   return { id: row.id, runId: row.run_id, question: row.question, options: parseJson(row.options_json) as string[], recommendation: row.recommendation, evidence: parseJson(row.evidence_json), risk: row.risk, consequence: row.consequence, resumeCommand: row.resume_command, createdAt: row.created_at, resolvedAt: row.resolved_at };
+}
+
+function mapInvocationManifest(row: InvocationManifestRow): InvocationManifest {
+  const manifest = parseJson(row.manifest_json) as InvocationManifest;
+  if (
+    manifest.schemaVersion !== 1 ||
+    manifest.id !== row.id ||
+    manifest.runId !== row.run_id ||
+    manifest.operationId !== row.operation_id ||
+    manifest.role !== row.role ||
+    manifest.createdAt !== row.created_at
+  ) throw new Error(`Stored Invocation Manifest ${row.id} is corrupt`);
+  return manifest;
 }
 
 function validateHumanInbox(input: HumanInboxInput): void {

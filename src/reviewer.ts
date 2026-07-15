@@ -82,6 +82,7 @@ export interface ReviewSnapshot {
 export interface ReviewerResult {
   report: ReviewReport | null;
   provider: ProviderRunResult;
+  renderedPrompt: string;
   reviewedCommit: string;
   diffHash: string;
   stale: boolean;
@@ -99,9 +100,10 @@ export async function runReviewer(
   request: Omit<ProviderRunRequest, "prompt" | "workspaceAccess" | "allowedRepositoryRoots" | "contextBudget" | "additionalWritableDirectories">,
 ): Promise<ReviewerResult> {
   validateBinding(input, snapshot());
+  const renderedPrompt = renderReviewerPrompt(input);
   const providerResult = await provider.run({
     ...request,
-    prompt: reviewerPrompt(input),
+    prompt: renderedPrompt,
     workspaceAccess: "read-only",
     allowedRepositoryRoots: input.allowedRepositoryRoots,
     contextBudget: input.contextBudget,
@@ -125,7 +127,7 @@ export async function runReviewer(
         })),
       })
     : null;
-  return { report, provider: providerResult, reviewedCommit: input.reviewedCommit, diffHash: input.diffHash, stale: false };
+  return { report, provider: providerResult, renderedPrompt, reviewedCommit: input.reviewedCommit, diffHash: input.diffHash, stale: false };
 }
 
 export function invalidateStaleReview(result: ReviewerResult, current: Pick<ReviewSnapshot, "commit" | "diffHash">): ReviewerResult {
@@ -168,7 +170,7 @@ function validateBinding(input: ReviewerInput, current: ReviewSnapshot): void {
   if (!Number.isSafeInteger(input.contextBudget) || input.contextBudget <= 0) throw new Error("Reviewer context budget must be a positive integer");
 }
 
-function reviewerPrompt(input: ReviewerInput): string {
+export function renderReviewerPrompt(input: ReviewerInput): string {
   return [
     "Role: independent read-only Reviewer. Do not write files or change run state.",
     `Task spec and acceptance: ${JSON.stringify(input.task)}`,

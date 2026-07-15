@@ -82,6 +82,11 @@ describe("production CLI loop", () => {
       run: { status: string; binding: { providerProfile: string } };
       worktreePath: string;
       evidence: Array<{ kind: string; status: string }>;
+      invocationManifests: Array<{
+        role: string;
+        prompt: { renderedPromptHash: string; redactedArtifactPath: string | null };
+        provider: { actualProvider: string };
+      }>;
     };
 
     expect(started.run).toMatchObject({ status: "ready", binding: { providerProfile: "CODEX_PRIMARY" } });
@@ -89,6 +94,16 @@ describe("production CLI loop", () => {
       expect.objectContaining({ kind: "candidate_commit", status: "valid" }),
       expect.objectContaining({ kind: "command", status: "valid" }),
     ]));
+    expect(started.invocationManifests).toEqual([
+      expect.objectContaining({
+        role: "author",
+        prompt: expect.objectContaining({
+          renderedPromptHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          redactedArtifactPath: null,
+        }),
+        provider: expect.objectContaining({ actualProvider: "openai-codex" }),
+      }),
+    ]);
     expect(readFileSync(join(started.worktreePath, "changed.txt"), "utf8")).toContain("production CLI");
     expect(git(started.worktreePath, ["show", "-s", "--format=%an <%ae>"])).toBe(
       "Agent Loop Harness <agent-loop@localhost>",

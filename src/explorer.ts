@@ -32,6 +32,7 @@ export interface ExplorerInput {
 export interface ExplorerResult {
   report: ExplorerReport | null;
   provider: ProviderRunResult;
+  renderedPrompt: string;
   costTokens: number;
   latencyMs: number;
   used: boolean;
@@ -45,9 +46,10 @@ export async function runExplorer(
   if (!Number.isSafeInteger(input.contextBudget) || input.contextBudget <= 0) {
     throw new Error("Explorer context budget must be a positive integer");
   }
+  const renderedPrompt = renderExplorerPrompt(input);
   const providerResult = await provider.run({
     ...request,
-    prompt: explorerPrompt(input),
+    prompt: renderedPrompt,
     workspaceAccess: "read-only",
     allowedRepositoryRoots: input.allowedRepositoryRoots,
     contextBudget: input.contextBudget,
@@ -59,6 +61,7 @@ export async function runExplorer(
   return {
     report,
     provider: providerResult,
+    renderedPrompt,
     costTokens: sumUsage(providerResult),
     latencyMs: providerResult.durationMs,
     used: report !== null,
@@ -69,7 +72,7 @@ export function compactExplorerReport(report: ExplorerReport): string {
   return JSON.stringify(report);
 }
 
-function explorerPrompt(input: ExplorerInput): string {
+export function renderExplorerPrompt(input: ExplorerInput): string {
   return [
     "Role: bounded read-only Explorer. Do not write files or change run state.",
     `Task spec: ${JSON.stringify(input.task)}`,
