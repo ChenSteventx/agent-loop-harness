@@ -10,11 +10,18 @@ import {
   safeBranchName,
   type CandidateCommit,
 } from "./execution.js";
+import {
+  FindingValidator,
+  findingClaimHash,
+  isBoundFindingValidationDecision,
+  type FindingValidationDecision,
+} from "./finding-validator.js";
 import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { ProviderAdapter, ProviderRunRequest, ProviderRunResult } from "./provider.js";
 import { loadTaskSpec } from "./project.js";
 import { SqliteStore } from "./store.js";
 import type { Evidence, Operation, Run } from "./domain.js";
+import { EvidenceGate } from "./evidence-gate.js";
 import { applyRiskEscalation, executionTemplates } from "./routing.js";
 import {
   compactExplorerReport,
@@ -347,7 +354,8 @@ export class Orchestrator {
     this.reconcileCommitBoundEvidence(runId, git.head());
     const operations = this.store.listOperations(runId);
     const allEvidence = this.store.listEvidence(runId);
-    const validEvidence = allEvidence.filter((item) => item.status === "valid");
+    const evidenceGate = new EvidenceGate(allEvidence);
+    const validEvidence = evidenceGate.validEvidence();
     const template = executionTemplates[binding.executionTemplate];
 
     const explorer = operations.find((operation) => operation.kind === "explorer");
@@ -372,9 +380,7 @@ export class Orchestrator {
     const savedCheckpoint = operations.some((operation) =>
       operation.kind === "checkpoint-commit" && operation.status === "succeeded"
     );
-    const currentCandidate = validEvidence.some((item) =>
-      item.kind === "candidate_commit" && item.commitSha === git.head()
-    );
+    const currentCandidate = evidenceGate.has("candidate_commit", (item) => item.commitSha === git.head());
     let writerProof: ProofGapSnapshot["writer"];
     if (git.isDirty()) {
       writerProof = writer && (writer.status === "running" || writer.status === "succeeded")
@@ -391,22 +397,13 @@ export class Orchestrator {
     const expectedCommandHashes = commands.map((command) =>
       this.commandEvidenceReceipt(runId, git.head(), binding.worktreePath, "verify", command).dependencyHash
     );
-    const validHashes = new Set(validEvidence.map((item) => item.dependencyHash));
-    const currentFailures = validEvidence.filter((item) =>
-      item.kind === "verification_failure" && item.commitSha === git.head()
-    );
-    const verification = currentFailures.length > 0
-      ? "failed"
-      : expectedCommandHashes.length > 0 && expectedCommandHashes.every((hash) => validHashes.has(hash))
-        ? "passed"
-        : "missing";
+    const currentFailures = evidenceGate.matching("verification_failure", (item) => item.commitSha === git.head());
+    const verification = evidenceGate.verificationStatus(git.head(), expectedCommandHashes);
 
     const acceptanceReceipt = this.acceptanceEvidenceReceipt(runId, git.head());
     const acceptance = !template.requiresIndependentReview
       ? "not-required"
-      : validEvidence.some((item) =>
-          item.kind === "acceptance_binding" && item.dependencyHash === acceptanceReceipt.dependencyHash
-        )
+      : evidenceGate.has("acceptance_binding", (item) => item.dependencyHash === acceptanceReceipt.dependencyHash)
         ? "satisfied"
         : "missing";
 
@@ -1023,10 +1020,14 @@ export class Orchestrator {
         git,
       );
       const blockingFindings = validatedReport.findings.filter((finding) => isBlockingFinding(finding));
+      const inconclusiveFindings = validatedReport.findings.filter((finding) =>
+        finding.status === "proposed" && (finding.severity === "high" || finding.severity === "critical")
+      );
       operation = this.store.finishOperation(operation.id, "succeeded", {
         report: validatedReport,
         blocking: blockingFindings.length > 0,
         blockingFindingIds: blockingFindings.map((finding) => finding.id),
+        inconclusiveFindingIds: inconclusiveFindings.map((finding) => finding.id),
         reviewedCommit,
         diffHash,
         selectedReviewer: {
@@ -1043,6 +1044,8 @@ export class Orchestrator {
           { operationId: operation.id },
           operation.id,
         );
+      } else if (inconclusiveFindings.length > 0) {
+        this.requireFindingEvidence(runId, inconclusiveFindings, operation.id);
       }
     } catch (error) {
       if (error instanceof ReviewProviderCompletionInterruption) throw error;
@@ -1415,9 +1418,8 @@ export class Orchestrator {
       reviewOperationId: reviewOperation.id,
       reviewedCommit,
       findingId: finding.id,
-      claim: finding.claim,
-      severity: finding.severity,
-      reproductionCommand: finding.reproductionCommand,
+      claimHash: findingClaimHash(finding),
+      verificationRequest: finding.verificationRequest,
       evidenceIds: finding.evidenceIds,
     };
     const inputHash = operationInputHash(input);
@@ -1433,75 +1435,38 @@ export class Orchestrator {
       throw new Error(`Finding validation previously failed: ${finding.id}`);
     }
     if (operation.status === "running") {
-      const validEvidence = this.store.listEvidence(runId, "valid");
-      const referenced = finding.evidenceIds.map((id) => validEvidence.find((item) => item.id === id));
-      const referencesConfirmed = referenced.length > 0 && referenced.every((item) =>
-        item !== undefined &&
-        item.commitSha === reviewedCommit &&
-        (item.kind === "command" || item.kind === "verification_failure")
-      );
-      let commandResult: Awaited<ReturnType<CommandRunner["run"]>> | null = null;
-      let commandError: string | null = null;
-      let reproduced = referencesConfirmed;
-      if (!referencesConfirmed && finding.reproductionCommand) {
-        const before = {
-          head: git.head(),
-          dirty: git.isDirty(),
-          diffHash: git.diffHash(),
-          controlStateHash: git.controlStateHash(),
-        };
-        try {
-          commandResult = await this.commandRunner.run({
-            argv: finding.reproductionCommand,
-            cwd: run.binding.worktreePath,
-            artifactDirectory: resolve(
-              this.loopHome,
-              "runs",
-              runId,
-              "review",
-              reviewedCommit,
-              "finding-validation",
-              inputHash.slice(0, 16),
-            ),
-            environmentAllowlist: commandEnvironmentAllowlist(),
-            timeoutMs: 60_000,
-            outputLimitBytes: 1024 * 1024,
-            shell: false,
-          });
-          const boundaryChanged =
-            before.head !== git.head() ||
-            before.dirty !== git.isDirty() ||
-            before.diffHash !== git.diffHash() ||
-            before.controlStateHash !== git.controlStateHash();
-          if (boundaryChanged) {
-            operation = this.store.finishOperation(operation.id, "failed", {
-              reason: "Finding reproduction command changed the reviewed worktree or Git control state",
-              commandResult,
-            });
-            throw new Error(String((operation.result as { reason: string }).reason));
-          }
-          reproduced = commandResult.commitBefore === reviewedCommit &&
-            commandResult.exitCode === 0 &&
-            commandResult.signal === null &&
-            !commandResult.timedOut;
-        } catch (error) {
-          if (this.store.getOperation(operation.id)?.status === "failed") throw error;
-          commandError = errorMessage(error);
-        }
+      try {
+        const result = await new FindingValidator(this.projectAdapter, this.commandRunner).validate({
+          finding,
+          reviewedCommit,
+          task: run.binding.taskSpec,
+          worktreePath: run.binding.worktreePath,
+          artifactDirectory: resolve(
+            this.loopHome,
+            "runs",
+            runId,
+            "review",
+            reviewedCommit,
+            "finding-validation",
+            inputHash.slice(0, 16),
+          ),
+          evidence: this.store.listEvidence(runId, "valid"),
+          git,
+        });
+        operation = this.store.finishOperation(operation.id, "succeeded", result);
+      } catch (error) {
+        operation = this.store.finishOperation(operation.id, "failed", { reason: errorMessage(error) });
+        throw error;
       }
-      const status = reproduced ? "confirmed" : "rejected";
-      operation = this.store.finishOperation(operation.id, "succeeded", {
-        findingId: finding.id,
-        status,
-        machineEvidenceIds: referencesConfirmed ? finding.evidenceIds : [],
-        commandResult,
-        commandError,
-      });
     }
-    if (!isRecord(operation.result) ||
-      (operation.result.status !== "confirmed" && operation.result.status !== "rejected")) {
+    if (!isBoundFindingValidationDecision(operation.result, {
+      findingId: finding.id,
+      claimHash: input.claimHash,
+      reviewedCommit,
+    })) {
       throw new Error(`Finding validation result is invalid: ${finding.id}`);
     }
+    const result: FindingValidationDecision = operation.result;
     const stepId = `finding-validation:${finding.id}`;
     const dependencies = evidenceDependencies({
       commitSha: reviewedCommit,
@@ -1522,9 +1487,9 @@ export class Orchestrator {
       stepId,
       dependencyHash,
       dependencies,
-      data: operation.result,
+      data: result,
     });
-    return { ...finding, status: operation.result.status };
+    return { ...finding, status: result.status === "inconclusive" ? "proposed" : result.status };
   }
 
   private reviewProviderCompletion(runId: string, operationId: string): ReviewProviderCompletion | null {
@@ -1606,10 +1571,14 @@ export class Orchestrator {
       git,
     );
     const blockingFindings = validatedReport.findings.filter((finding) => isBlockingFinding(finding));
+    const inconclusiveFindings = validatedReport.findings.filter((finding) =>
+      finding.status === "proposed" && (finding.severity === "high" || finding.severity === "critical")
+    );
     const completed = this.store.finishOperation(operation.id, "succeeded", {
       report: validatedReport,
       blocking: blockingFindings.length > 0,
       blockingFindingIds: blockingFindings.map((finding) => finding.id),
+      inconclusiveFindingIds: inconclusiveFindings.map((finding) => finding.id),
       reviewedCommit: input.reviewedCommit,
       diffHash: input.diffHash,
       selectedReviewer: {
@@ -1627,7 +1596,33 @@ export class Orchestrator {
         { operationId: completed.id },
         completed.id,
       );
+    } else if (inconclusiveFindings.length > 0) {
+      this.requireFindingEvidence(runId, inconclusiveFindings, completed.id);
     }
+  }
+
+  private requireFindingEvidence(runId: string, findings: readonly Finding[], checkpointRef: string): void {
+    const reason = "High-risk Reviewer Findings need human evidence because no approved machine predicate confirmed or rejected them";
+    const question = `${reason}. How should these Findings be handled?`;
+    if (!this.store.listHumanInbox(runId).some((item) => item.question === question)) {
+      this.store.createHumanInbox(runId, {
+        question,
+        options: ["inspect-finding-evidence", "add-project-verification-step", "cancel"],
+        recommendation: "add-project-verification-step",
+        evidence: {
+          findings: findings.map((finding) => ({
+            id: finding.id,
+            severity: finding.severity,
+            claim: finding.claim,
+            proposedVerification: finding.proposedVerification,
+          })),
+        },
+        risk: "high",
+        consequence: "The Harness will not silently convert an unverified model claim into a machine conclusion",
+        resumeCommand: `agent-loop resume --run-id ${runId}`,
+      });
+    }
+    this.block(runId, reason, checkpointRef);
   }
 
   private requireHumanReview(runId: string, reason: string, evidence: unknown, checkpointRef: string): void {
@@ -1654,6 +1649,7 @@ export class Orchestrator {
       "finding_validation",
       "independent_review",
       "acceptance_binding",
+      "commit_policy",
     ];
     const currentHashes = this.store.listEvidence(runId, "valid")
       .filter((item) => kinds.includes(item.kind) && item.commitSha === currentCommit)
@@ -2001,7 +1997,33 @@ export class Orchestrator {
       dependencyHash,
       dependencies,
       data: candidate,
-    }, ["candidate_commit", "command", "verification_failure", "finding_validation", "independent_review", "acceptance_binding"]);
+    }, ["candidate_commit", "command", "verification_failure", "finding_validation", "independent_review", "acceptance_binding", "commit_policy"]);
+    const commitPolicyStepId = `commit-policy:${attempt}`;
+    const commitPolicyData = {
+      hooks_skipped: true,
+      replacement_verification_steps: effectiveRun.binding.taskSpec.verification.map((command) => command.id),
+    };
+    const commitPolicyDependencies = evidenceDependencies({
+      commitSha: candidate.commitSha,
+      taskSpecHash: effectiveRun.binding.taskSpecHash,
+      acceptanceHash: effectiveRun.binding.acceptanceHash,
+      policyVersion: effectiveRun.binding.policyVersion,
+      stepId: commitPolicyStepId,
+      operationInputHash: operationInputHash(commitPolicyData),
+    });
+    const commitPolicyHash = evidenceDependencyHash(commitPolicyDependencies);
+    this.store.installEvidence({
+      id: `${runId}:evidence:commit-policy:${commitPolicyHash.slice(0, 12)}`,
+      runId,
+      operationId: operation.id,
+      kind: "commit_policy",
+      commitSha: candidate.commitSha,
+      policyVersion: effectiveRun.binding.policyVersion,
+      stepId: commitPolicyStepId,
+      dependencyHash: commitPolicyHash,
+      dependencies: commitPolicyDependencies,
+      data: commitPolicyData,
+    });
     return candidate;
   }
 

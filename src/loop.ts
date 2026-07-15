@@ -1,4 +1,5 @@
 import type { ExecutionTemplateName, Risk } from "./routing.js";
+import { readyEvidenceSatisfied } from "./evidence-gate.js";
 
 export type ExplorationProof = "not-required" | "missing" | "satisfied" | "failed";
 export type WriterProof = "missing" | "running" | "patch-ready" | "failed" | "committed";
@@ -51,7 +52,9 @@ export function decideNextAction(snapshot: ProofGapSnapshot): NextAction {
   if (snapshot.review === "unavailable") {
     return { kind: "block", reason: "Independent review is unavailable" };
   }
-  return { kind: "advance-ready" };
+  return readyEvidenceSatisfied(snapshot)
+    ? { kind: "advance-ready" }
+    : { kind: "block", reason: "Required Evidence is incomplete" };
 }
 
 function repairOrBlock(snapshot: ProofGapSnapshot, reason: string): NextAction {

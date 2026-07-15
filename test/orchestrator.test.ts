@@ -272,7 +272,11 @@ describe("Orchestrator", () => {
       allowedRepositoryRoots: [view.worktreePath],
     });
     expect(provider.requests[0]?.additionalWritableDirectories).toBeUndefined();
-    expect(view.evidence.map((item) => item.kind)).toEqual(["candidate_commit", "command"]);
+    expect(view.evidence.map((item) => item.kind)).toEqual(["candidate_commit", "commit_policy", "command"]);
+    expect(view.evidence.find((item) => item.kind === "commit_policy")?.data).toEqual({
+      hooks_skipped: true,
+      replacement_verification_steps: ["check"],
+    });
     expect((view.evidence.find((item) => item.kind === "command")?.data as { exitCode: number }).exitCode).toBe(0);
     expect(view.operations.map((operation) => operation.status)).toEqual(["succeeded", "succeeded", "succeeded"]);
     expect(git(view.worktreePath, ["show", "-s", "--format=%an <%ae>", "HEAD"])).toBe(
@@ -305,7 +309,7 @@ describe("Orchestrator", () => {
       targetRepository: missingFixture.root,
     });
     expect(missingView.run.status).toBe("blocked");
-    expect(missingView.evidence.map((item) => item.kind)).toEqual(["candidate_commit"]);
+    expect(missingView.evidence.map((item) => item.kind)).toEqual(["candidate_commit", "commit_policy"]);
     missing.close();
   }, 90_000);
 
@@ -349,7 +353,7 @@ describe("Orchestrator", () => {
     expect(Number(git(view.worktreePath, ["rev-list", "--count", "HEAD"]))).toBe(3);
     expect(view.evidence.filter((item) => item.kind === "verification_failure")).toHaveLength(1);
     expect(view.evidence.filter((item) => item.status === "valid").map((item) => item.kind).sort()).toEqual([
-      "candidate_commit", "command",
+      "candidate_commit", "command", "commit_policy",
     ]);
     orchestrator.close();
   }, 60_000);
@@ -379,7 +383,7 @@ describe("Orchestrator", () => {
     const validCommitEvidence = crashed.evidence.filter((item) =>
       item.status === "valid" && item.kind !== "exploration"
     );
-    expect(validCommitEvidence.map((item) => item.kind)).toEqual(["candidate_commit"]);
+    expect(validCommitEvidence.map((item) => item.kind)).toEqual(["candidate_commit", "commit_policy"]);
     expect(validCommitEvidence.every((item) => item.commitSha === head)).toBe(true);
     expect(crashed.evidence.filter((item) => item.kind === "candidate_commit" && item.status === "invalid")).toHaveLength(1);
     expect(crashed.evidence.filter((item) => item.kind === "verification_failure" && item.status === "invalid")).toHaveLength(1);
@@ -393,7 +397,7 @@ describe("Orchestrator", () => {
     const view = await resumed.resume("run-candidate-atomic");
     expect(view.run.status).toBe("ready");
     expect(view.evidence.filter((item) => item.status === "valid").map((item) => item.kind).sort()).toEqual([
-      "candidate_commit", "command",
+      "candidate_commit", "command", "commit_policy",
     ]);
     resumed.close();
   }, 90_000);
@@ -563,7 +567,7 @@ describe("Orchestrator", () => {
     expect(view.operations[0]).toMatchObject({ kind: "explorer", status: "succeeded" });
     expect(view.operations[0]?.result).toMatchObject({ costTokens: 0, latencyMs: 1, used: true });
     expect(view.evidence.filter((item) => item.status === "valid").map((item) => item.kind).sort()).toEqual([
-      "candidate_commit", "command", "exploration",
+      "candidate_commit", "command", "commit_policy", "exploration",
     ]);
     const exploration = view.evidence.find((item) => item.kind === "exploration");
     expect(exploration?.dependencies).toMatchObject({
@@ -605,7 +609,7 @@ describe("Orchestrator", () => {
     expect(view.run.status).toBe("ready");
     expect(provider.requests.filter((request) => request.workspaceAccess === "read-only")).toHaveLength(1);
     expect(view.evidence.filter((item) => item.status === "valid").map((item) => item.kind).sort()).toEqual([
-      "candidate_commit", "command", "exploration",
+      "candidate_commit", "command", "commit_policy", "exploration",
     ]);
     resumed.close();
   }, 60_000);

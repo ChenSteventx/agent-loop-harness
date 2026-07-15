@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import type { FindingVerificationRequest } from "./ports.js";
 import type { ProviderAdapter, ProviderIdentity, ProviderRunRequest, ProviderRunResult } from "./provider.js";
 import type { TaskSpec } from "./task-spec.js";
 
@@ -7,8 +8,13 @@ export const findingCategories = ["correctness", "acceptance", "security", "reli
 export const findingSeverities = ["low", "medium", "high", "critical"] as const;
 export const findingStatuses = ["proposed", "confirmed", "rejected", "fixed"] as const;
 
-const optionalText = z.string().trim().min(1).nullable();
-const optionalArgv = z.tuple([z.string().trim().min(1)]).rest(z.string()).nullable();
+const findingVerificationRequestSchema: z.ZodType<FindingVerificationRequest> = z.object({
+  verificationStepId: z.string().trim().min(1).optional(),
+  proposedArgv: z.tuple([z.string().trim().min(1)]).rest(z.string()).optional(),
+  expectedExitCode: z.number().int().optional(),
+  stdoutIncludes: z.string().min(1).optional(),
+  stderrIncludes: z.string().min(1).optional(),
+}).strict();
 
 export const reviewerFindingOutputSchema = z.object({
   id: z.string().trim().min(1),
@@ -16,10 +22,8 @@ export const reviewerFindingOutputSchema = z.object({
   severity: z.enum(findingSeverities),
   claim: z.string().trim().min(1),
   location: z.string().trim().min(1),
-  reproductionCommand: optionalArgv,
+  verificationRequest: findingVerificationRequestSchema.nullable(),
   evidenceIds: z.array(z.string().trim().min(1)),
-  expectedResult: optionalText,
-  observedResult: optionalText,
   confidence: z.number().min(0).max(1),
   proposedVerification: z.string().trim().min(1),
   status: z.literal("proposed"),
@@ -136,7 +140,7 @@ export function isBlockingFinding(finding: Finding, policy: FindingPolicy = {}):
 }
 
 export function conflictResolution(finding: Finding): "evidence_request" | "deterministic_experiment" {
-  return finding.reproductionCommand === null && finding.evidenceIds.length === 0
+  return finding.verificationRequest === null && finding.evidenceIds.length === 0
     ? "evidence_request"
     : "deterministic_experiment";
 }
@@ -173,7 +177,8 @@ function reviewerPrompt(input: ReviewerInput): string {
     `Diff: ${input.diff}`,
     `Verification evidence: ${JSON.stringify(input.verificationEvidence)}`,
     "Every Finding must have status proposed. The Harness alone may confirm, reject, or fix it.",
-    "A reproductionCommand is an argv array executed without a shell and must exit 0 only when the claimed defect is reproduced.",
+    "A verificationRequest may refer only to a declared verificationStepId. proposedArgv is advisory and must exactly match that declared step.",
+    "State a machine-checkable stdoutIncludes or stderrIncludes predicate. Exit code alone does not prove a Finding.",
     "Use evidenceIds only for machine Evidence IDs present in the supplied verification evidence.",
     "Return only structured findings. Do not report provider identity or the reviewed commit; the Harness binds those facts.",
     "Do not vote. For conflicts request evidence or propose a deterministic experiment.",

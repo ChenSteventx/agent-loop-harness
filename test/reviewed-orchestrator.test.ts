@@ -32,7 +32,7 @@ function fixture(risk: "normal" | "high" = "high"): { root: string; taskPath: st
   git(root, ["config", "user.name", "Reviewed Test"]);
   writeFileSync(
     join(root, "check.mjs"),
-    "import { existsSync } from 'node:fs'; process.exit(existsSync('changed.txt') ? 0 : 4);\n",
+    "import { existsSync, readFileSync } from 'node:fs'; if (!existsSync('changed.txt')) process.exit(4); console.log(readFileSync('changed.txt', 'utf8').trim());\n",
   );
   const taskPath = join(root, "task.yaml");
   writeFileSync(taskPath, [
@@ -177,14 +177,13 @@ class Reviewer implements ProviderAdapter {
         severity: "high",
         claim: "changed.txt still contains the unreviewed value",
         location: "changed.txt:1",
-        reproductionCommand: outcome === "blocking" ? [
-            process.execPath,
-            "-e",
-            "const fs=require('fs');process.exit(fs.readFileSync('changed.txt','utf8').includes('broken')?0:1)",
-          ] : null,
+        verificationRequest: outcome === "blocking" ? {
+          verificationStepId: "check",
+          proposedArgv: [process.execPath, "check.mjs"],
+          expectedExitCode: 0,
+          stdoutIncludes: "broken",
+        } : null,
         evidenceIds: [],
-        expectedResult: "fixed",
-        observedResult: "broken",
         confidence: 1,
         proposedVerification: "read changed.txt after Repair",
         status: "proposed",
@@ -363,7 +362,7 @@ describe("reviewed Orchestrator profile", () => {
     loop.close();
   }, 180_000);
 
-  it("rejects an unsupported model-only Finding without triggering automatic Repair", async () => {
+  it("keeps an unsupported model-only Finding proposed and routes it to Human Inbox", async () => {
     const target = fixture();
     const author = new RepairingAuthor();
     const reviewer = new Reviewer("unsupported-claim-reviewer", ["unsupported"]);
@@ -372,16 +371,22 @@ describe("reviewed Orchestrator profile", () => {
       runId: "reviewed-unconfirmed-claim", taskPath: target.taskPath, targetRepository: target.root,
     });
 
-    expect(view.run.status).toBe("ready");
+    expect(view.run.status).toBe("blocked");
     expect(author.requests).toHaveLength(1);
     expect(view.operations.filter((item) => item.kind === "repair")).toHaveLength(0);
     expect(view.operations.find((item) => item.kind === "finding-validation")?.result).toMatchObject({
-      status: "rejected",
+      status: "inconclusive",
     });
     expect(view.evidence.find((item) => item.kind === "independent_review")?.data).toMatchObject({
       blocking: false,
-      report: { findings: [expect.objectContaining({ status: "rejected" })] },
+      report: { findings: [expect.objectContaining({ status: "proposed" })] },
     });
+    expect(loop.store.listHumanInbox(view.run.id)).toEqual([
+      expect.objectContaining({
+        recommendation: "add-project-verification-step",
+        options: expect.arrayContaining(["inspect-finding-evidence", "add-project-verification-step"]),
+      }),
+    ]);
     loop.close();
   }, 120_000);
 

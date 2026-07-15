@@ -6,6 +6,14 @@ export interface VerificationCommand {
   argv: [string, ...string[]];
 }
 
+export interface FindingVerificationRequest {
+  verificationStepId?: string;
+  proposedArgv?: [string, ...string[]];
+  expectedExitCode?: number;
+  stdoutIncludes?: string;
+  stderrIncludes?: string;
+}
+
 export interface ProjectAdapter {
   readonly name: string;
   readonly policyVersion: string;
@@ -15,4 +23,5 @@ export interface ProjectAdapter {
   }): Risk;
   verificationCommands(task: TaskSpec): readonly VerificationCommand[];
   postMergeCommands(task: TaskSpec): readonly VerificationCommand[];
+  allowDiagnosticCommand?(request: FindingVerificationRequest): boolean;
 }

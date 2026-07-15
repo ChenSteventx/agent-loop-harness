@@ -9,7 +9,8 @@ const commit = "abc123";
 function finding(overrides: Partial<Finding> = {}): Finding {
   return {
     id: "F1", category: "correctness", severity: "high", claim: "behavior is wrong", location: "src/a.ts:1",
-    reproductionCommand: ["npm", "test"], evidenceIds: [], expectedResult: "exit 0", observedResult: "exit 1", confidence: 0.9,
+    verificationRequest: { verificationStepId: "test", proposedArgv: ["npm", "test"], expectedExitCode: 1, stderrIncludes: "failed" },
+    evidenceIds: [], confidence: 0.9,
     proposedVerification: "run npm test", reviewerIdentity: identity, reviewedCommit: commit, status: "proposed", ...overrides,
   };
 }
@@ -25,7 +26,8 @@ class FakeReviewer implements ProviderAdapter {
       finalOutput: {
         findings: [{
           id: "F1", category: "correctness", severity: "high", claim: "behavior is wrong", location: "src/a.ts:1",
-          reproductionCommand: ["npm", "test"], evidenceIds: [], expectedResult: "exit 0", observedResult: "exit 1", confidence: 0.9,
+          verificationRequest: { verificationStepId: "test", proposedArgv: ["npm", "test"], expectedExitCode: 1, stderrIncludes: "failed" },
+          evidenceIds: [], confidence: 0.9,
           proposedVerification: "run npm test", status: "proposed",
         }],
       }, stderr: "", exitCode: 0, signal: null, durationMs: 1, usage: null,
@@ -78,7 +80,7 @@ describe("independent reviewer", () => {
   });
 
   it("requires a Harness-confirmed lifecycle state before a finding can block", () => {
-    const unsupported = finding({ reproductionCommand: null, expectedResult: null, observedResult: null });
+    const unsupported = finding({ verificationRequest: null });
     expect(isBlockingFinding(unsupported)).toBe(false);
     expect(isBlockingFinding(finding())).toBe(false);
     expect(isBlockingFinding(finding({ status: "confirmed" }))).toBe(true);
