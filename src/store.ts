@@ -39,6 +39,26 @@ export interface HumanInboxInput {
 
 export interface HumanInboxRecord extends HumanInboxInput {
   id: number; runId: string; createdAt: string; resolvedAt: string | null;
+  resolution: HumanResolution | null;
+}
+
+export interface HumanResolution {
+  type: "finding";
+  findingId: string;
+  outcome: "confirmed" | "rejected";
+  note: string | null;
+}
+
+export interface AgentCallRecord {
+  id: number;
+  runId: string;
+  role: string;
+  provider: string;
+  latencyMs: number;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  outputTokens: number | null;
+  createdAt: string;
 }
 
 export interface RunMetrics {
@@ -490,7 +510,36 @@ export class SqliteStore {
   }
 
   listHumanInbox(runId: string): HumanInboxRecord[] {
+    this.requireRun(runId);
     return (this.database.prepare("SELECT * FROM human_inbox WHERE run_id = ? ORDER BY id").all(runId) as HumanInboxRow[]).map(mapHumanInbox);
+  }
+
+  resolveHumanInbox(
+    id: number,
+    resolution: HumanResolution,
+    now = new Date().toISOString(),
+  ): HumanInboxRecord {
+    validateHumanResolution(resolution);
+    const transaction = this.database.transaction(() => {
+      const current = this.requireHumanInbox(id);
+      if (current.resolution) {
+        if (canonicalJson(current.resolution) !== canonicalJson(resolution)) {
+          throw new Error(`Human Inbox ${id} already has a different resolution`);
+        }
+        return current;
+      }
+      this.database.prepare(
+        "UPDATE human_inbox SET resolved_at = ?, resolution_json = ? WHERE id = ? AND resolved_at IS NULL",
+      ).run(now, JSON.stringify(resolution), id);
+      this.insertEvent(current.runId, "human-inbox.resolved", {
+        inboxId: id,
+        type: resolution.type,
+        findingId: resolution.findingId,
+        outcome: resolution.outcome,
+      }, now);
+      return this.requireHumanInbox(id);
+    });
+    return transaction();
   }
 
   listPendingOutbox(): OutboxRecord[] {
@@ -517,6 +566,13 @@ export class SqliteStore {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(runId, input.role, input.provider, input.latencyMs, input.usage?.inputTokens ?? null,
       input.usage?.cachedInputTokens ?? null, input.usage?.outputTokens ?? null, now);
+  }
+
+  listAgentCalls(runId: string): AgentCallRecord[] {
+    this.requireRun(runId);
+    return (this.database.prepare(
+      "SELECT * FROM agent_call_metrics WHERE run_id = ? ORDER BY created_at, id",
+    ).all(runId) as AgentCallRow[]).map(mapAgentCall);
   }
 
   recordFindingOutcome(runId: string, findingId: string, outcome: "confirmed" | "false_positive", now = new Date().toISOString()): void {
@@ -678,7 +734,8 @@ export class SqliteStore {
         consequence TEXT NOT NULL,
         resume_command TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        resolved_at TEXT
+        resolved_at TEXT,
+        resolution_json TEXT
       );
       CREATE TABLE IF NOT EXISTS agent_call_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -712,6 +769,7 @@ export class SqliteStore {
     this.ensureColumn("operations", "input_hash", "TEXT");
     this.ensureColumn("evidence", "dependency_version", "INTEGER");
     this.ensureColumn("evidence", "dependencies_json", "TEXT");
+    this.ensureColumn("human_inbox", "resolution_json", "TEXT");
     const version = this.database.pragma("user_version", { simple: true }) as number;
     if (version < 2) {
       const now = new Date().toISOString();
@@ -793,7 +851,8 @@ interface EvidenceRow {
 }
 
 interface OutboxRow { id: number; run_id: string; type: OutboxEventType; payload_json: string; created_at: string; delivered_at: string | null; attempts: number; last_error: string | null }
-interface HumanInboxRow { id: number; run_id: string; question: string; options_json: string; recommendation: string; evidence_json: string; risk: string; consequence: string; resume_command: string; created_at: string; resolved_at: string | null }
+interface HumanInboxRow { id: number; run_id: string; question: string; options_json: string; recommendation: string; evidence_json: string; risk: string; consequence: string; resume_command: string; created_at: string; resolved_at: string | null; resolution_json: string | null }
+interface AgentCallRow { id: number; run_id: string; role: string; provider: string; latency_ms: number; input_tokens: number | null; cached_input_tokens: number | null; output_tokens: number | null; created_at: string }
 
 function mapRun(row: RunRow): Run {
   return {
@@ -849,7 +908,14 @@ function mapOutbox(row: OutboxRow): OutboxRecord {
 }
 
 function mapHumanInbox(row: HumanInboxRow): HumanInboxRecord {
-  return { id: row.id, runId: row.run_id, question: row.question, options: parseJson(row.options_json) as string[], recommendation: row.recommendation, evidence: parseJson(row.evidence_json), risk: row.risk, consequence: row.consequence, resumeCommand: row.resume_command, createdAt: row.created_at, resolvedAt: row.resolved_at };
+  return { id: row.id, runId: row.run_id, question: row.question, options: parseJson(row.options_json) as string[], recommendation: row.recommendation, evidence: parseJson(row.evidence_json), risk: row.risk, consequence: row.consequence, resumeCommand: row.resume_command, createdAt: row.created_at, resolvedAt: row.resolved_at, resolution: row.resolution_json ? parseJson(row.resolution_json) as HumanResolution : null };
+}
+
+function mapAgentCall(row: AgentCallRow): AgentCallRecord {
+  return { id: row.id, runId: row.run_id, role: row.role, provider: row.provider,
+    latencyMs: row.latency_ms, inputTokens: row.input_tokens,
+    cachedInputTokens: row.cached_input_tokens, outputTokens: row.output_tokens,
+    createdAt: row.created_at };
 }
 
 function mapInvocationManifest(row: InvocationManifestRow): InvocationManifest {
@@ -870,6 +936,15 @@ function validateHumanInbox(input: HumanInboxInput): void {
       !input.recommendation.trim() || !input.risk.trim() || !input.consequence.trim() || !input.resumeCommand.trim()) {
     throw new Error("Human Inbox requires question, options, recommendation, risk, consequence, and resume command");
   }
+}
+
+function validateHumanResolution(resolution: HumanResolution): void {
+  if (
+    resolution.type !== "finding" ||
+    !resolution.findingId.trim() ||
+    (resolution.outcome !== "confirmed" && resolution.outcome !== "rejected") ||
+    !(resolution.note === null || typeof resolution.note === "string")
+  ) throw new Error("Human resolution requires a Finding id and confirmed or rejected outcome");
 }
 
 function parseJson(value: string): unknown {

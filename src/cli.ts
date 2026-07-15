@@ -14,6 +14,12 @@ import {
 } from "./provider.js";
 import { GenericNodeProjectAdapter } from "./project.js";
 import { defaultRoleOutputSchemas } from "./role-output-schemas.js";
+import { SqliteStore } from "./store.js";
+import { exportRunFacts } from "./evaluation/facts.js";
+import { projectRunMetrics, summarizeMetrics } from "./evaluation/metrics.js";
+import { evaluateReadiness } from "./evaluation/readiness.js";
+import { gradeReplayability } from "./evaluation/manifests.js";
+import { EvaluationStore } from "./evaluation/store.js";
 import {
   createProviderProfile,
   providerProfileNames,
@@ -103,6 +109,96 @@ program
     );
   });
 
+const metrics = program.command("metrics").description("project metrics from durable development facts");
+
+metrics
+  .command("run")
+  .requiredOption("--run-id <id>")
+  .description("export a sanitized Fact Bundle and project metrics for one Run")
+  .action((options: { runId: string }) => {
+    withEvaluationStores((development, evaluation) => {
+      const facts = evaluation.installFactBundle(exportRunFacts(development, options.runId));
+      const projection = projectRunMetrics(facts);
+      evaluation.installMetrics(projection, facts.factHash);
+      print({ facts, metrics: projection });
+    });
+  });
+
+metrics
+  .command("summary")
+  .description("project aggregate metrics while keeping ready and done success separate")
+  .action(() => {
+    withEvaluationStores((development, evaluation) => {
+      const projections = development.listRuns().map((run) => {
+        const facts = evaluation.installFactBundle(exportRunFacts(development, run.id));
+        const projection = projectRunMetrics(facts);
+        evaluation.installMetrics(projection, facts.factHash);
+        return projection;
+      });
+      print(summarizeMetrics(projections));
+    });
+  });
+
+const evaluation = program.command("eval").description("offline evaluation controls");
+
+evaluation
+  .command("readiness")
+  .description("show whether real evidence is sufficient for optimization and Canary")
+  .action(() => {
+    withEvaluationStores((development, evaluationStore) => {
+      const realRuns = development.listRuns();
+      const projections = realRuns.map((run) => projectRunMetrics(exportRunFacts(development, run.id)));
+      const report = evaluateReadiness({
+        realRunCount: realRuns.length,
+        resolvedFindingCount: projections.reduce((total, value) =>
+          total + value.reviewerFindings.confirmed + value.reviewerFindings.rejected, 0),
+        exactReplayCount: realRuns.filter((run) => gradeReplayability({
+          binding: run.binding,
+          manifests: development.listInvocationManifests(run.id),
+          requiredOperationIds: development.listOperations(run.id)
+            .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
+            .map((operation) => operation.id),
+        }).grade === "exact").length,
+        goldenTaskCount: 0,
+        holdoutTaskCount: 0,
+        completedOfflineComparisons: 0,
+        completedShadowRuns: 0,
+        humanCanaryApproval: false,
+      });
+      evaluationStore.recordReadiness(report);
+      print(report);
+    });
+  });
+
+const human = program.command("human").description("record explicit human decisions");
+
+human
+  .command("resolve")
+  .requiredOption("--id <id>")
+  .requiredOption("--finding-id <id>")
+  .requiredOption("--outcome <outcome>", "confirmed or rejected")
+  .option("--note <text>")
+  .description("resolve an inconclusive Finding without treating Reviewer output as truth")
+  .action((options: { id: string; findingId: string; outcome: string; note?: string }) => {
+    const id = Number(options.id);
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Human Inbox id must be a positive integer");
+    if (options.outcome !== "confirmed" && options.outcome !== "rejected") {
+      throw new Error("Human Finding outcome must be confirmed or rejected");
+    }
+    const home = resolve(program.opts<{ loopHome: string }>().loopHome);
+    const development = new SqliteStore(resolve(home, "state.sqlite"));
+    try {
+      print(development.resolveHumanInbox(id, {
+        type: "finding",
+        findingId: options.findingId,
+        outcome: options.outcome,
+        note: options.note ?? null,
+      }));
+    } finally {
+      development.close();
+    }
+  });
+
 function createOrchestrator(loopHome: string): Orchestrator {
   const profileName = parseProviderProfileName(
     program.opts<{ providerProfile: string }>().providerProfile,
@@ -133,6 +229,19 @@ async function withOrchestrator(action: (orchestrator: Orchestrator) => Promise<
     await action(orchestrator);
   } finally {
     orchestrator.close();
+  }
+}
+
+function withEvaluationStores(action: (development: SqliteStore, evaluation: EvaluationStore) => void): void {
+  const home = resolve(program.opts<{ loopHome: string }>().loopHome);
+  mkdirSync(home, { recursive: true });
+  const development = new SqliteStore(resolve(home, "state.sqlite"));
+  const evaluation = new EvaluationStore(resolve(home, "evaluation.sqlite"));
+  try {
+    action(development, evaluation);
+  } finally {
+    evaluation.close();
+    development.close();
   }
 }
 
