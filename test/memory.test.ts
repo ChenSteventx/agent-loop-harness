@@ -2,12 +2,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import type { SanitizedFactBundle } from "../src/evaluation/facts.js";
 import { EvaluationStore } from "../src/evaluation/store.js";
 import {
   approveCandidateMemory,
   deriveCandidateMemories,
   expireCandidateMemories,
+  invalidateCandidateMemory,
   rejectCandidateMemory,
   retrieveApprovedMemory,
   scanCandidateMemory,
@@ -57,6 +59,34 @@ function facts(id: string, factHash: string, projectScope = "generic-node"): San
 }
 
 describe("quarantined Candidate Memory", () => {
+  it("migrates an earlier Candidate Memory constraint before invalidation is used", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-loop-memory-migration-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "evaluation.sqlite");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE candidate_memories (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'approved', 'rejected', 'superseded', 'expired')),
+        memory_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        decided_at TEXT,
+        UNIQUE(project_scope, content_hash)
+      );
+    `);
+    legacy.close();
+    const store = new EvaluationStore(path);
+    const schema = store.database.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'candidate_memories'",
+    ).get() as { sql: string };
+    expect(schema.sql).toContain("invalidated");
+    store.close();
+  });
+
   it("is disabled by default and requires scoped human approval before lexical retrieval", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-loop-memory-"));
     temporaryDirectories.push(directory);
@@ -92,8 +122,8 @@ describe("quarantined Candidate Memory", () => {
       projectScope: "another-project", query: "provider quota fallback", enabled: true,
     })).toEqual([]);
 
-    rejectCandidateMemory(store, {
-      id: candidate!.id, rejectedBy: "human-reviewer", reason: "rollback after stale evidence",
+    invalidateCandidateMemory(store, {
+      id: candidate!.id, invalidatedBy: "human-reviewer", reason: "rollback after stale evidence",
       decidedAt: "2026-07-15T00:04:00.000Z",
     });
     expect(retrieveApprovedMemory(store, {

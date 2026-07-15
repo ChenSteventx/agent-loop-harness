@@ -9,6 +9,7 @@ import {
   createChangeProposal,
   createChallenger,
   createInitialChampion,
+  evolutionTargets,
   promoteChallenger,
   rollbackChampion,
   type EvolutionConfiguration,
@@ -115,6 +116,7 @@ describe("controlled Champion and Challenger evolution", () => {
   });
 
   it("rejects Holdout access, arbitrary targets, cross-target patches, and premature promotion", () => {
+    expect(evolutionTargets).not.toContain("risk-thresholds");
     const directory = mkdtempSync(join(tmpdir(), "agent-loop-evolution-guard-"));
     temporaryDirectories.push(directory);
     const store = new EvaluationStore(join(directory, "evaluation.sqlite"));

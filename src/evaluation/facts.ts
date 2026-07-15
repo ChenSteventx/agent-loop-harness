@@ -32,6 +32,7 @@ export interface FactAgentCall {
 }
 
 export interface DevelopmentFactSource {
+  listRuns(): Run[];
   getRun(runId: string): Run | null;
   listOperations(runId: string): Operation[];
   listEvidence(runId: string): Evidence[];
@@ -39,6 +40,30 @@ export interface DevelopmentFactSource {
   listInvocationManifests(runId: string): InvocationManifest[];
   listHumanInbox(runId: string): FactHumanInbox[];
   listAgentCalls(runId: string): FactAgentCall[];
+}
+
+export interface EligibleRunFilter {
+  statuses?: readonly Run["status"][];
+  requireBinding?: boolean;
+}
+
+/** Read-only adapter from the formal development store into the evaluation sidecar. */
+export class EvaluationFactSource {
+  constructor(private readonly development: DevelopmentFactSource) {}
+
+  exportRun(runId: string, options: { source?: FactSourceKind; exportedAt?: string } = {}): SanitizedFactBundle {
+    return exportRunFacts(this.development, runId, options);
+  }
+
+  listEligibleRuns(
+    filter: EligibleRunFilter = {},
+    options: { source?: FactSourceKind; exportedAt?: string } = {},
+  ): SanitizedFactBundle[] {
+    return this.development.listRuns()
+      .filter((run) => !filter.statuses || filter.statuses.includes(run.status))
+      .filter((run) => !filter.requireBinding || run.binding !== null)
+      .map((run) => this.exportRun(run.id, options));
+  }
 }
 
 export interface ReviewerFindingFact {

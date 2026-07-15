@@ -26,9 +26,19 @@ import { operationInputHash } from "./bindings.js";
 import {
   approveCandidateMemory,
   deriveCandidateMemories,
+  invalidateCandidateMemory,
   rejectCandidateMemory,
   retrieveApprovedMemory,
 } from "./memory/candidates.js";
+import {
+  approveChangeProposal,
+  createChangeProposal,
+  evolutionTargets,
+  promoteChallenger,
+  rollbackChampion,
+  type EvolutionTarget,
+} from "./evolution/proposals.js";
+import { disabledCanaryPolicy } from "./evolution/canary.js";
 import {
   createProviderProfile,
   providerProfileNames,
@@ -156,7 +166,8 @@ evaluation
   .action(() => {
     withEvaluationStores((development, evaluationStore) => {
       const realRuns = development.listRuns();
-      const projections = realRuns.map((run) => projectRunMetrics(exportRunFacts(development, run.id)));
+      const factBundles = realRuns.map((run) => exportRunFacts(development, run.id));
+      const projections = factBundles.map((facts) => projectRunMetrics(facts));
       const datasets = DatasetCatalog.loadDirectory(resolve("eval")).list("readiness");
       const report = evaluateReadiness({
         realRunCount: realRuns.length,
@@ -173,6 +184,8 @@ evaluation
         completedShadowRuns: evaluationStore.listShadowEvaluations().length,
         humanCanaryApproval: evaluationStore.listCanaryApprovals()
           .some((approval) => approval.authority === "human" && approval.expiresAt > new Date().toISOString()),
+        coverageComplete: requiredReadinessCoverage(realRuns, factBundles, projections),
+        fixtureOnly: realRuns.length === 0,
       });
       evaluationStore.recordReadiness(report);
       print(report);
@@ -185,53 +198,142 @@ evaluation
   .option("--mode <mode>", "verify-only; full requires an injected full Replay executor", "verify-only")
   .option("--evaluation-id <id>")
   .description("create a separate immutable Evaluation Run without mutating the development Run")
-  .action(async (options: { runId: string; mode: string; evaluationId?: string }) => {
-    const mode = parseReplayMode(options.mode);
-    await withEvaluationStoresAsync(async (development, evaluationStore, home) => {
-      const run = development.getRun(options.runId);
-      if (!run) throw new Error(`Run not found: ${options.runId}`);
-      const facts = evaluationStore.installFactBundle(exportRunFacts(development, options.runId));
-      const evaluationId = options.evaluationId ?? `replay:${options.runId}:${Date.now()}`;
-      const replay = new HistoricalReplay(evaluationStore, async (replayFacts, replayMode, binding) => {
-        if (replayMode === "full") throw new Error("FullReplayExecutorUnavailable");
-        const commit = pinnedVerificationCommit(replayFacts);
-        if (!commit || new GitService(binding.worktreePath).head() !== commit) {
-          throw new Error("PinnedVerificationCommitUnavailable");
-        }
-        const runner = new CommandRunner();
-        const receipts = [];
-        for (const command of binding.taskSpec.verification) {
-          const result = await runner.run({
-            argv: command.argv,
-            cwd: binding.worktreePath,
-            artifactDirectory: resolve(home, "evaluation-runs", evaluationId, command.id),
-            environmentAllowlist: ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE"],
-            timeoutMs: 60_000,
-            outputLimitBytes: 1024 * 1024,
-            shell: false,
-          });
-          receipts.push({ commandId: command.id, exitCode: result.exitCode, signal: result.signal,
-            timedOut: result.timedOut, commitBefore: result.commitBefore });
-        }
-        const passed = receipts.every((receipt) => receipt.exitCode === 0 && receipt.signal === null &&
-          !receipt.timedOut && receipt.commitBefore === commit);
-        return {
-          passed,
-          evidenceHash: operationInputHash(receipts),
-          diagnostics: receipts.filter((receipt) => receipt.exitCode !== 0).map((receipt) => receipt.commandId),
-        };
-      });
-      print(await replay.run({
-        id: evaluationId,
-        facts,
-        binding: run.binding,
-        mode,
-        requiredOperationIds: development.listOperations(options.runId)
-          .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
-          .map((operation) => operation.id),
+  .action(runReplayCommand);
+
+program
+  .command("replay")
+  .requiredOption("--run-id <id>")
+  .option("--mode <mode>", "verify-only; full requires an injected full Replay executor", "verify-only")
+  .option("--evaluation-id <id>")
+  .description("top-level alias for immutable Historical Replay")
+  .action(runReplayCommand);
+
+evaluation
+  .command("compare")
+  .option("--project <scope>")
+  .description("report immutable Champion/Challenger offline comparisons")
+  .action((options: { project?: string }) => {
+    withEvaluationStores((_development, store) => print(store.listOfflineComparisons(options.project)));
+  });
+
+const shadow = program.command("shadow").description("non-authoritative Shadow reports");
+shadow.command("report").option("--project <scope>").action((options: { project?: string }) => {
+  withEvaluationStores((_development, store) => print(store.listShadowEvaluations(options.project)));
+});
+
+const proposal = program.command("proposal").description("configuration-only Change Proposals");
+proposal
+  .command("create")
+  .requiredOption("--id <id>")
+  .requiredOption("--project <scope>")
+  .requiredOption("--target <target>")
+  .requiredOption("--patch <json>")
+  .requiredOption("--rationale <text>")
+  .requiredOption("--source-facts <hashes>")
+  .option("--minimum-samples <count>", "minimum comparison samples", "5")
+  .description("create a bounded proposal; Holdout Tasks remain inaccessible")
+  .action((options: {
+    id: string; project: string; target: string; patch: string; rationale: string;
+    sourceFacts: string; minimumSamples: string;
+  }) => {
+    withEvaluationStores((_development, store) => {
+      const champion = store.activeChampion(options.project);
+      if (!champion) throw new Error(`No active Champion for project ${options.project}`);
+      const target = parseEvolutionTarget(options.target);
+      print(store.installChangeProposal(createChangeProposal({
+        id: options.id,
+        projectScope: options.project,
+        target,
+        baseChampion: champion,
+        patch: parseObject(options.patch),
+        rationale: options.rationale,
+        sourceFactHashes: csv(options.sourceFacts),
+        datasets: DatasetCatalog.loadDirectory(resolve("eval")).list("proposal"),
+        metrics: ["readySuccessRate", "doneSuccessRate", "verificationFailures"],
+        minimumSamples: positiveInteger(options.minimumSamples, "minimum samples"),
+      })));
+    });
+  });
+
+proposal
+  .command("approve")
+  .requiredOption("--id <id>")
+  .requiredOption("--approved-by <identity>")
+  .requiredOption("--reason <text>")
+  .action((options: { id: string; approvedBy: string; reason: string }) => {
+    withEvaluationStores((_development, store) => print(approveChangeProposal(store, options)));
+  });
+
+const config = program.command("config").description("Champion activation and rollback decisions");
+config.command("champion").requiredOption("--project <scope>").action((options: { project: string }) => {
+  withEvaluationStores((_development, store) => print(store.activeChampion(options.project)));
+});
+config
+  .command("activate")
+  .requiredOption("--proposal-id <id>")
+  .requiredOption("--challenger-id <id>")
+  .requiredOption("--comparison-id <id>")
+  .requiredOption("--decided-by <identity>")
+  .requiredOption("--reason <text>")
+  .action((options: {
+    proposalId: string; challengerId: string; comparisonId: string; decidedBy: string; reason: string;
+  }) => {
+    withEvaluationStores((_development, store) => {
+      const proposalValue = store.getChangeProposal(options.proposalId);
+      const challenger = store.getConfigurationVariant(options.challengerId);
+      const comparison = store.getOfflineComparison(options.comparisonId);
+      if (!proposalValue || !challenger || !comparison) throw new Error("Promotion facts are incomplete");
+      const champion = store.activeChampion(proposalValue.projectScope);
+      if (!champion) throw new Error("Active Champion is missing");
+      print(promoteChallenger(store, {
+        id: `promotion:${proposalValue.id}:${Date.now()}`,
+        projectScope: proposalValue.projectScope,
+        proposalId: proposalValue.id,
+        fromChampionId: champion.id,
+        challengerId: challenger.id,
+        verdict: "promote",
+        comparisonId: comparison.id,
+        thresholdsSatisfied: comparison.guardrailsSatisfied,
+        sampleSize: comparison.sampleSize,
+        decidedBy: options.decidedBy,
+        reason: options.reason,
+        decidedAt: new Date().toISOString(),
       }));
     });
   });
+config
+  .command("rollback")
+  .requiredOption("--project <scope>")
+  .requiredOption("--from <variant-id>")
+  .requiredOption("--restore <variant-id>")
+  .requiredOption("--evidence <hash>")
+  .requiredOption("--decided-by <identity>")
+  .requiredOption("--reason <text>")
+  .action((options: {
+    project: string; from: string; restore: string; evidence: string; decidedBy: string; reason: string;
+  }) => {
+    withEvaluationStores((_development, store) => print(rollbackChampion(store, {
+      id: `rollback:${options.project}:${Date.now()}`,
+      projectScope: options.project,
+      fromChampionId: options.from,
+      restoreChampionId: options.restore,
+      reason: options.reason,
+      triggerEvidenceHash: options.evidence,
+      authority: "human",
+      decidedBy: options.decidedBy,
+      decidedAt: new Date().toISOString(),
+    })));
+  });
+
+const canary = program.command("canary").description("disabled-by-default low-risk Canary controls");
+canary.command("plan").action(() => print(disabledCanaryPolicy));
+canary.command("status").option("--project <scope>").action((options: { project?: string }) => {
+  withEvaluationStores((_development, store) => print({
+    policy: disabledCanaryPolicy,
+    approvals: store.listCanaryApprovals(options.project),
+    pendingRollbackEvents: store.listPendingEvolutionOutbox(),
+  }));
+});
 
 const human = program.command("human").description("record explicit human decisions");
 
@@ -311,6 +413,16 @@ memory
   });
 
 memory
+  .command("invalidate")
+  .requiredOption("--id <id>")
+  .requiredOption("--invalidated-by <identity>")
+  .requiredOption("--reason <text>")
+  .description("invalidate stale or contaminated memory so it cannot be retrieved")
+  .action((options: { id: string; invalidatedBy: string; reason: string }) => {
+    withEvaluationStores((_development, store) => print(invalidateCandidateMemory(store, options)));
+  });
+
+memory
   .command("retrieve")
   .requiredOption("--project <scope>")
   .requiredOption("--query <text>")
@@ -323,6 +435,56 @@ memory
       enabled: options.enable,
     })));
   });
+
+async function runReplayCommand(options: { runId: string; mode: string; evaluationId?: string }): Promise<void> {
+  const mode = parseReplayMode(options.mode);
+  await withEvaluationStoresAsync(async (development, evaluationStore, home) => {
+    const run = development.getRun(options.runId);
+    if (!run) throw new Error(`Run not found: ${options.runId}`);
+    const facts = evaluationStore.installFactBundle(exportRunFacts(development, options.runId));
+    const evaluationId = options.evaluationId ?? `replay:${options.runId}:${Date.now()}`;
+    const replay = new HistoricalReplay(evaluationStore, async (replayFacts, replayMode, binding) => {
+      if (replayMode === "full") throw new Error("FullReplayExecutorUnavailable");
+      const commit = pinnedVerificationCommit(replayFacts);
+      if (!commit || new GitService(binding.worktreePath).head() !== commit) {
+        throw new Error("PinnedVerificationCommitUnavailable");
+      }
+      const runner = new CommandRunner();
+      const receipts = [];
+      for (const command of binding.taskSpec.verification) {
+        const result = await runner.run({
+          argv: command.argv,
+          cwd: binding.worktreePath,
+          artifactDirectory: resolve(home, "evaluation-runs", evaluationId, command.id),
+          environmentAllowlist: [
+            "PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE",
+          ],
+          timeoutMs: 60_000,
+          outputLimitBytes: 1024 * 1024,
+          shell: false,
+        });
+        receipts.push({ commandId: command.id, exitCode: result.exitCode, signal: result.signal,
+          timedOut: result.timedOut, commitBefore: result.commitBefore });
+      }
+      const passed = receipts.every((receipt) => receipt.exitCode === 0 && receipt.signal === null &&
+        !receipt.timedOut && receipt.commitBefore === commit);
+      return {
+        passed,
+        evidenceHash: operationInputHash(receipts),
+        diagnostics: receipts.filter((receipt) => receipt.exitCode !== 0).map((receipt) => receipt.commandId),
+      };
+    });
+    print(await replay.run({
+      id: evaluationId,
+      facts,
+      binding: run.binding,
+      mode,
+      requiredOperationIds: development.listOperations(options.runId)
+        .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
+        .map((operation) => operation.id),
+    }));
+  });
+}
 
 function createOrchestrator(loopHome: string): Orchestrator {
   const profileName = parseProviderProfileName(
@@ -392,6 +554,50 @@ function print(value: unknown): void {
 function parseProviderProfileName(value: string): ProviderProfileName {
   if (providerProfileNames.includes(value as ProviderProfileName)) return value as ProviderProfileName;
   throw new Error(`Unknown Provider profile: ${value}`);
+}
+
+function parseEvolutionTarget(value: string): EvolutionTarget {
+  if (evolutionTargets.includes(value as EvolutionTarget)) return value as EvolutionTarget;
+  throw new Error(`Forbidden evolution target: ${value}`);
+}
+
+function parseObject(value: string): Record<string, unknown> {
+  const parsed = JSON.parse(value) as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("JSON value must be an object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function csv(value: string): string[] {
+  const values = value.split(",").map((item) => item.trim()).filter(Boolean);
+  if (values.length === 0) throw new Error("At least one value is required");
+  return values;
+}
+
+function positiveInteger(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${label} must be a positive integer`);
+  return parsed;
+}
+
+function requiredReadinessCoverage(
+  runs: ReturnType<SqliteStore["listRuns"]>,
+  facts: ReturnType<typeof exportRunFacts>[],
+  projections: ReturnType<typeof projectRunMetrics>[],
+): boolean {
+  const risks = new Set(runs.map((run) => run.binding?.risk).filter(Boolean));
+  const taskTypes = new Set(runs.map((run) => run.taskId.split(":", 1)[0]));
+  return projections.some((value) => value.readySuccess || value.doneSuccess) &&
+    runs.some((run) => ["blocked", "failed", "cancelled"].includes(run.status)) &&
+    projections.some((value) => value.verificationFailures > 0) &&
+    projections.some((value) => value.repairRounds > 0) &&
+    projections.some((value) => value.providerFallbacks > 0) &&
+    projections.some((value) => value.humanInboxCount > 0) &&
+    risks.has("low") && risks.has("normal") && risks.has("high") &&
+    taskTypes.size >= 2 &&
+    facts.some((bundle) => bundle.agentCalls.some((call) =>
+      !/^(fake|test|fixture)/i.test(call.provider)));
 }
 
 function parseReplayMode(value: string): ReplayMode {

@@ -108,6 +108,36 @@ codex exec resume <SESSION_ID> \
 - 状态推进必须依赖真实退出码和绑定当前 Commit 的 Evidence。
 - 任何外部业务项目仅能在脚手架稳定后通过独立 Adapter 接入。
 
+## 三层运行边界
+
+这三个入口用途不同，不能互相冒充：
+
+```text
+automation/continue.mjs
+= 构建本仓库的 Bootstrap Driver，只按任务卡推进脚手架施工
+
+src/cli.ts + Orchestrator
+= 对目标项目执行开放 Loop 的产品 Runtime，唯一能够推进正式 Run
+
+src/evaluation | src/memory | src/evolution
+= 旁路评估与受控演进 Sidecar，只读脱敏 Fact，不得控制正式 Run
+```
+
+Phase 3 新增独立的 `evaluation.sqlite`、Historical Replay、Golden/Holdout Dataset、Metrics、
+Candidate Memory、Champion/Challenger、Offline Compare、Shadow 和低风险 Canary。Memory Retrieval
+与 Canary 均默认关闭；Fixture 只能证明机制可运行，数据不足时 Readiness 必须保持关闭，不能宣称生产收益。
+
+常用只读入口：
+
+```bash
+npm run loop -- metrics summary
+npm run loop -- eval readiness
+npm run loop -- replay --run-id <RUN_ID> --mode verify-only
+npm run loop -- memory list
+npm run loop -- config champion --project <PROJECT_SCOPE>
+npm run loop -- canary status
+```
+
 ## 文件索引
 
 - `START-CODEX.md`：可直接粘贴给 Codex 的单段总 Prompt。

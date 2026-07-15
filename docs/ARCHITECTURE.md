@@ -1,6 +1,18 @@
-# Phase 1 architecture
+# Agent Loop Harness architecture
 
 Phase 1 is one deterministic application with one writable Author. It is not an agent graph.
+
+## Runtime ownership
+
+- `automation/continue.mjs` is a repository-construction Bootstrap Driver. It is not the product loop.
+- `src/cli.ts` and `Orchestrator` are the product Runtime. Only this boundary may request formal Run transitions and install formal Evidence.
+- `src/evaluation`, `src/memory`, and `src/evolution` are non-authoritative Sidecars. They receive sanitized facts through `EvaluationFactSource`, use a separate `evaluation.sqlite`, and have no formal Store write interface.
+
+Historical Replay creates an immutable Evaluation Run and never resumes or rewrites the source Run. Holdout Tasks are hidden from proposal generation. Reviewer claims remain proposed findings until Project Adapter validation or an explicit human resolution supplies authority.
+
+Candidate Memory is project-scoped and quarantined. Capture may create candidates, but retrieval, automatic promotion, and cross-project use are off by default. Configuration evolution is limited to an allowlist and cannot change the Risk Floor, source code, Run state machine, Acceptance, verification policy, or security boundary.
+
+Shadow is non-authoritative. Canary is disabled by default and requires complete real-data Readiness, low risk, a project allowlist, a bounded time window/task count/budget, an evaluated Challenger, and explicit human approval. A guardrail regression records an atomic rollback decision while leaving the formal Run untouched.
 
 ## Boundaries
 

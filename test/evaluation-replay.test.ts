@@ -105,7 +105,14 @@ describe("Evaluation Datasets and Historical Replay", () => {
       id: "evaluation-verify", facts, binding, mode: "verify-only", requiredOperationIds: ["run-1:author"],
       createdAt: "2026-07-15T00:03:00.000Z",
     });
-    expect(verifyOnly).toMatchObject({ status: "completed", replayability: "verify-only", outcome: { passed: true } });
+    expect(verifyOnly).toMatchObject({
+      status: "completed",
+      replayability: "verify-only",
+      datasetPartition: "historical",
+      championVersion: "development-source",
+      challengerVersion: null,
+      outcome: { passed: true },
+    });
     expect(calls).toBe(1);
     expect(JSON.stringify({
       runs: development.listRuns(), operations: development.listOperations("run-1"),

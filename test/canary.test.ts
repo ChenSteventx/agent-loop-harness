@@ -89,6 +89,8 @@ describe("disabled low-risk Canary", () => {
       proposal,
       challenger,
       maximumBasisPoints: 500,
+      maximumTasks: 5,
+      maximumExtraBudgetTokens: 10_000,
       approvedBy: "human-operator",
       reason: "low-risk five-percent cap",
       createdAt: "2026-07-15T00:03:00.000Z",
@@ -103,6 +105,8 @@ describe("disabled low-risk Canary", () => {
       completedOfflineComparisons: 1,
       completedShadowRuns: 1,
       humanCanaryApproval: true,
+      coverageComplete: true,
+      fixtureOnly: false,
     }, {
       optimizationRealRuns: 1,
       optimizationResolvedFindings: 1,
@@ -112,8 +116,18 @@ describe("disabled low-risk Canary", () => {
       canaryOfflineComparisons: 1,
       canaryShadowRuns: 1,
     });
+    const policy = {
+      enabled: true,
+      basisPoints: 500,
+      hashSalt: "stable-salt",
+      projectAllowlist: ["generic-node"],
+      maxTasks: 5,
+      windowStartsAt: "2026-07-15T00:00:00.000Z",
+      windowEndsAt: "2026-07-16T00:00:00.000Z",
+      extraBudgetTokens: 5_000,
+    };
     let taskKey = "task-0";
-    for (let index = 0; stableCanaryBucket("generic-node", taskKey, "stable-salt") >= 500; index += 1) {
+    for (let index = 0; stableCanaryBucket("generic-node", taskKey, proposal.id, "stable-salt") >= 500; index += 1) {
       taskKey = `task-${index + 1}`;
     }
 
@@ -126,12 +140,11 @@ describe("disabled low-risk Canary", () => {
     const assignment = assignCanary(store, {
       id: "assignment-enabled", projectScope: "generic-node", taskKey, risk: "low", proposal,
       champion, challenger, comparison, readiness, approval,
-      policy: { enabled: true, basisPoints: 500, hashSalt: "stable-salt" },
+      policy,
       createdAt: "2026-07-15T00:05:00.000Z",
     });
     expect(assignment).toMatchObject({ selected: "challenger", selectedVariantId: challenger.id });
-    expect(stableCanaryBucket("generic-node", taskKey, "stable-salt")).toBe(assignment.bucket);
-    const policy = { enabled: true, basisPoints: 500, hashSalt: "stable-salt" };
+    expect(stableCanaryBucket("generic-node", taskKey, proposal.id, "stable-salt")).toBe(assignment.bucket);
     expect(assignCanary(store, {
       id: "assignment-medium", projectScope: "generic-node", taskKey, risk: "medium", proposal,
       champion, challenger, comparison, readiness, approval, policy,
@@ -168,7 +181,17 @@ describe("disabled low-risk Canary", () => {
   });
 
   it("keeps medium-risk tasks and unready or unapproved work on the Champion", () => {
-    expect(stableCanaryBucket("scope", "task", "salt")).toBe(stableCanaryBucket("scope", "task", "salt"));
-    expect(disabledCanaryPolicy).toEqual({ enabled: false, basisPoints: 0, hashSalt: "agent-loop-canary-v1" });
+    expect(stableCanaryBucket("scope", "task", "proposal", "salt"))
+      .toBe(stableCanaryBucket("scope", "task", "proposal", "salt"));
+    expect(disabledCanaryPolicy).toEqual({
+      enabled: false,
+      basisPoints: 0,
+      hashSalt: "agent-loop-canary-v1",
+      projectAllowlist: [],
+      maxTasks: 0,
+      windowStartsAt: "1970-01-01T00:00:00.000Z",
+      windowEndsAt: "1970-01-01T00:00:00.000Z",
+      extraBudgetTokens: 0,
+    });
   });
 });

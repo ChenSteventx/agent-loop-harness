@@ -1,7 +1,17 @@
 import { createHash } from "node:crypto";
 import type { OfflineComparison } from "../evaluation/compare.js";
 import type { ReadinessReport } from "../evaluation/readiness.js";
-import type { ChangeProposal, ConfigurationVariant, RollbackDecision } from "./proposals.js";
+import type { ChangeProposal, ConfigurationVariant, EvolutionTarget, RollbackDecision } from "./proposals.js";
+
+const canaryEligibleTargets: readonly EvolutionTarget[] = [
+  "prompt-variant",
+  "context-ranking",
+  "provider-routing",
+  "retry-policy",
+  "timeout-policy",
+  "low-risk-review-rubric",
+  "memory-retrieval",
+];
 
 export interface CanaryApproval {
   schemaVersion: 1;
@@ -11,6 +21,8 @@ export interface CanaryApproval {
   challengerId: string;
   allowedRisk: "low";
   maximumBasisPoints: number;
+  maximumTasks: number;
+  maximumExtraBudgetTokens: number;
   authority: "human";
   approvedBy: string;
   reason: string;
@@ -22,12 +34,22 @@ export interface CanaryPolicy {
   enabled: boolean;
   basisPoints: number;
   hashSalt: string;
+  projectAllowlist: string[];
+  maxTasks: number;
+  windowStartsAt: string;
+  windowEndsAt: string;
+  extraBudgetTokens: number;
 }
 
 export const disabledCanaryPolicy: CanaryPolicy = {
   enabled: false,
   basisPoints: 0,
   hashSalt: "agent-loop-canary-v1",
+  projectAllowlist: [],
+  maxTasks: 0,
+  windowStartsAt: "1970-01-01T00:00:00.000Z",
+  windowEndsAt: "1970-01-01T00:00:00.000Z",
+  extraBudgetTokens: 0,
 };
 
 export interface CanaryAssignment {
@@ -43,6 +65,7 @@ export interface CanaryAssignment {
   selected: "champion" | "challenger";
   bucket: number;
   basisPoints: number;
+  extraBudgetTokens: number;
   reason: string;
   createdAt: string;
 }
@@ -74,6 +97,7 @@ export interface CanaryRepository {
   installCanaryApproval(approval: CanaryApproval): CanaryApproval;
   installCanaryAssignment(assignment: CanaryAssignment): CanaryAssignment;
   applyCanaryObservation(observation: CanaryObservation, rollback: RollbackDecision | null): CanaryObservation;
+  countCanaryAssignments(projectScope: string, proposalId: string): number;
 }
 
 export function createCanaryApproval(input: {
@@ -82,6 +106,8 @@ export function createCanaryApproval(input: {
   proposal: ChangeProposal;
   challenger: ConfigurationVariant;
   maximumBasisPoints: number;
+  maximumTasks: number;
+  maximumExtraBudgetTokens: number;
   approvedBy: string;
   reason: string;
   createdAt?: string;
@@ -94,6 +120,10 @@ export function createCanaryApproval(input: {
   if (!Number.isSafeInteger(input.maximumBasisPoints) || input.maximumBasisPoints <= 0 || input.maximumBasisPoints > 1_000) {
     throw new Error("Canary approval maximum must be between 1 and 1000 basis points");
   }
+  if (!Number.isSafeInteger(input.maximumTasks) || input.maximumTasks <= 0 ||
+      !Number.isSafeInteger(input.maximumExtraBudgetTokens) || input.maximumExtraBudgetTokens < 0) {
+    throw new Error("Canary approval requires bounded task and extra-budget limits");
+  }
   const createdAt = input.createdAt ?? new Date().toISOString();
   if (input.expiresAt <= createdAt) throw new Error("Canary approval must expire after it is created");
   return {
@@ -104,6 +134,8 @@ export function createCanaryApproval(input: {
     challengerId: input.challenger.id,
     allowedRisk: "low",
     maximumBasisPoints: input.maximumBasisPoints,
+    maximumTasks: input.maximumTasks,
+    maximumExtraBudgetTokens: input.maximumExtraBudgetTokens,
     authority: "human",
     approvedBy: requiredText(input.approvedBy, "human approver"),
     reason: requiredText(input.reason, "approval reason"),
@@ -133,16 +165,25 @@ export function assignCanary(
   const createdAt = input.createdAt ?? new Date().toISOString();
   validatePolicy(policy);
   validateBindings(input);
-  const bucket = stableCanaryBucket(input.projectScope, input.taskKey, policy.hashSalt);
+  const bucket = stableCanaryBucket(input.projectScope, input.taskKey, input.proposal.id, policy.hashSalt);
   let selected: CanaryAssignment["selected"] = "champion";
   let reason = "Canary is disabled";
   if (policy.enabled) {
     if (input.risk !== "low") reason = "Only low-risk tasks are eligible for Canary";
+    else if (!canaryEligibleTargets.includes(input.proposal.target)) reason = "Proposal target is not eligible for Canary";
+    else if (!policy.projectAllowlist.includes(input.projectScope)) reason = "Project is not in the Canary allowlist";
+    else if (createdAt < policy.windowStartsAt || createdAt >= policy.windowEndsAt) reason = "Canary is outside its approved time window";
     else if (!input.readiness.canaryReady) reason = "Canary Readiness is not satisfied";
     else if (!input.approval || input.approval.expiresAt <= createdAt || input.approval.authority !== "human" ||
         input.approval.projectScope !== input.projectScope || input.approval.proposalId !== input.proposal.id ||
         input.approval.challengerId !== input.challenger.id) reason = "Valid human Canary approval is missing";
     else if (policy.basisPoints > input.approval.maximumBasisPoints) reason = "Canary percentage exceeds human approval";
+    else if (policy.maxTasks > input.approval.maximumTasks ||
+        repository.countCanaryAssignments(input.projectScope, input.proposal.id) >= policy.maxTasks) {
+      reason = "Canary task limit is exhausted or exceeds human approval";
+    } else if (policy.extraBudgetTokens > input.approval.maximumExtraBudgetTokens) {
+      reason = "Canary extra budget exceeds human approval";
+    }
     else if (input.comparison.status !== "completed" || !input.comparison.guardrailsSatisfied) {
       reason = "Offline Comparison guardrails are not satisfied";
     } else if (bucket >= policy.basisPoints) reason = "Stable hash selected the Champion cohort";
@@ -164,6 +205,7 @@ export function assignCanary(
     selected,
     bucket,
     basisPoints: policy.basisPoints,
+    extraBudgetTokens: policy.extraBudgetTokens,
     reason,
     createdAt,
   });
@@ -218,14 +260,18 @@ export function recordCanaryObservation(
   }, decision);
 }
 
-export function stableCanaryBucket(projectScope: string, taskKey: string, salt: string): number {
-  const hash = createHash("sha256").update(`${projectScope}\0${taskKey}\0${salt}`).digest();
+export function stableCanaryBucket(projectScope: string, taskKey: string, proposalId: string, salt: string): number {
+  const hash = createHash("sha256").update(`${projectScope}\0${taskKey}\0${proposalId}\0${salt}`).digest();
   return hash.readUInt32BE(0) % 10_000;
 }
 
 function validatePolicy(policy: CanaryPolicy): void {
   if (!Number.isSafeInteger(policy.basisPoints) || policy.basisPoints < 0 || policy.basisPoints > 1_000 ||
-      !policy.hashSalt.trim() || (!policy.enabled && policy.basisPoints !== 0)) {
+      !Number.isSafeInteger(policy.maxTasks) || policy.maxTasks < 0 ||
+      !Number.isSafeInteger(policy.extraBudgetTokens) || policy.extraBudgetTokens < 0 ||
+      !policy.hashSalt.trim() || policy.projectAllowlist.some((scope) => !scope.trim()) ||
+      (policy.enabled && (policy.maxTasks === 0 || policy.windowEndsAt <= policy.windowStartsAt)) ||
+      (!policy.enabled && (policy.basisPoints !== 0 || policy.maxTasks !== 0 || policy.extraBudgetTokens !== 0))) {
     throw new Error("Canary Policy must be disabled at zero or bounded to at most 10 percent");
   }
 }

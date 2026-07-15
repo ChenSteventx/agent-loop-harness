@@ -468,6 +468,13 @@ export class EvaluationStore {
     return this.getCanaryAssignment(assignment.id)!;
   }
 
+  countCanaryAssignments(projectScope: string, proposalId: string): number {
+    const row = this.database.prepare(
+      "SELECT COUNT(*) AS count FROM canary_assignments WHERE project_scope = ? AND proposal_id = ? AND selected = 'challenger'",
+    ).get(projectScope, proposalId) as { count: number };
+    return row.count;
+  }
+
   getCanaryAssignment(id: string): CanaryAssignment | null {
     const row = this.database.prepare("SELECT assignment_json FROM canary_assignments WHERE id = ?")
       .get(id) as { assignment_json: string } | undefined;
@@ -611,7 +618,7 @@ export class EvaluationStore {
         project_scope TEXT NOT NULL,
         kind TEXT NOT NULL CHECK(kind IN ('failure-pattern', 'finding-rule', 'provider-observation')),
         content_hash TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('candidate', 'approved', 'rejected', 'superseded', 'expired')),
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'approved', 'rejected', 'superseded', 'expired', 'invalidated')),
         memory_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
@@ -708,6 +715,34 @@ export class EvaluationStore {
         delivered_at TEXT
       );
     `);
+    this.migrateCandidateMemoryStatusConstraint();
+  }
+
+  private migrateCandidateMemoryStatusConstraint(): void {
+    const row = this.database.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'candidate_memories'",
+    ).get() as { sql: string } | undefined;
+    if (!row || row.sql.includes("'invalidated'")) return;
+    this.database.exec(`
+      ALTER TABLE candidate_memories RENAME TO candidate_memories_before_invalidation;
+      CREATE TABLE candidate_memories (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('failure-pattern', 'finding-rule', 'provider-observation')),
+        content_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'approved', 'rejected', 'superseded', 'expired', 'invalidated')),
+        memory_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        decided_at TEXT,
+        UNIQUE(project_scope, content_hash)
+      );
+      INSERT INTO candidate_memories
+        (id, project_scope, kind, content_hash, status, memory_json, created_at, expires_at, decided_at)
+      SELECT id, project_scope, kind, content_hash, status, memory_json, created_at, expires_at, decided_at
+      FROM candidate_memories_before_invalidation;
+      DROP TABLE candidate_memories_before_invalidation;
+    `);
   }
 
   private writeVariant(variant: ConfigurationVariant): void {
@@ -746,9 +781,9 @@ function validateMemoryDecision(
     throw new Error("Only a human decision can approve, reject, or supersede Candidate Memory");
   }
   const allowed = current.status === "candidate"
-    ? ["approved", "rejected", "expired"]
+    ? ["approved", "rejected", "expired", "invalidated"]
     : current.status === "approved"
-      ? ["rejected", "superseded", "expired"]
+      ? ["rejected", "superseded", "expired", "invalidated"]
       : [];
   if (!allowed.includes(input.status)) throw new Error(`Illegal Candidate Memory decision: ${current.status} -> ${input.status}`);
 }

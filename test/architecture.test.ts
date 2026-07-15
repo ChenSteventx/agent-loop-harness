@@ -27,4 +27,22 @@ describe("generic architecture boundary", () => {
       }
     }
   });
+
+  it("keeps evaluation, memory, and evolution sidecars unable to mutate formal Run state", () => {
+    const sidecarRoots = [resolve("src/evaluation"), resolve("src/memory"), resolve("src/evolution")];
+    const forbidden = [
+      /from\s+["'][^"']*orchestrator(?:\.js)?["']/u,
+      /\bOrchestrator\b/u,
+      /\btransitionRun\s*\(/u,
+      /\bresumeRun\s*\(/u,
+      /\breopenRunForInvalidEvidence\s*\(/u,
+      /\binstallEvidence\s*\(/u,
+      /\bcommitCandidate\s*\(/u,
+      /\bmarkMerged\s*\(/u,
+    ];
+    for (const file of sidecarRoots.flatMap(sourceFiles)) {
+      const source = readFileSync(file, "utf8");
+      for (const pattern of forbidden) expect(source, `${file} violates the sidecar boundary`).not.toMatch(pattern);
+    }
+  });
 });

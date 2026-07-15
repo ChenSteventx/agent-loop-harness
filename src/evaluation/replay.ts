@@ -1,5 +1,6 @@
 import { operationInputHash } from "../bindings.js";
 import type { RunBinding } from "../domain.js";
+import type { DatasetKind } from "./datasets.js";
 import type { SanitizedFactBundle } from "./facts.js";
 import { gradeReplayability, type Replayability } from "./manifests.js";
 
@@ -18,6 +19,9 @@ export interface EvaluationRun {
   sourceRunId: string;
   sourceFactHash: string;
   mode: ReplayMode;
+  datasetPartition: DatasetKind;
+  championVersion: string;
+  challengerVersion: string | null;
   replayability: Replayability;
   status: EvaluationRunStatus;
   verificationCommit: string | null;
@@ -48,6 +52,9 @@ export class HistoricalReplay {
     facts: SanitizedFactBundle;
     binding: RunBinding | null;
     mode: ReplayMode;
+    datasetPartition?: DatasetKind;
+    championVersion?: string;
+    challengerVersion?: string | null;
     requiredOperationIds?: readonly string[];
     createdAt?: string;
   }): Promise<EvaluationRun> {
@@ -120,7 +127,14 @@ export function pinnedVerificationCommit(facts: SanitizedFactBundle): string | n
 }
 
 function baseRun(
-  input: { id: string; facts: SanitizedFactBundle; mode: ReplayMode },
+  input: {
+    id: string;
+    facts: SanitizedFactBundle;
+    mode: ReplayMode;
+    datasetPartition?: DatasetKind;
+    championVersion?: string;
+    challengerVersion?: string | null;
+  },
   replayability: Replayability,
   status: EvaluationRunStatus,
   outcome: EvaluationOutcome | null,
@@ -136,6 +150,9 @@ function baseRun(
     sourceRunId: input.facts.run.id,
     sourceFactHash: input.facts.factHash,
     mode: input.mode,
+    datasetPartition: input.datasetPartition ?? "historical",
+    championVersion: input.championVersion ?? "development-source",
+    challengerVersion: input.challengerVersion ?? null,
     replayability,
     status,
     verificationCommit,

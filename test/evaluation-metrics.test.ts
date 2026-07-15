@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { exportRunFacts } from "../src/evaluation/facts.js";
+import { EvaluationFactSource, exportRunFacts } from "../src/evaluation/facts.js";
 import { projectRunMetrics, summarizeMetrics } from "../src/evaluation/metrics.js";
 import { evaluateReadiness } from "../src/evaluation/readiness.js";
 import { EvaluationStore } from "../src/evaluation/store.js";
@@ -72,6 +72,10 @@ describe("sanitized fact projections", () => {
     const eventCount = store.listEvents("run-1").length;
 
     const facts = exportRunFacts(store, "run-1", { exportedAt: "2026-07-15T00:01:00.000Z" });
+    const factSource = new EvaluationFactSource(store);
+    expect(factSource.exportRun("run-1", { exportedAt: "2026-07-15T00:01:00.000Z" })).toEqual(facts);
+    expect(factSource.listEligibleRuns({ statuses: ["done"], requireBinding: false },
+      { exportedAt: "2026-07-15T00:01:00.000Z" })).toEqual([facts]);
     const serialized = JSON.stringify(facts);
     expect(serialized).not.toContain("SECRET");
     expect(store.listEvents("run-1")).toHaveLength(eventCount);
@@ -90,7 +94,7 @@ describe("sanitized fact projections", () => {
       verificationFailures: 1,
       reviewerFindings: { confirmed: 0, rejected: 1, inconclusive: 0 },
       reviewPrecision: 0,
-      reviewRecall: null,
+      reviewRecall: "unknown",
       providerFallbacks: 1,
       quotaFailures: 1,
     });
@@ -118,7 +122,12 @@ describe("sanitized fact projections", () => {
       completedOfflineComparisons: 0,
       completedShadowRuns: 0,
       humanCanaryApproval: false,
+      coverageComplete: false,
+      fixtureOnly: true,
     });
+    expect(report.mechanismReady).toBe(true);
+    expect(report.offlineCompareReady).toBe(false);
+    expect(report.shadowReady).toBe(false);
     expect(report.optimizationReady).toBe(false);
     expect(report.canaryReady).toBe(false);
     expect(report.optimizationBlockers).toEqual(expect.arrayContaining([

@@ -7,6 +7,8 @@ export interface ReadinessInputs {
   completedOfflineComparisons: number;
   completedShadowRuns: number;
   humanCanaryApproval: boolean;
+  coverageComplete: boolean;
+  fixtureOnly: boolean;
 }
 
 export interface ReadinessThresholds {
@@ -20,6 +22,9 @@ export interface ReadinessThresholds {
 }
 
 export interface ReadinessReport {
+  mechanismReady: true;
+  offlineCompareReady: boolean;
+  shadowReady: boolean;
   optimizationReady: boolean;
   canaryReady: boolean;
   inputs: ReadinessInputs;
@@ -44,6 +49,8 @@ export function evaluateReadiness(
 ): ReadinessReport {
   validateCounts(inputs, thresholds);
   const optimizationBlockers = [
+    inputs.fixtureOnly ? "only Fixture data is available" : null,
+    inputs.coverageComplete ? null : "required real-run coverage is incomplete",
     below(inputs.realRunCount, thresholds.optimizationRealRuns, "real development runs"),
     below(inputs.resolvedFindingCount, thresholds.optimizationResolvedFindings, "human or machine resolved Findings"),
     below(inputs.exactReplayCount, thresholds.optimizationExactReplays, "exact historical replays"),
@@ -51,15 +58,20 @@ export function evaluateReadiness(
     below(inputs.holdoutTaskCount, thresholds.optimizationHoldoutTasks, "Holdout Tasks"),
   ].filter((value): value is string => value !== null);
   const optimizationReady = optimizationBlockers.length === 0;
+  const shadowReady = optimizationReady && inputs.completedOfflineComparisons > 0;
   const canaryBlockers = [
     ...optimizationBlockers,
+    shadowReady ? null : "Shadow prerequisites are not satisfied",
     below(inputs.completedOfflineComparisons, thresholds.canaryOfflineComparisons, "completed offline comparisons"),
     below(inputs.completedShadowRuns, thresholds.canaryShadowRuns, "completed Shadow runs"),
     inputs.humanCanaryApproval ? null : "human Canary approval is missing",
   ].filter((value): value is string => value !== null);
   return {
+    mechanismReady: true,
+    offlineCompareReady: optimizationReady,
+    shadowReady,
     optimizationReady,
-    canaryReady: optimizationReady && canaryBlockers.length === 0,
+    canaryReady: shadowReady && canaryBlockers.length === 0,
     inputs: { ...inputs },
     thresholds: { ...thresholds },
     optimizationBlockers,

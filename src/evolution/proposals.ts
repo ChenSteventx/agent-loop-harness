@@ -2,21 +2,26 @@ import { operationInputHash } from "../bindings.js";
 import type { EvaluationDataset } from "../evaluation/datasets.js";
 
 export const evolutionTargets = [
+  "prompt-variant",
+  "context-ranking",
   "provider-routing",
   "role-model-selection",
   "retry-policy",
   "timeout-policy",
-  "risk-thresholds",
+  "low-risk-review-rubric",
   "memory-retrieval",
 ] as const;
 export type EvolutionTarget = (typeof evolutionTargets)[number];
 
 export interface EvolutionConfiguration {
+  promptVariant?: string;
+  contextRanking?: string[];
   providerOrder: string[];
   roleModels: Record<string, string>;
   retryLimit: number;
   timeoutMs: number;
   riskThresholds: { assisted: number; reviewed: number };
+  lowRiskReviewRubric?: string;
   memoryRetrievalEnabled: boolean;
 }
 
@@ -277,11 +282,13 @@ export function rollbackChampion(
 
 function validatePatch(target: EvolutionTarget, patch: Partial<EvolutionConfiguration>): void {
   const allowed: Record<EvolutionTarget, keyof EvolutionConfiguration> = {
+    "prompt-variant": "promptVariant",
+    "context-ranking": "contextRanking",
     "provider-routing": "providerOrder",
     "role-model-selection": "roleModels",
     "retry-policy": "retryLimit",
     "timeout-policy": "timeoutMs",
-    "risk-thresholds": "riskThresholds",
+    "low-risk-review-rubric": "lowRiskReviewRubric",
     "memory-retrieval": "memoryRetrievalEnabled",
   };
   const keys = Object.keys(patch) as Array<keyof EvolutionConfiguration>;
@@ -290,7 +297,12 @@ function validatePatch(target: EvolutionTarget, patch: Partial<EvolutionConfigur
 }
 
 function validateConfiguration(configuration: EvolutionConfiguration): void {
-  if (!Array.isArray(configuration.providerOrder) || configuration.providerOrder.length === 0 ||
+  if ((configuration.promptVariant !== undefined && !configuration.promptVariant.trim()) ||
+      (configuration.contextRanking !== undefined &&
+        (!Array.isArray(configuration.contextRanking) || configuration.contextRanking.length === 0 ||
+          configuration.contextRanking.some((value) => !value.trim()))) ||
+      (configuration.lowRiskReviewRubric !== undefined && !configuration.lowRiskReviewRubric.trim()) ||
+      !Array.isArray(configuration.providerOrder) || configuration.providerOrder.length === 0 ||
       configuration.providerOrder.some((provider) => !provider.trim()) ||
       Object.values(configuration.roleModels).some((model) => !model.trim()) ||
       !Number.isSafeInteger(configuration.retryLimit) || configuration.retryLimit < 0 || configuration.retryLimit > 3 ||
@@ -306,11 +318,14 @@ function validateConfiguration(configuration: EvolutionConfiguration): void {
 
 function defaultConfiguration(): EvolutionConfiguration {
   return {
+    promptVariant: "baseline",
+    contextRanking: ["task", "acceptance", "repository"],
     providerOrder: ["codex"],
     roleModels: {},
     retryLimit: 1,
     timeoutMs: 60_000,
     riskThresholds: { assisted: 1, reviewed: 2 },
+    lowRiskReviewRubric: "verify acceptance and regression evidence",
     memoryRetrievalEnabled: false,
   };
 }

@@ -1,9 +1,18 @@
 import { operationInputHash } from "../bindings.js";
 import type { SanitizedFactBundle } from "../evaluation/facts.js";
 
-export const candidateMemoryStatuses = ["candidate", "approved", "rejected", "superseded", "expired"] as const;
+export const candidateMemoryStatuses = [
+  "candidate", "approved", "rejected", "superseded", "expired", "invalidated",
+] as const;
 export type CandidateMemoryStatus = (typeof candidateMemoryStatuses)[number];
 export type CandidateMemoryKind = "failure-pattern" | "finding-rule" | "provider-observation";
+
+export const candidateMemoryDefaults = Object.freeze({
+  captureCandidates: true,
+  retrievalMode: "off" as const,
+  autoPromote: false,
+  crossProject: false,
+});
 
 export interface CandidateMemory {
   schemaVersion: 1;
@@ -132,6 +141,21 @@ export function rejectCandidateMemory(
     authority: "human",
     decidedBy: requiredText(input.rejectedBy, "human reviewer"),
     reason: requiredText(input.reason, "rejection reason"),
+    decidedAt: input.decidedAt ?? new Date().toISOString(),
+  });
+}
+
+export function invalidateCandidateMemory(
+  repository: MemoryRepository,
+  input: { id: string; invalidatedBy: string; reason: string; decidedAt?: string },
+): CandidateMemory {
+  requireMemory(repository, input.id);
+  return repository.decideCandidateMemory({
+    id: input.id,
+    status: "invalidated",
+    authority: "human",
+    decidedBy: requiredText(input.invalidatedBy, "human reviewer"),
+    reason: requiredText(input.reason, "invalidation reason"),
     decidedAt: input.decidedAt ?? new Date().toISOString(),
   });
 }
