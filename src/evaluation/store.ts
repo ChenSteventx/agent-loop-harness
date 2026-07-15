@@ -6,6 +6,12 @@ import type { ReadinessReport } from "./readiness.js";
 import type { EvaluationDataset } from "./datasets.js";
 import type { EvaluationRun } from "./replay.js";
 import type { CandidateMemory, CandidateMemoryStatus } from "../memory/candidates.js";
+import type {
+  ChangeProposal,
+  ConfigurationVariant,
+  PromotionDecision,
+  RollbackDecision,
+} from "../evolution/proposals.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -194,6 +200,159 @@ export class EvaluationStore {
     return this.getCandidateMemory(input.id)!;
   }
 
+  installChangeProposal(proposal: ChangeProposal): ChangeProposal {
+    const existing = this.getChangeProposal(proposal.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(proposal)) throw new Error(`Change Proposal ${proposal.id} is immutable`);
+      return existing;
+    }
+    if (proposal.status !== "draft" || proposal.approval !== null) throw new Error("Change Proposal must begin as draft");
+    this.database.prepare(
+      `INSERT INTO change_proposals
+       (id, project_scope, target, base_champion_id, proposal_hash, status, proposal_json, created_at, decided_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+    ).run(proposal.id, proposal.projectScope, proposal.target, proposal.baseChampionId,
+      proposal.proposalHash, proposal.status, JSON.stringify(proposal), proposal.createdAt);
+    return this.getChangeProposal(proposal.id)!;
+  }
+
+  getChangeProposal(id: string): ChangeProposal | null {
+    const row = this.database.prepare("SELECT proposal_json FROM change_proposals WHERE id = ?")
+      .get(id) as { proposal_json: string } | undefined;
+    return row ? JSON.parse(row.proposal_json) as ChangeProposal : null;
+  }
+
+  listChangeProposals(projectScope?: string): ChangeProposal[] {
+    const rows = (projectScope
+      ? this.database.prepare("SELECT proposal_json FROM change_proposals WHERE project_scope = ? ORDER BY created_at, id").all(projectScope)
+      : this.database.prepare("SELECT proposal_json FROM change_proposals ORDER BY project_scope, created_at, id").all()) as
+      Array<{ proposal_json: string }>;
+    return rows.map((row) => JSON.parse(row.proposal_json) as ChangeProposal);
+  }
+
+  decideChangeProposal(input: {
+    id: string;
+    status: "approved" | "rejected" | "evaluated";
+    authority: "human";
+    decidedBy: string;
+    reason: string;
+    decidedAt: string;
+  }): ChangeProposal {
+    const current = this.getChangeProposal(input.id);
+    if (!current) throw new Error(`Change Proposal not found: ${input.id}`);
+    if (input.authority !== "human" || !input.decidedBy.trim() || !input.reason.trim()) {
+      throw new Error("Proposal decision requires explicit human authority, actor, and reason");
+    }
+    const allowed = current.status === "draft"
+      ? ["approved", "rejected"]
+      : current.status === "approved"
+        ? ["evaluated"]
+        : [];
+    if (!allowed.includes(input.status)) throw new Error(`Illegal Change Proposal decision: ${current.status} -> ${input.status}`);
+    const approval = current.approval ?? {
+      authority: "human" as const,
+      decidedBy: input.decidedBy,
+      reason: input.reason,
+      decidedAt: input.decidedAt,
+    };
+    const updated: ChangeProposal = { ...current, status: input.status, approval };
+    this.database.prepare(
+      "UPDATE change_proposals SET status = ?, proposal_json = ?, decided_at = ? WHERE id = ?",
+    ).run(updated.status, JSON.stringify(updated), input.decidedAt, input.id);
+    return this.getChangeProposal(input.id)!;
+  }
+
+  installConfigurationVariant(variant: ConfigurationVariant): ConfigurationVariant {
+    const existing = this.getConfigurationVariant(variant.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(variant)) throw new Error(`Configuration Variant ${variant.id} is immutable`);
+      return existing;
+    }
+    if (variant.status === "champion" && this.activeChampion(variant.projectScope)) {
+      throw new Error(`Project ${variant.projectScope} already has an active Champion`);
+    }
+    if (variant.status === "challenger" && (!variant.proposalId || !this.getChangeProposal(variant.proposalId))) {
+      throw new Error("Challenger requires a persisted Change Proposal");
+    }
+    this.database.prepare(
+      `INSERT INTO configuration_variants
+       (id, project_scope, proposal_id, version, configuration_hash, status, variant_json, created_at, activated_at, retired_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(variant.id, variant.projectScope, variant.proposalId, variant.version, variant.configurationHash,
+      variant.status, JSON.stringify(variant), variant.createdAt, variant.activatedAt, variant.retiredAt);
+    return this.getConfigurationVariant(variant.id)!;
+  }
+
+  getConfigurationVariant(id: string): ConfigurationVariant | null {
+    const row = this.database.prepare("SELECT variant_json FROM configuration_variants WHERE id = ?")
+      .get(id) as { variant_json: string } | undefined;
+    return row ? JSON.parse(row.variant_json) as ConfigurationVariant : null;
+  }
+
+  listConfigurationVariants(projectScope?: string): ConfigurationVariant[] {
+    const rows = (projectScope
+      ? this.database.prepare("SELECT variant_json FROM configuration_variants WHERE project_scope = ? ORDER BY created_at, id").all(projectScope)
+      : this.database.prepare("SELECT variant_json FROM configuration_variants ORDER BY project_scope, created_at, id").all()) as
+      Array<{ variant_json: string }>;
+    return rows.map((row) => JSON.parse(row.variant_json) as ConfigurationVariant);
+  }
+
+  activeChampion(projectScope: string): ConfigurationVariant | null {
+    const row = this.database.prepare(
+      "SELECT variant_json FROM configuration_variants WHERE project_scope = ? AND status = 'champion'",
+    ).get(projectScope) as { variant_json: string } | undefined;
+    return row ? JSON.parse(row.variant_json) as ConfigurationVariant : null;
+  }
+
+  activateChallenger(decision: PromotionDecision): ConfigurationVariant {
+    const transaction = this.database.transaction(() => {
+      const champion = this.activeChampion(decision.projectScope);
+      const challenger = this.getConfigurationVariant(decision.challengerId);
+      const proposal = this.getChangeProposal(decision.proposalId);
+      if (!champion || champion.id !== decision.fromChampionId || !challenger || challenger.status !== "challenger" ||
+          challenger.projectScope !== decision.projectScope || !proposal || proposal.status !== "evaluated" ||
+          decision.verdict !== "promote" || decision.authority !== "human") {
+        throw new Error("Promotion Decision does not match persisted evolution facts");
+      }
+      const retired: ConfigurationVariant = { ...champion, status: "retired", retiredAt: decision.decidedAt };
+      const activated: ConfigurationVariant = { ...challenger, status: "champion", activatedAt: decision.decidedAt };
+      this.writeVariant(retired);
+      this.writeVariant(activated);
+      const promoted: ChangeProposal = { ...proposal, status: "promoted" };
+      this.database.prepare("UPDATE change_proposals SET status = ?, proposal_json = ? WHERE id = ?")
+        .run(promoted.status, JSON.stringify(promoted), promoted.id);
+      this.insertEvolutionDecision(decision.id, decision.projectScope, "promotion", decision, decision.decidedAt);
+      return this.getConfigurationVariant(activated.id)!;
+    });
+    return transaction();
+  }
+
+  rollbackChampion(decision: RollbackDecision): ConfigurationVariant {
+    const transaction = this.database.transaction(() => {
+      const champion = this.activeChampion(decision.projectScope);
+      const restore = this.getConfigurationVariant(decision.restoreChampionId);
+      if (!champion || champion.id !== decision.fromChampionId || !restore || restore.projectScope !== decision.projectScope ||
+          restore.status !== "retired" || champion.id === restore.id) {
+        throw new Error("Rollback Decision does not match current and restorable Champions");
+      }
+      const rolledBack: ConfigurationVariant = { ...champion, status: "rolled-back", retiredAt: decision.decidedAt };
+      const restored: ConfigurationVariant = { ...restore, status: "champion", activatedAt: decision.decidedAt, retiredAt: null };
+      this.writeVariant(rolledBack);
+      this.writeVariant(restored);
+      if (champion.proposalId) {
+        const proposal = this.getChangeProposal(champion.proposalId);
+        if (proposal) {
+          const updated: ChangeProposal = { ...proposal, status: "rolled-back" };
+          this.database.prepare("UPDATE change_proposals SET status = ?, proposal_json = ? WHERE id = ?")
+            .run(updated.status, JSON.stringify(updated), updated.id);
+        }
+      }
+      this.insertEvolutionDecision(decision.id, decision.projectScope, "rollback", decision, decision.decidedAt);
+      return this.getConfigurationVariant(restored.id)!;
+    });
+    return transaction();
+  }
+
   private migrate(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS fact_bundles (
@@ -248,7 +407,57 @@ export class EvaluationStore {
         decided_at TEXT,
         UNIQUE(project_scope, content_hash)
       );
+      CREATE TABLE IF NOT EXISTS change_proposals (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        target TEXT NOT NULL,
+        base_champion_id TEXT NOT NULL,
+        proposal_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('draft', 'approved', 'rejected', 'evaluated', 'promoted', 'rolled-back')),
+        proposal_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        decided_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS configuration_variants (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        proposal_id TEXT REFERENCES change_proposals(id),
+        version TEXT NOT NULL,
+        configuration_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('champion', 'challenger', 'retired', 'rolled-back')),
+        variant_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        activated_at TEXT,
+        retired_at TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS one_active_champion_per_project
+        ON configuration_variants(project_scope) WHERE status = 'champion';
+      CREATE TABLE IF NOT EXISTS evolution_decisions (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('promotion', 'rollback')),
+        decision_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
+  }
+
+  private writeVariant(variant: ConfigurationVariant): void {
+    this.database.prepare(
+      "UPDATE configuration_variants SET status = ?, variant_json = ?, activated_at = ?, retired_at = ? WHERE id = ?",
+    ).run(variant.status, JSON.stringify(variant), variant.activatedAt, variant.retiredAt, variant.id);
+  }
+
+  private insertEvolutionDecision(
+    id: string,
+    projectScope: string,
+    kind: "promotion" | "rollback",
+    decision: PromotionDecision | RollbackDecision,
+    createdAt: string,
+  ): void {
+    this.database.prepare(
+      "INSERT INTO evolution_decisions (id, project_scope, kind, decision_json, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(id, projectScope, kind, JSON.stringify(decision), createdAt);
   }
 }
 
