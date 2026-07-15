@@ -24,6 +24,12 @@ import { HistoricalReplay, pinnedVerificationCommit, type ReplayMode } from "./e
 import { CommandRunner, GitService } from "./execution.js";
 import { operationInputHash } from "./bindings.js";
 import {
+  approveCandidateMemory,
+  deriveCandidateMemories,
+  rejectCandidateMemory,
+  retrieveApprovedMemory,
+} from "./memory/candidates.js";
+import {
   createProviderProfile,
   providerProfileNames,
   type ProviderProfileName,
@@ -252,6 +258,68 @@ human
     } finally {
       development.close();
     }
+  });
+
+const memory = program.command("memory").description("quarantined project-scoped Candidate Memory");
+
+memory
+  .command("generate")
+  .description("derive candidates from sanitized real Fact Bundles without activating retrieval")
+  .action(() => {
+    withEvaluationStores((_development, evaluationStore) => {
+      const values = deriveCandidateMemories(evaluationStore.listLatestFactBundles())
+        .map((candidate) => evaluationStore.installCandidateMemory(candidate));
+      print(values);
+    });
+  });
+
+memory
+  .command("list")
+  .option("--project <scope>")
+  .description("list Candidate Memory and explicit decision state")
+  .action((options: { project?: string }) => {
+    withEvaluationStores((_development, evaluationStore) =>
+      print(evaluationStore.listCandidateMemories(options.project)));
+  });
+
+memory
+  .command("approve")
+  .requiredOption("--id <id>")
+  .requiredOption("--approved-by <identity>")
+  .requiredOption("--reason <text>")
+  .option("--forbid <identifiers>", "comma-separated project-specific identifiers")
+  .description("record an explicit human approval after contamination and overfit scans")
+  .action((options: { id: string; approvedBy: string; reason: string; forbid?: string }) => {
+    withEvaluationStores((_development, evaluationStore) => print(approveCandidateMemory(evaluationStore, {
+      id: options.id,
+      approvedBy: options.approvedBy,
+      reason: options.reason,
+      forbiddenIdentifiers: options.forbid?.split(",").map((item) => item.trim()).filter(Boolean),
+    })));
+  });
+
+memory
+  .command("reject")
+  .requiredOption("--id <id>")
+  .requiredOption("--rejected-by <identity>")
+  .requiredOption("--reason <text>")
+  .description("record an explicit human rejection or rollback of approved memory")
+  .action((options: { id: string; rejectedBy: string; reason: string }) => {
+    withEvaluationStores((_development, evaluationStore) => print(rejectCandidateMemory(evaluationStore, options)));
+  });
+
+memory
+  .command("retrieve")
+  .requiredOption("--project <scope>")
+  .requiredOption("--query <text>")
+  .option("--enable", "explicitly enable otherwise-disabled retrieval", false)
+  .description("run explainable lexical retrieval; disabled unless --enable is supplied")
+  .action((options: { project: string; query: string; enable: boolean }) => {
+    withEvaluationStores((_development, evaluationStore) => print(retrieveApprovedMemory(evaluationStore, {
+      projectScope: options.project,
+      query: options.query,
+      enabled: options.enable,
+    })));
   });
 
 function createOrchestrator(loopHome: string): Orchestrator {

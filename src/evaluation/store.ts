@@ -5,6 +5,7 @@ import type { RunMetricsProjection } from "./metrics.js";
 import type { ReadinessReport } from "./readiness.js";
 import type { EvaluationDataset } from "./datasets.js";
 import type { EvaluationRun } from "./replay.js";
+import type { CandidateMemory, CandidateMemoryStatus } from "../memory/candidates.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -136,6 +137,63 @@ export class EvaluationStore {
       Array<{ run_json: string }>).map((row) => JSON.parse(row.run_json) as EvaluationRun);
   }
 
+  installCandidateMemory(memory: CandidateMemory): CandidateMemory {
+    const existing = this.getCandidateMemory(memory.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(memory)) throw new Error(`Candidate Memory ${memory.id} is immutable`);
+      return existing;
+    }
+    const duplicate = this.database.prepare(
+      "SELECT id FROM candidate_memories WHERE project_scope = ? AND content_hash = ?",
+    ).get(memory.projectScope, memory.contentHash) as { id: string } | undefined;
+    if (duplicate) throw new Error(`Candidate Memory duplicates ${duplicate.id}`);
+    if (memory.status !== "candidate" || memory.decision !== null) {
+      throw new Error("Candidate Memory must be installed before any decision");
+    }
+    this.database.prepare(
+      `INSERT INTO candidate_memories
+       (id, project_scope, kind, content_hash, status, memory_json, created_at, expires_at, decided_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+    ).run(memory.id, memory.projectScope, memory.kind, memory.contentHash, memory.status,
+      JSON.stringify(memory), memory.createdAt, memory.expiresAt);
+    return this.getCandidateMemory(memory.id)!;
+  }
+
+  getCandidateMemory(id: string): CandidateMemory | null {
+    const row = this.database.prepare("SELECT memory_json FROM candidate_memories WHERE id = ?")
+      .get(id) as { memory_json: string } | undefined;
+    return row ? JSON.parse(row.memory_json) as CandidateMemory : null;
+  }
+
+  listCandidateMemories(projectScope?: string): CandidateMemory[] {
+    const rows = (projectScope
+      ? this.database.prepare("SELECT memory_json FROM candidate_memories WHERE project_scope = ? ORDER BY id").all(projectScope)
+      : this.database.prepare("SELECT memory_json FROM candidate_memories ORDER BY project_scope, id").all()) as
+      Array<{ memory_json: string }>;
+    return rows.map((row) => JSON.parse(row.memory_json) as CandidateMemory);
+  }
+
+  decideCandidateMemory(input: {
+    id: string;
+    status: Exclude<CandidateMemoryStatus, "candidate">;
+    authority: "human" | "system-expiry";
+    decidedBy: string;
+    reason: string;
+    decidedAt: string;
+  }): CandidateMemory {
+    const current = this.getCandidateMemory(input.id);
+    if (!current) throw new Error(`Candidate Memory not found: ${input.id}`);
+    const decision = { status: input.status, authority: input.authority, decidedBy: input.decidedBy,
+      reason: input.reason, decidedAt: input.decidedAt };
+    if (current.status === input.status && canonicalJson(current.decision) === canonicalJson(decision)) return current;
+    validateMemoryDecision(current, input);
+    const updated: CandidateMemory = { ...current, status: input.status, decision };
+    this.database.prepare(
+      "UPDATE candidate_memories SET status = ?, memory_json = ?, decided_at = ? WHERE id = ?",
+    ).run(updated.status, JSON.stringify(updated), input.decidedAt, input.id);
+    return this.getCandidateMemory(input.id)!;
+  }
+
   private migrate(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS fact_bundles (
@@ -178,8 +236,44 @@ export class EvaluationStore {
         created_at TEXT NOT NULL,
         FOREIGN KEY(source_run_id, source_fact_hash) REFERENCES fact_bundles(run_id, fact_hash)
       );
+      CREATE TABLE IF NOT EXISTS candidate_memories (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('failure-pattern', 'finding-rule', 'provider-observation')),
+        content_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'approved', 'rejected', 'superseded', 'expired')),
+        memory_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        decided_at TEXT,
+        UNIQUE(project_scope, content_hash)
+      );
     `);
   }
+}
+
+function validateMemoryDecision(
+  current: CandidateMemory,
+  input: {
+    status: Exclude<CandidateMemoryStatus, "candidate">;
+    authority: "human" | "system-expiry";
+    decidedBy: string;
+    reason: string;
+  },
+): void {
+  if (!input.decidedBy.trim() || !input.reason.trim()) throw new Error("Memory decision requires actor and reason");
+  if (input.status === "expired" && input.authority !== "system-expiry") {
+    throw new Error("Only the deterministic expiry mechanism can expire Candidate Memory");
+  }
+  if (input.status !== "expired" && input.authority !== "human") {
+    throw new Error("Only a human decision can approve, reject, or supersede Candidate Memory");
+  }
+  const allowed = current.status === "candidate"
+    ? ["approved", "rejected", "expired"]
+    : current.status === "approved"
+      ? ["rejected", "superseded", "expired"]
+      : [];
+  if (!allowed.includes(input.status)) throw new Error(`Illegal Candidate Memory decision: ${current.status} -> ${input.status}`);
 }
 
 function stableBundle(bundle: SanitizedFactBundle): Omit<SanitizedFactBundle, "exportedAt"> {
