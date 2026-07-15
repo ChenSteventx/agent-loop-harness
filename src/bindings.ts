@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { EvidenceDependencies, RunBinding } from "./domain.js";
 import type { ProjectAdapter } from "./ports.js";
-import { routeRisk, type ExecutionTemplateName } from "./routing.js";
+import { routeRisk, type ExecutionTemplateName, type Risk } from "./routing.js";
 import type { TaskSpec } from "./task-spec.js";
 
 export interface CreateRunBindingInput {
@@ -14,10 +14,12 @@ export interface CreateRunBindingInput {
   worktreePath: string;
   providerProfile: string;
   projectAdapter: ProjectAdapter;
+  effectiveRisk?: Risk;
   executionTemplate?: ExecutionTemplateName;
 }
 
 export function createRunBinding(input: CreateRunBindingInput): RunBinding {
+  const effectiveRisk = input.effectiveRisk ?? input.taskSpec.risk;
   return {
     version: 1,
     taskSpecPath: normalizeExistingPath(input.taskSpecPath),
@@ -27,8 +29,8 @@ export function createRunBinding(input: CreateRunBindingInput): RunBinding {
     baselineCommit: input.baselineCommit,
     sourceRepository: normalizeExistingPath(input.sourceRepository),
     worktreePath: resolve(input.worktreePath),
-    risk: input.taskSpec.risk,
-    executionTemplate: input.executionTemplate ?? routeRisk(input.taskSpec.risk),
+    risk: effectiveRisk,
+    executionTemplate: input.executionTemplate ?? routeRisk(effectiveRisk),
     providerProfile: requiredText(input.providerProfile, "providerProfile"),
     projectAdapterName: requiredText(input.projectAdapter.name, "projectAdapter.name"),
     policyVersion: requiredText(input.projectAdapter.policyVersion, "projectAdapter.policyVersion"),

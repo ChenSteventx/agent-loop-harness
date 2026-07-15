@@ -80,6 +80,13 @@ export class GitService {
     return createHash("sha256").update(this.diffBetween(baseCommit, commitSha)).digest("hex");
   }
 
+  changedFilesBetween(baseCommit: string, commitSha = "HEAD"): string[] {
+    return this.git(["diff", "--name-only", "-z", baseCommit, commitSha])
+      .split("\0")
+      .filter(Boolean)
+      .sort();
+  }
+
   parent(commitSha = "HEAD"): string {
     return this.git(["rev-parse", `${commitSha}^`]).trim();
   }

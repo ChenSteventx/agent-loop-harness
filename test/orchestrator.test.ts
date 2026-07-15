@@ -172,6 +172,17 @@ class WritingExplorer extends FakeAuthor {
   }
 }
 
+class SensitivePathAuthor extends FakeAuthor {
+  override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    const result = await super.run(request);
+    if (request.workspaceAccess !== "read-only") {
+      mkdirSync(join(request.cwd, "src", "security"), { recursive: true });
+      writeFileSync(join(request.cwd, "src", "security", "policy.txt"), "sensitive change\n");
+    }
+    return result;
+  }
+}
+
 class FailedResultAuthor extends FakeAuthor {
   override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
     const result = await super.run(request);
@@ -283,6 +294,7 @@ describe("Orchestrator", () => {
     const emptyAdapter: ProjectAdapter = {
       name: "empty",
       policyVersion: "empty/v1",
+      minimumRisk: () => "low",
       verificationCommands: () => [],
       postMergeCommands: () => [],
     };
@@ -489,6 +501,43 @@ describe("Orchestrator", () => {
     expect(orchestrator.store.listHumanInbox("run-unknown-risk")).toHaveLength(1);
     orchestrator.close();
   }, 20_000);
+
+  it("enforces the Project Adapter risk floor over a low Task YAML declaration", async () => {
+    const fixture = targetRepository();
+    writeFileSync(
+      fixture.taskPath,
+      readFileSync(fixture.taskPath, "utf8").replace("risk: low", "scope:\n  - src/security/\nrisk: low"),
+    );
+    git(fixture.root, ["add", "task.yaml"]);
+    git(fixture.root, ["commit", "-m", "test: add sensitive scope"]);
+    const orchestrator = createOrchestrator(fixture, new FakeAuthor());
+    const view = await orchestrator.start({
+      runId: "run-risk-floor", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+
+    expect(view.run.binding).toMatchObject({ risk: "high", executionTemplate: "reviewed" });
+    expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked?.checkpointRef).toBe("independent-review");
+    orchestrator.close();
+  }, 30_000);
+
+  it("recomputes a monotonic risk floor from actual changed files", async () => {
+    const fixture = targetRepository();
+    const orchestrator = createOrchestrator(fixture, new SensitivePathAuthor());
+    const view = await orchestrator.start({
+      runId: "run-risk-changed-files", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+
+    expect(view.run.binding).toMatchObject({ risk: "high", executionTemplate: "reviewed" });
+    expect(view.run.status).toBe("blocked");
+    expect(view.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "run.risk-escalated",
+        data: expect.objectContaining({ from: "low", to: "high" }),
+      }),
+    ]));
+    orchestrator.close();
+  }, 30_000);
 
   it("runs a bounded Explorer for assisted work and gives the Author only its compact report", async () => {
     const fixture = targetRepository(false, "normal");
@@ -773,7 +822,7 @@ describe("Orchestrator", () => {
       risk: "low",
       executionTemplate: "solo",
       projectAdapterName: "generic-node",
-      policyVersion: "generic-node/v1",
+      policyVersion: "generic-node/v2",
     });
     expect((await orchestrator.resume("run-bound")).run.status).toBe("ready");
 
@@ -806,6 +855,7 @@ describe("Orchestrator", () => {
     const failingPostMerge: ProjectAdapter = {
       name: "post-merge-failure",
       policyVersion: "post-merge-failure/v1",
+      minimumRisk: (input) => base.minimumRisk(input),
       verificationCommands: (task) => base.verificationCommands(task),
       postMergeCommands: () => [{ id: "post-failure", argv: [process.execPath, "-e", "process.exit(9)"] }],
     };

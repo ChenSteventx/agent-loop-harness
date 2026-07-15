@@ -15,7 +15,7 @@ import type { ProviderAdapter, ProviderRunRequest, ProviderRunResult } from "./p
 import { loadTaskSpec } from "./project.js";
 import { SqliteStore } from "./store.js";
 import type { Evidence, Operation, Run } from "./domain.js";
-import { executionTemplates } from "./routing.js";
+import { applyRiskEscalation, executionTemplates } from "./routing.js";
 import {
   compactExplorerReport,
   explorerReportSchema,
@@ -176,6 +176,8 @@ export class Orchestrator {
     const runId = request.runId ?? randomUUID();
     if (this.store.getRun(runId)) throw new Error(`Run already exists: ${runId}`);
     const sourceGit = new GitService(request.targetRepository);
+    const minimumRisk = this.projectAdapter.minimumRisk({ task });
+    const effectiveRisk = applyRiskEscalation(minimumRisk, task.risk);
     const worktreePath = this.worktreePath(runId);
     const binding = createRunBinding({
       taskSpecPath: taskPath,
@@ -185,6 +187,7 @@ export class Orchestrator {
       worktreePath,
       providerProfile: this.providerProfileName,
       projectAdapter: this.projectAdapter,
+      effectiveRisk,
     });
     this.store.createBoundRun(runId, task.id, binding);
     this.store.appendEvent(runId, "worktree.planned", {
@@ -1719,12 +1722,25 @@ export class Orchestrator {
     }
 
     const operationInput = operation.input;
+    const changedFiles = git.changedFilesBetween(
+      this.requireBoundRun(runId).binding.baselineCommit,
+      candidate.commitSha,
+    );
+    const riskFloor = this.projectAdapter.minimumRisk({
+      task: this.requireBoundRun(runId).binding.taskSpec,
+      changedFiles,
+    });
+    this.store.escalateRunRisk(runId, riskFloor, {
+      changedFiles,
+      candidateCommit: candidate.commitSha,
+    });
+    const effectiveRun = this.requireBoundRun(runId);
     const stepId = `candidate-commit:${attempt}`;
     const dependencies = evidenceDependencies({
       commitSha: candidate.commitSha,
-      taskSpecHash: run.binding.taskSpecHash,
-      acceptanceHash: run.binding.acceptanceHash,
-      policyVersion: run.binding.policyVersion,
+      taskSpecHash: effectiveRun.binding.taskSpecHash,
+      acceptanceHash: effectiveRun.binding.acceptanceHash,
+      policyVersion: effectiveRun.binding.policyVersion,
       stepId,
       operationInputHash: operationInputHash(operationInput),
     });
@@ -1735,7 +1751,7 @@ export class Orchestrator {
       operationId: operation.id,
       kind: "candidate_commit",
       commitSha: candidate.commitSha,
-      policyVersion: run.binding.policyVersion,
+      policyVersion: effectiveRun.binding.policyVersion,
       stepId,
       dependencyHash,
       dependencies,

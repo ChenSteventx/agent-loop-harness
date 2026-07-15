@@ -26,6 +26,7 @@ const task: TaskSpec = {
 const adapter: ProjectAdapter = {
   name: "fixture",
   policyVersion: "fixture/v1",
+  minimumRisk: () => "low",
   verificationCommands: (value) => value.verification,
   postMergeCommands: (value) => value.verification,
 };
@@ -116,5 +117,30 @@ describe("canonical run and evidence bindings", () => {
       dependencies,
     });
     reopened.close();
+  });
+
+  it("persists only monotonic risk escalation in the Run binding", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-loop-risk-binding-"));
+    temporaryDirectories.push(directory);
+    const taskPath = join(directory, "task.yaml");
+    writeFileSync(taskPath, "fixture\n");
+    const binding = createRunBinding({
+      taskSpecPath: taskPath,
+      taskSpec: task,
+      baselineCommit: "base",
+      sourceRepository: directory,
+      worktreePath: join(directory, "worktree"),
+      providerProfile: "CODEX_PRIMARY",
+      projectAdapter: adapter,
+    });
+    const store = new SqliteStore(join(directory, "risk.sqlite"));
+    store.createBoundRun("risk-run", task.id, binding);
+    expect(store.escalateRunRisk("risk-run", "high", { changedFiles: ["src/security/policy.ts"] }).binding)
+      .toMatchObject({ risk: "high", executionTemplate: "reviewed" });
+    expect(store.escalateRunRisk("risk-run", "low", { changedFiles: [] }).binding)
+      .toMatchObject({ risk: "high", executionTemplate: "reviewed" });
+    expect(store.listEvents("risk-run").filter((event) => event.type === "run.risk-escalated"))
+      .toHaveLength(1);
+    store.close();
   });
 });

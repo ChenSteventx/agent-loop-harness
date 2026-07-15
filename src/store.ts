@@ -14,6 +14,7 @@ import {
   type TransitionOptions,
 } from "./domain.js";
 import { evidenceDependencyHash, operationInputHash } from "./bindings.js";
+import { applyRiskEscalation, routeRisk, type Risk } from "./routing.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -125,6 +126,39 @@ export class SqliteStore {
   listRuns(): Run[] {
     const rows = this.database.prepare("SELECT * FROM runs ORDER BY created_at, id").all() as RunRow[];
     return rows.map(mapRun);
+  }
+
+  escalateRunRisk(
+    id: string,
+    proposedFloor: Risk,
+    source: unknown,
+    now = new Date().toISOString(),
+  ): Run {
+    const transaction = this.database.transaction(() => {
+      const current = this.requireRun(id);
+      if (!current.binding) throw new Error(`Run ${id} has no binding to escalate`);
+      const risk = applyRiskEscalation(current.binding.risk, proposedFloor);
+      if (risk === current.binding.risk) return current;
+      const updated: Run = {
+        ...current,
+        binding: {
+          ...current.binding,
+          risk,
+          executionTemplate: routeRisk(risk),
+        },
+        updatedAt: now,
+      };
+      this.database.prepare("UPDATE runs SET binding_json = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify(updated.binding), now, id);
+      this.insertEvent(id, "run.risk-escalated", {
+        from: current.binding.risk,
+        to: risk,
+        executionTemplate: updated.binding?.executionTemplate,
+        source,
+      }, now);
+      return updated;
+    });
+    return transaction();
   }
 
   transitionRun(
