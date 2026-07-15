@@ -103,8 +103,6 @@ program
     );
   });
 
-await program.parseAsync();
-
 function createOrchestrator(loopHome: string): Orchestrator {
   const profileName = parseProviderProfileName(
     program.opts<{ providerProfile: string }>().providerProfile,
@@ -203,3 +201,5 @@ class UnconfiguredPiAdapter implements ProviderAdapter {
     };
   }
 }
+
+await program.parseAsync();

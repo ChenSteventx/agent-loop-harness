@@ -55,7 +55,17 @@ if (mode === "timeout") {
   event({ type: "thread.started", thread_id: "fake-thread-1" });
   if (mode === "malformed") process.stdout.write("{not-json}\n");
   event({ type: "item.completed", item: { type: "command_execution", status: "completed" } });
-  if (outputPath) writeFileSync(outputPath, JSON.stringify({ status: "completed", source: "fixture" }));
+  if (mode === "production-author") {
+    writeFileSync("changed.txt", "created by the production CLI fixture\n");
+    if (outputPath) {
+      writeFileSync(outputPath, JSON.stringify({
+        summary: "Created the bounded fixture change",
+        changedFiles: ["changed.txt"],
+      }));
+    }
+  } else if (outputPath) {
+    writeFileSync(outputPath, JSON.stringify({ status: "completed", source: "fixture" }));
+  }
   event({
     type: "turn.completed",
     usage: { input_tokens: 12, cached_input_tokens: 3, output_tokens: 7 },

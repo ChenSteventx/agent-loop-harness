@@ -3,6 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  evidenceDependencies,
+  evidenceDependencyHash,
+  operationInputHash,
+} from "../src/bindings.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { createProviderProfile } from "../src/profiles.js";
 import { GenericNodeProjectAdapter } from "../src/project.js";
@@ -142,6 +147,31 @@ class Reviewer implements ProviderAdapter {
 
   private identity() {
     return { provider: this.providerName, model: "fixture", executable: "in-process", version: "1" };
+  }
+}
+
+class ControlStateTamperingReviewer implements ProviderAdapter {
+  readonly workspaceIsolation = { readOnly: "enforced", workspaceWrite: "unverified" } as const;
+  readonly requests: ProviderRunRequest[] = [];
+
+  constructor(private readonly targetWorktree: string) {}
+
+  async probe() {
+    return { available: true, identity: this.identity(), error: null };
+  }
+
+  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    this.requests.push(request);
+    const original = git(this.targetWorktree, ["rev-parse", "HEAD"]);
+    git(this.targetWorktree, ["commit", "--allow-empty", "-m", "reviewer boundary violation"]);
+    git(this.targetWorktree, ["reset", "--hard", original]);
+    return result(request, "tampering-reviewer", { findings: [] });
+  }
+
+  async cancel() { return false; }
+
+  private identity() {
+    return { provider: "tampering-reviewer", model: "fixture", executable: "in-process", version: "1" };
   }
 }
 
@@ -288,5 +318,106 @@ describe("reviewed Orchestrator profile", () => {
     });
     expect(resumed.store.listPendingOutbox().filter((item) => item.type === "provider-fallback")).toHaveLength(1);
     resumed.close();
+  }, 120_000);
+
+  it("resumes the same Review operation after all Reviewers were temporarily unavailable", async () => {
+    const target = fixture();
+    const author = new RepairingAuthor();
+    const primary = new Reviewer("recovering-primary", ["quota", "clean"]);
+    const fallback = new Reviewer("temporarily-unavailable-fallback", ["quota"]);
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-reviewed-home-"));
+    temporaryDirectories.push(loopHome);
+    const first = orchestrator(author, primary, fallback, loopHome);
+    const blocked = await first.start({
+      runId: "reviewed-provider-recovery", taskPath: target.taskPath, targetRepository: target.root,
+    });
+    expect(blocked.run).toMatchObject({ status: "blocked", blocked: { checkpointRef: "provider-recovery" } });
+    expect(blocked.operations.filter((item) => item.kind === "independent-review")).toHaveLength(1);
+    expect(blocked.operations.find((item) => item.kind === "independent-review")?.status).toBe("running");
+    first.close();
+
+    const resumed = orchestrator(author, primary, fallback, loopHome);
+    const ready = await resumed.resume("reviewed-provider-recovery");
+    expect(ready.run.status).toBe("ready");
+    expect(author.requests).toHaveLength(1);
+    expect(primary.requests).toHaveLength(2);
+    expect(fallback.requests).toHaveLength(1);
+    expect(ready.operations.filter((item) => item.kind === "independent-review")).toHaveLength(1);
+    expect(ready.operations.find((item) => item.kind === "independent-review")?.status).toBe("succeeded");
+    resumed.close();
+  }, 120_000);
+
+  it("re-reviews when the verification proof set changes on the same commit", async () => {
+    const target = fixture();
+    const reviewer = new Reviewer("proof-set-reviewer", ["clean", "clean"]);
+    const loop = orchestrator(new RepairingAuthor(), reviewer, new Reviewer("unused-fallback", ["clean"]));
+    const first = await loop.start({
+      runId: "reviewed-proof-set", taskPath: target.taskPath, targetRepository: target.root,
+    });
+    const binding = first.run.binding;
+    const currentCommand = first.evidence.find((item) => item.kind === "command" && item.status === "valid");
+    const firstReview = first.evidence.find((item) => item.kind === "independent_review" && item.status === "valid");
+    expect(binding).not.toBeNull();
+    expect(currentCommand).toBeDefined();
+    expect(firstReview).toBeDefined();
+
+    const stepId = "verify:augmented-proof";
+    const input = {
+      kind: "command",
+      phase: "verify",
+      commandId: "augmented-proof",
+      argv: [process.execPath, "--version"],
+      cwd: first.worktreePath,
+    };
+    const dependencies = evidenceDependencies({
+      commitSha: git(first.worktreePath, ["rev-parse", "HEAD"]),
+      taskSpecHash: binding!.taskSpecHash,
+      acceptanceHash: binding!.acceptanceHash,
+      policyVersion: binding!.policyVersion,
+      stepId,
+      operationInputHash: operationInputHash(input),
+    });
+    const dependencyHash = evidenceDependencyHash(dependencies);
+    loop.store.installEvidence({
+      id: `reviewed-proof-set:evidence:command:${dependencyHash.slice(0, 12)}`,
+      runId: "reviewed-proof-set",
+      operationId: currentCommand!.operationId,
+      kind: "command",
+      commitSha: dependencies.commitSha,
+      policyVersion: binding!.policyVersion,
+      stepId,
+      dependencyHash,
+      dependencies,
+      data: { argv: input.argv, exitCode: 0 },
+    });
+
+    const second = await loop.resume("reviewed-proof-set");
+    expect(second.run.status).toBe("ready");
+    expect(reviewer.requests).toHaveLength(2);
+    expect(second.operations.filter((item) => item.kind === "independent-review")).toHaveLength(2);
+    expect(second.evidence.find((item) => item.id === firstReview!.id)?.status).toBe("invalid");
+    expect(second.evidence.filter((item) => item.kind === "independent_review" && item.status === "valid")).toHaveLength(1);
+    loop.close();
+  }, 120_000);
+
+  it("blocks a Reviewer that commits and resets the candidate behind the read-only boundary", async () => {
+    const target = fixture();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-reviewed-home-"));
+    temporaryDirectories.push(loopHome);
+    const runId = "reviewed-control-state";
+    const targetWorktree = join(loopHome, "worktrees", runId);
+    const reviewer = new ControlStateTamperingReviewer(targetWorktree);
+    const loop = orchestrator(
+      new RepairingAuthor(), reviewer, new Reviewer("unused-fallback", ["clean"]), loopHome,
+    );
+    const view = await loop.start({ runId, taskPath: target.taskPath, targetRepository: target.root });
+
+    expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked?.reason).toContain("boundary check failed");
+    expect(reviewer.requests).toHaveLength(1);
+    expect(view.operations.find((item) => item.kind === "independent-review")?.status).toBe("failed");
+    expect(view.evidence.some((item) => item.kind === "independent_review" && item.status === "valid")).toBe(false);
+    expect(git(targetWorktree, ["status", "--short"])).toBe("");
+    loop.close();
   }, 120_000);
 });

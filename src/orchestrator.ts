@@ -1099,7 +1099,7 @@ export class Orchestrator {
     );
     if (operationInputHash(operation.input) !== operationInputHash(expectedInput)) return null;
     const receipt = this.reviewEvidenceReceipt(runId, reviewedCommit, operation.input, selected);
-    return this.store.installEvidence({
+    return this.store.installEvidenceReplacingKinds({
       id: `${runId}:evidence:review:${receipt.dependencyHash.slice(0, 12)}`,
       runId,
       operationId: operation.id,
@@ -1117,7 +1117,7 @@ export class Orchestrator {
         diffHash,
         selectedReviewer: selectedFact,
       },
-    });
+    }, ["independent_review"]);
   }
 
   private reviewVerificationEvidence(runId: string, commitSha: string): VerificationEvidence[] {
