@@ -11,6 +11,10 @@ if (process.argv.includes("exec")) {
     process.stderr.write("missing user config isolation\n");
     process.exit(2);
   }
+  if (!process.argv.includes("--ignore-rules")) {
+    process.stderr.write("missing rules isolation\n");
+    process.exit(2);
+  }
   if (process.argv.includes("--ask-for-approval")) {
     process.stderr.write("obsolete --ask-for-approval flag\n");
     process.exit(2);
@@ -18,6 +22,10 @@ if (process.argv.includes("exec")) {
   const configIndex = process.argv.indexOf("-c");
   if (configIndex < 0 || process.argv[configIndex + 1] !== 'approval_policy="never"') {
     process.stderr.write("missing deterministic approval_policy config\n");
+    process.exit(2);
+  }
+  if (!process.argv.includes("features.hooks=false")) {
+    process.stderr.write("missing disabled hooks config\n");
     process.exit(2);
   }
 }

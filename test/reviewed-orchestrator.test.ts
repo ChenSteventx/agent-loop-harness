@@ -1,0 +1,292 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { Orchestrator } from "../src/orchestrator.js";
+import { createProviderProfile } from "../src/profiles.js";
+import { GenericNodeProjectAdapter } from "../src/project.js";
+import type {
+  ProviderAdapter,
+  ProviderFailureClass,
+  ProviderRunRequest,
+  ProviderRunResult,
+} from "../src/provider.js";
+
+const temporaryDirectories: string[] = [];
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function fixture(): { root: string; taskPath: string } {
+  const root = mkdtempSync(join(tmpdir(), "agent-loop-reviewed-target-"));
+  temporaryDirectories.push(root);
+  git(root, ["init", "-b", "main"]);
+  git(root, ["config", "user.email", "reviewed@example.invalid"]);
+  git(root, ["config", "user.name", "Reviewed Test"]);
+  writeFileSync(
+    join(root, "check.mjs"),
+    "import { existsSync } from 'node:fs'; process.exit(existsSync('changed.txt') ? 0 : 4);\n",
+  );
+  const taskPath = join(root, "task.yaml");
+  writeFileSync(taskPath, [
+    "id: REVIEWED-1",
+    "goal: Add a reviewed change",
+    "acceptance:",
+    "  - changed.txt exists and contains the reviewed result",
+    "risk: high",
+    "verification:",
+    "  - id: check",
+    "    argv: [node, check.mjs]",
+    "",
+  ].join("\n"));
+  git(root, ["add", "."]);
+  git(root, ["commit", "-m", "initial"]);
+  return { root, taskPath };
+}
+
+function result(
+  request: ProviderRunRequest,
+  provider: string,
+  finalOutput: unknown,
+  failureClass: ProviderFailureClass | null = null,
+): ProviderRunResult {
+  const ok = failureClass === null;
+  return {
+    invocationId: request.invocationId,
+    ok,
+    cancelled: false,
+    identity: { provider, model: "fixture", executable: "in-process", version: "1" },
+    threadId: ok ? `${provider}-thread` : null,
+    events: [],
+    finalOutput: ok ? finalOutput : null,
+    stderr: ok ? "" : `${failureClass} failure`,
+    exitCode: ok ? 0 : 1,
+    signal: null,
+    durationMs: 1,
+    usage: null,
+    failureClass,
+    eventsPath: join(request.artifactDirectory, "events.jsonl"),
+    finalOutputPath: join(request.artifactDirectory, "final.json"),
+    stderrPath: join(request.artifactDirectory, "stderr.log"),
+  };
+}
+
+class RepairingAuthor implements ProviderAdapter {
+  readonly workspaceIsolation = { readOnly: "enforced", workspaceWrite: "enforced" } as const;
+  readonly requests: ProviderRunRequest[] = [];
+
+  async probe() {
+    return { available: true, identity: this.identity(), error: null };
+  }
+
+  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    this.requests.push(request);
+    mkdirSync(request.artifactDirectory, { recursive: true });
+    const repairing = request.prompt.includes("Role: bounded Repair attempt");
+    writeFileSync(join(request.cwd, "changed.txt"), repairing ? "fixed\n" : "broken\n");
+    return result(request, "observed-author", {
+      summary: repairing ? "Repaired the reviewed finding" : "Added the initial change",
+      changedFiles: ["changed.txt"],
+    });
+  }
+
+  async cancel() { return false; }
+
+  private identity() {
+    return { provider: "observed-author", model: "fixture", executable: "in-process", version: "1" };
+  }
+}
+
+type ReviewOutcome = "clean" | "blocking" | "quota";
+
+class Reviewer implements ProviderAdapter {
+  readonly workspaceIsolation;
+  readonly requests: ProviderRunRequest[] = [];
+
+  constructor(
+    private readonly providerName: string,
+    private readonly outcomes: ReviewOutcome[],
+    readOnly: "enforced" | "unverified" = "enforced",
+  ) {
+    this.workspaceIsolation = { readOnly, workspaceWrite: "unverified" as const };
+  }
+
+  async probe() {
+    return { available: true, identity: this.identity(), error: null };
+  }
+
+  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    this.requests.push(request);
+    const outcome = this.outcomes.shift() ?? "clean";
+    if (outcome === "quota") return result(request, this.providerName, null, "quota");
+    return result(request, this.providerName, {
+      findings: outcome === "blocking" ? [{
+        id: "F-1",
+        category: "acceptance",
+        severity: "high",
+        claim: "changed.txt still contains the unreviewed value",
+        location: "changed.txt:1",
+        reproductionCommand: "node -e read changed.txt",
+        expectedResult: "fixed",
+        observedResult: "broken",
+        confidence: 1,
+        proposedVerification: "read changed.txt after Repair",
+        status: "open",
+      }] : [],
+    });
+  }
+
+  async cancel() { return false; }
+
+  private identity() {
+    return { provider: this.providerName, model: "fixture", executable: "in-process", version: "1" };
+  }
+}
+
+function orchestrator(
+  author: ProviderAdapter,
+  primary: ProviderAdapter,
+  fallback: ProviderAdapter,
+  loopHome = mkdtempSync(join(tmpdir(), "agent-loop-reviewed-home-")),
+  faults?: { afterReviewProviderCompletion?: () => void },
+): Orchestrator {
+  if (!temporaryDirectories.includes(loopHome)) temporaryDirectories.push(loopHome);
+  return new Orchestrator({
+    loopHome,
+    providerProfile: createProviderProfile("CODEX_PRIMARY", {
+      codex: { adapter: author, family: "codex", name: "Configured Codex Author" },
+      claude: { adapter: primary, family: "claude", name: "Configured Claude Reviewer" },
+      deepseek: { adapter: fallback, family: "deepseek", name: "Configured DeepSeek Reviewer" },
+    }),
+    projectAdapter: new GenericNodeProjectAdapter(),
+    faults,
+  });
+}
+
+afterEach(() => {
+  for (const directory of temporaryDirectories.splice(0).reverse()) {
+    rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+});
+
+describe("reviewed Orchestrator profile", () => {
+  it("repairs one blocking independent finding, then re-verifies and re-reviews the same Run", async () => {
+    const target = fixture();
+    const author = new RepairingAuthor();
+    const reviewer = new Reviewer("observed-provider-claiming-any-family", ["blocking", "clean"]);
+    const loop = orchestrator(author, reviewer, new Reviewer("unused-fallback", ["clean"]));
+    const view = await loop.start({ runId: "reviewed-repair", taskPath: target.taskPath, targetRepository: target.root });
+
+    expect(view.run).toMatchObject({ status: "ready", binding: { providerProfile: "CODEX_PRIMARY" } });
+    expect(author.requests).toHaveLength(2);
+    expect(reviewer.requests).toHaveLength(2);
+    expect(author.requests[1]?.prompt).toContain("changed.txt still contains the unreviewed value");
+    expect(view.operations.filter((item) => item.kind === "repair")).toHaveLength(1);
+    expect(view.operations.filter((item) => item.kind === "verify:check")).toHaveLength(2);
+    expect(view.operations.filter((item) => item.kind === "independent-review")).toHaveLength(2);
+    expect(Number(git(view.worktreePath, ["rev-list", "--count", "HEAD"]))).toBe(3);
+
+    const valid = view.evidence.filter((item) => item.status === "valid");
+    const review = valid.find((item) => item.kind === "independent_review");
+    const acceptance = valid.find((item) => item.kind === "acceptance_binding");
+    expect(review?.data).toMatchObject({
+      blocking: false,
+      selectedReviewer: {
+        configuredFamily: "claude",
+        configuredName: "Configured Claude Reviewer",
+        observedIdentity: { provider: "observed-provider-claiming-any-family" },
+      },
+    });
+    expect(review?.dependencies).toMatchObject({
+      commitSha: git(view.worktreePath, ["rev-parse", "HEAD"]),
+      taskSpecHash: view.run.binding?.taskSpecHash,
+      acceptanceHash: view.run.binding?.acceptanceHash,
+      policyVersion: view.run.binding?.policyVersion,
+    });
+    expect(acceptance?.dependencies).toMatchObject({
+      commitSha: git(view.worktreePath, ["rev-parse", "HEAD"]),
+      taskSpecHash: view.run.binding?.taskSpecHash,
+      acceptanceHash: view.run.binding?.acceptanceHash,
+      policyVersion: view.run.binding?.policyVersion,
+      stepId: "acceptance-binding",
+    });
+    expect(view.evidence.filter((item) => item.kind === "independent_review" && item.status === "invalid")).toHaveLength(1);
+    loop.close();
+  }, 180_000);
+
+  it("persists quota fallback facts and binds the receipt to the selected configured family", async () => {
+    const target = fixture();
+    const primary = new Reviewer("primary-observed", ["quota"]);
+    const fallback = new Reviewer("fallback-observed", ["clean"]);
+    const loop = orchestrator(new RepairingAuthor(), primary, fallback);
+    const view = await loop.start({ runId: "reviewed-fallback", taskPath: target.taskPath, targetRepository: target.root });
+
+    expect(view.run.status).toBe("ready");
+    expect(primary.requests).toHaveLength(1);
+    expect(fallback.requests).toHaveLength(1);
+    expect(view.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "provider.failure", data: expect.objectContaining({ failureClass: "quota" }) }),
+      expect.objectContaining({ type: "provider.fallback", data: expect.objectContaining({ reason: "quota" }) }),
+      expect.objectContaining({ type: "provider.checkpoint", data: expect.objectContaining({ provider: "fallback-observed" }) }),
+    ]));
+    expect(loop.store.listPendingOutbox()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "provider-fallback", payload: expect.objectContaining({ reason: "quota" }) }),
+    ]));
+    expect(view.evidence.find((item) => item.kind === "independent_review")?.data).toMatchObject({
+      selectedReviewer: { configuredFamily: "deepseek", observedIdentity: { provider: "fallback-observed" } },
+    });
+    loop.close();
+  }, 60_000);
+
+  it("fails high-risk work closed when no independent Reviewer proves read-only isolation", async () => {
+    const target = fixture();
+    const primary = new Reviewer("unsafe-primary", ["clean"], "unverified");
+    const fallback = new Reviewer("unsafe-fallback", ["clean"], "unverified");
+    const loop = orchestrator(new RepairingAuthor(), primary, fallback);
+    const view = await loop.start({ runId: "reviewed-no-safe-reviewer", taskPath: target.taskPath, targetRepository: target.root });
+
+    expect(view.run).toMatchObject({ status: "blocked", blocked: { checkpointRef: "independent-review" } });
+    expect(primary.requests).toHaveLength(0);
+    expect(fallback.requests).toHaveLength(0);
+    expect(view.evidence.some((item) => item.kind === "independent_review" && item.status === "valid")).toBe(false);
+    expect(loop.store.listHumanInbox("reviewed-no-safe-reviewer")).toHaveLength(1);
+    expect(loop.store.listPendingOutbox().some((item) => item.type === "needs-human")).toBe(true);
+    loop.close();
+  }, 60_000);
+
+  it("recovers a durable fallback Reviewer completion without invoking either Provider again", async () => {
+    const target = fixture();
+    const author = new RepairingAuthor();
+    const primary = new Reviewer("primary-once", ["quota"]);
+    const fallback = new Reviewer("fallback-once", ["clean"]);
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-reviewed-home-"));
+    temporaryDirectories.push(loopHome);
+    const first = orchestrator(author, primary, fallback, loopHome, {
+      afterReviewProviderCompletion: () => { throw new Error("simulated restart after durable Reviewer receipt"); },
+    });
+    await expect(first.start({
+      runId: "reviewed-receipt-recovery", taskPath: target.taskPath, targetRepository: target.root,
+    })).rejects.toThrow("durable Reviewer receipt");
+    expect(first.status("reviewed-receipt-recovery").operations.at(-1)).toMatchObject({
+      kind: "independent-review", status: "running",
+    });
+    expect(first.status("reviewed-receipt-recovery").events.some((item) =>
+      item.type === "review.provider-completed"
+    )).toBe(true);
+    first.close();
+
+    const resumed = orchestrator(author, primary, fallback, loopHome);
+    const view = await resumed.resume("reviewed-receipt-recovery");
+    expect(view.run.status).toBe("ready");
+    expect(primary.requests).toHaveLength(1);
+    expect(fallback.requests).toHaveLength(1);
+    expect(view.operations.filter((item) => item.kind === "independent-review")).toHaveLength(1);
+    expect(view.operations.find((item) => item.kind === "independent-review")?.result).toMatchObject({
+      recoveredAfterProviderCompletion: true,
+    });
+    expect(resumed.store.listPendingOutbox().filter((item) => item.type === "provider-fallback")).toHaveLength(1);
+    resumed.close();
+  }, 120_000);
+});

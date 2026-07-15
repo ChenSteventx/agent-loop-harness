@@ -64,7 +64,10 @@ describe("continuous runner Codex CLI compatibility", () => {
   });
 
   it("routes a valid deferral into deterministic manifest verification", () => {
-    const source = readFileSync(resolve("automation/continue.mjs"), "utf8");
+    const source = readFileSync(resolve("automation/continue.mjs"), "utf8").replace(
+      /\r\n/g,
+      "\n",
+    );
     expect(source).toContain(
       "validateExternalVerificationDeferral(\n        report,",
     );

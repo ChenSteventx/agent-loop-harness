@@ -3,6 +3,7 @@ import type { ExecutionTemplateName, Risk } from "./routing.js";
 export type ExplorationProof = "not-required" | "missing" | "satisfied" | "failed";
 export type WriterProof = "missing" | "running" | "patch-ready" | "failed" | "committed";
 export type VerificationProof = "missing" | "passed" | "failed";
+export type AcceptanceProof = "not-required" | "missing" | "satisfied";
 export type ReviewProof = "not-required" | "missing" | "passed" | "blocking" | "unavailable";
 
 export interface ProofGapSnapshot {
@@ -10,6 +11,7 @@ export interface ProofGapSnapshot {
   template: ExecutionTemplateName;
   exploration: ExplorationProof;
   writer: WriterProof;
+  acceptance: AcceptanceProof;
   verification: VerificationProof;
   review: ReviewProof;
   repairsUsed: number;
@@ -22,6 +24,7 @@ export type NextAction =
   | { kind: "explore" }
   | { kind: "author"; attempt: 1 }
   | { kind: "checkpoint-commit" }
+  | { kind: "bind-acceptance" }
   | { kind: "verify" }
   | { kind: "review" }
   | { kind: "repair"; attempt: number }
@@ -40,6 +43,7 @@ export function decideNextAction(snapshot: ProofGapSnapshot): NextAction {
       ? { kind: "repair", attempt: snapshot.repairsUsed }
       : { kind: "author", attempt: 1 };
   }
+  if (snapshot.acceptance === "missing") return { kind: "bind-acceptance" };
   if (snapshot.verification === "missing") return { kind: "verify" };
   if (snapshot.verification === "failed") return repairOrBlock(snapshot, "Verification failed");
   if (snapshot.review === "missing") return { kind: "review" };

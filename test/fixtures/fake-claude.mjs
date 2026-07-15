@@ -12,6 +12,10 @@ if (required.some((argument) => !process.argv.includes(argument))) {
   process.stderr.write("missing documented Claude Code argument\n");
   process.exit(2);
 }
+if (process.argv.includes("--tools") && process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== "1") {
+  process.stderr.write("read-only invocation did not disable auto memory\n");
+  process.exit(2);
+}
 if (mode === "timeout") {
   setInterval(() => {}, 1000);
 } else if (mode === "quota") {

@@ -1,13 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { ProviderAdapter } from "../src/provider.js";
-import { createProviderProfile, isIndependentReceipt, selectReviewer, withFallbackOutbox } from "../src/profiles.js";
+import { createProviderProfile, independentReviewCandidates, isIndependentReceipt, selectReviewer, withFallbackOutbox } from "../src/profiles.js";
 import { SqliteStore } from "../src/store.js";
 
-const adapter = {} as ProviderAdapter;
 const providers = {
-  codex: { adapter, family: "codex" as const, name: "Codex" },
-  claude: { adapter, family: "claude" as const, name: "Claude" },
-  deepseek: { adapter, family: "deepseek" as const, name: "Pi/DeepSeek" },
+  codex: { adapter: {} as ProviderAdapter, family: "codex" as const, name: "Codex" },
+  claude: { adapter: {} as ProviderAdapter, family: "claude" as const, name: "Claude" },
+  deepseek: { adapter: {} as ProviderAdapter, family: "deepseek" as const, name: "Pi/DeepSeek" },
 };
 
 describe("provider profiles", () => {
@@ -34,6 +33,14 @@ describe("provider profiles", () => {
     const profile = { ...createProviderProfile("CODEX_PRIMARY", providers), reviewer: providers.codex, fallbackReviewer: providers.codex };
     expect(selectReviewer(profile, "high", { primaryAvailable: true, fallbackAvailable: true }).disposition).toBe("needs-human");
     expect(selectReviewer(profile, "normal", { primaryAvailable: true, fallbackAvailable: false }).disposition).toBe("advisory");
+    expect(isIndependentReceipt(providers.codex, { ...providers.claude, adapter: providers.codex.adapter })).toBe(false);
+  });
+
+  it("offers only independently configured reviewers with enforced read-only isolation", () => {
+    const author = { ...providers.codex, adapter: { workspaceIsolation: { readOnly: "enforced" as const, workspaceWrite: "enforced" as const } } as ProviderAdapter };
+    const reviewer = { ...providers.claude, adapter: { workspaceIsolation: { readOnly: "enforced" as const, workspaceWrite: "unverified" as const } } as ProviderAdapter };
+    const fallbackReviewer = { ...providers.deepseek, adapter: { workspaceIsolation: { readOnly: "unverified" as const, workspaceWrite: "unverified" as const } } as ProviderAdapter };
+    expect(independentReviewCandidates({ name: "CODEX_PRIMARY", author, reviewer, fallbackReviewer })).toEqual([reviewer]);
   });
 
   it("binds Provider Supervisor fallback records to the Outbox", () => {

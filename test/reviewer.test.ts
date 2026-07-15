@@ -37,13 +37,13 @@ class FakeReviewer implements ProviderAdapter {
 function input() {
   return { task: { id: "T", goal: "fix", acceptance: ["works"], risk: "high" as const, verification: [{ id: "test", argv: ["npm", "test"] as [string, ...string[]] }] },
     diff, reviewedCommit: commit, diffHash: hashReviewDiff(diff), verificationEvidence: [{ command: ["npm", "test"], exitCode: 0, commitSha: commit, result: "passed" }],
-    allowedRepositoryRoots: ["/repo"], contextBudget: 100 };
+    allowedRepositoryRoots: ["/repo"], contextBudget: 100, controlStateHash: "control-1" };
 }
 
 describe("independent reviewer", () => {
   it("is read-only, fixed to commit and diff, and excludes Author self-evaluation from first-pass context", async () => {
     const provider = new FakeReviewer();
-    const state = { commit, diffHash: hashReviewDiff(diff), dirty: false };
+    const state = { commit, diffHash: hashReviewDiff(diff), dirty: false, controlStateHash: "control-1" };
     const result = await runReviewer(provider, input(), () => state, { invocationId: "review", cwd: "/repo", artifactDirectory: "/artifacts", outputSchemaPath: "/schema" });
     expect(provider.request).toMatchObject({ workspaceAccess: "read-only", allowedRepositoryRoots: ["/repo"], contextBudget: 100 });
     expect(provider.request?.additionalWritableDirectories).toBeUndefined();
@@ -61,7 +61,7 @@ describe("independent reviewer", () => {
       const first = (result.finalOutput as { findings: Record<string, unknown>[] }).findings[0]!;
       return { ...result, finalOutput: { findings: [{ ...first, reviewerIdentity: identity, reviewedCommit: "forged" }] } };
     };
-    const state = { commit, diffHash: hashReviewDiff(diff), dirty: false };
+    const state = { commit, diffHash: hashReviewDiff(diff), dirty: false, controlStateHash: "control-1" };
     expect((await runReviewer(provider, input(), () => state, {
       invocationId: "forged", cwd: "/repo", artifactDirectory: "/artifacts", outputSchemaPath: "/schema",
     })).report).toBeNull();
@@ -69,7 +69,7 @@ describe("independent reviewer", () => {
 
   it("rejects reviewer writes and invalidates review evidence when the commit changes", async () => {
     const provider = new FakeReviewer();
-    const state = { commit, diffHash: hashReviewDiff(diff), dirty: false };
+    const state = { commit, diffHash: hashReviewDiff(diff), dirty: false, controlStateHash: "control-1" };
     provider.mutate = () => { state.dirty = true; };
     await expect(runReviewer(provider, input(), () => state, { invocationId: "review", cwd: "/repo", artifactDirectory: "/a", outputSchemaPath: "/s" })).rejects.toThrow("read-only");
     state.dirty = false;

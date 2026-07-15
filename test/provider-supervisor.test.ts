@@ -70,9 +70,12 @@ describe("ProviderSupervisor", () => {
     ]);
     const outcome = await supervisor([primary], store, sleeps).run(request);
     expect(outcome.disposition).toBe("succeeded");
+    expect(outcome.selectedAdapterIndex).toBe(0);
     expect(primary.calls).toBe(2);
     expect(sleeps).toEqual([3_000]);
-    expect(store.checkpoints).toEqual([{ invocationId: "inv-1", provider: "primary", threadId: "primary-thread" }]);
+    expect(store.checkpoints).toEqual([expect.objectContaining({
+      invocationId: "inv-1", provider: "primary", threadId: "primary-thread", selectedAdapterIndex: 0, attempt: 2,
+    })]);
   });
 
   it("does not retry quota and records fallback history before using another provider", async () => {
@@ -83,6 +86,7 @@ describe("ProviderSupervisor", () => {
     expect(primary.calls).toBe(1);
     expect(fallback.calls).toBe(1);
     expect(outcome.disposition).toBe("succeeded");
+    expect(outcome.selectedAdapterIndex).toBe(1);
     expect(store.fallbacks).toEqual([{ fromProvider: "primary", reason: "quota" }]);
   });
 
@@ -118,6 +122,35 @@ describe("ProviderSupervisor", () => {
     expect(primary.calls).toBe(2);
     expect(fallback.calls).toBe(1);
     expect(store.failures.map((failure) => failure.attempt)).toEqual([1, 2]);
+  });
+
+  it("treats schema-invalid successful output as invalid_output before fallback", async () => {
+    const store = new MemoryPersistence();
+    const primary = adapter("primary", [result("primary", null), result("primary", null)]);
+    const fallback = adapter("fallback", [result("fallback", null)]);
+    const outcome = await supervisor([primary, fallback], store).run(
+      request,
+      (providerResult) => providerResult.identity.provider === "fallback",
+    );
+    expect(outcome).toMatchObject({ disposition: "succeeded", selectedAdapterIndex: 1 });
+    expect(primary.calls).toBe(2);
+    expect(fallback.calls).toBe(1);
+    expect(store.failures.map(({ failureClass }) => failureClass)).toEqual(["invalid_output", "invalid_output"]);
+    expect(store.fallbacks).toEqual([{ fromProvider: "primary", reason: "invalid_output" }]);
+  });
+
+  it("classifies a missing primary executable and still invokes fallback", async () => {
+    const store = new MemoryPersistence();
+    const primary: ProviderAdapter = {
+      async probe() { return { available: false, identity: result("primary", null).identity, error: "ENOENT" }; },
+      async run() { throw new Error("spawn primary ENOENT"); },
+      async cancel() { return false; },
+    };
+    const fallback = adapter("fallback", [result("fallback", null)]);
+    const outcome = await supervisor([primary, fallback], store).run(request);
+    expect(outcome).toMatchObject({ disposition: "succeeded", selectedAdapterIndex: 1 });
+    expect(store.failures).toEqual([expect.objectContaining({ provider: "adapter-0", failureClass: "unavailable" })]);
+    expect(fallback.calls).toBe(1);
   });
 
   it("prevents retry storms and cools down repeatedly failing providers", async () => {

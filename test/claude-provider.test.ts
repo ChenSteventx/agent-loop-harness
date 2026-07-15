@@ -16,7 +16,14 @@ function root(): string {
 function request(directory: string, invocationId: string) {
   const schema = join(directory, "schema.json");
   writeFileSync(schema, JSON.stringify({ type: "object" }));
-  return { invocationId, prompt: "fixture prompt", cwd: directory, artifactDirectory: join(directory, invocationId), outputSchemaPath: schema };
+  return {
+    invocationId,
+    prompt: "fixture prompt",
+    cwd: directory,
+    artifactDirectory: join(directory, invocationId),
+    outputSchemaPath: schema,
+    workspaceAccess: "read-only" as const,
+  };
 }
 
 function adapter(mode: string, startupTimeoutMs = 1_000) {
@@ -60,8 +67,14 @@ describe("ClaudeCodeAdapter", () => {
   });
 
   it("constructs only locally documented flags and derives known families", () => {
+    expect(adapter("success").workspaceIsolation).toEqual({ readOnly: "enforced", workspaceWrite: "unverified" });
     expect(buildClaudeCodeArgs([], "sonnet", "{}", "session-1")).toEqual([
       "--print", "--output-format", "json", "--json-schema", "{}", "--model", "sonnet", "--resume", "session-1",
+    ]);
+    expect(buildClaudeCodeArgs([], "sonnet", "{}", null, "read-only")).toEqual([
+      "--print", "--output-format", "json", "--json-schema", "{}",
+      "--tools", "", "--disallowedTools", "mcp__*", "--strict-mcp-config", "--setting-sources", "", "--permission-mode", "plan", "--no-session-persistence",
+      "--model", "sonnet",
     ]);
     expect(inferClaudeModelFamily("claude-opus-4-1")).toBe("opus");
     expect(inferClaudeModelFamily("custom-model")).toBeNull();

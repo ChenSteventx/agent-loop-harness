@@ -27,6 +27,13 @@ export interface ProviderCapabilities {
   resume: boolean;
 }
 
+export type ProviderWorkspaceIsolationLevel = "enforced" | "unverified";
+
+export interface ProviderWorkspaceIsolation {
+  readOnly: ProviderWorkspaceIsolationLevel;
+  workspaceWrite: ProviderWorkspaceIsolationLevel;
+}
+
 export interface ProviderProbe {
   available: boolean;
   identity: ProviderIdentity;
@@ -72,6 +79,7 @@ export interface ProviderRunResult {
 }
 
 export interface ProviderAdapter {
+  readonly workspaceIsolation?: ProviderWorkspaceIsolation;
   probe(): Promise<ProviderProbe>;
   run(request: ProviderRunRequest): Promise<ProviderRunResult>;
   resume?(threadId: string, request: ProviderRunRequest): Promise<ProviderRunResult>;
@@ -120,6 +128,11 @@ export function resolveCodexLaunch(options: CodexLaunchOptions = {}): CodexLaunc
 }
 
 export class CodexCliAdapter implements ProviderAdapter {
+  readonly workspaceIsolation: ProviderWorkspaceIsolation = {
+    readOnly: "enforced",
+    workspaceWrite: "enforced",
+  };
+
   private readonly executable: string;
   private readonly baseArgs: readonly string[];
   private readonly provider: string;
@@ -210,6 +223,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       ...this.baseArgs,
       "exec",
       "--ignore-user-config",
+      "--ignore-rules",
       "--json",
       "--sandbox",
       request.workspaceAccess ?? this.sandbox,
@@ -219,6 +233,8 @@ export class CodexCliAdapter implements ProviderAdapter {
       ),
       "-c",
       'approval_policy="never"',
+      "-c",
+      "features.hooks=false",
       ...windowsSandboxConfigArgs(process.platform, this.environment),
       "-C",
       resolve(request.cwd),

@@ -1,8 +1,10 @@
-import type {
-  ProviderAdapter,
-  ProviderFailureClass,
-  ProviderRunRequest,
-  ProviderRunResult,
+import { resolve } from "node:path";
+import {
+  classifyProviderFailure,
+  type ProviderAdapter,
+  type ProviderFailureClass,
+  type ProviderRunRequest,
+  type ProviderRunResult,
 } from "./provider.js";
 
 export type ProviderSupervisorDisposition = "succeeded" | "fallback" | "blocked";
@@ -22,7 +24,14 @@ export interface ProviderFallbackRecord {
 }
 
 export interface ProviderSupervisorPersistence {
-  saveCheckpoint(checkpoint: { invocationId: string; provider: string; threadId: string | null }): void;
+  saveCheckpoint(checkpoint: {
+    invocationId: string;
+    provider: string;
+    threadId: string | null;
+    selectedAdapterIndex: number;
+    attempt: number;
+    result: ProviderRunResult;
+  }): void;
   saveFailure(evidence: ProviderFailureEvidence): void;
   saveFallback(record: ProviderFallbackRecord): void;
 }
@@ -30,10 +39,13 @@ export interface ProviderSupervisorPersistence {
 export interface ProviderSupervisorResult {
   disposition: ProviderSupervisorDisposition;
   result: ProviderRunResult | null;
+  selectedAdapterIndex: number | null;
   failures: ProviderFailureEvidence[];
   fallbackHistory: ProviderFallbackRecord[];
   recoveryCommand: string | null;
 }
+
+export type ProviderResultValidator = (result: ProviderRunResult) => boolean;
 
 export interface ProviderSupervisorOptions {
   adapters: readonly ProviderAdapter[];
@@ -80,10 +92,13 @@ export class ProviderSupervisor {
     this.sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   }
 
-  async run(request: ProviderRunRequest): Promise<ProviderSupervisorResult> {
+  async run(
+    request: ProviderRunRequest,
+    validateResult: ProviderResultValidator = () => true,
+  ): Promise<ProviderSupervisorResult> {
     const failures: ProviderFailureEvidence[] = [];
     const fallbackHistory: ProviderFallbackRecord[] = [];
-    for (const adapter of this.adapters) {
+    for (const [adapterIndex, adapter] of this.adapters.entries()) {
       if (this.isCoolingDown(adapter)) {
         const provider = this.cooldowns.get(adapter)?.provider ?? "unknown";
         this.recordFallback({ fromProvider: provider, reason: "cooldown" }, fallbackHistory);
@@ -92,19 +107,38 @@ export class ProviderSupervisor {
 
       let attempt = 1;
       while (attempt <= 2) {
-        const result = await adapter.run({
+        const attemptRequest = {
           ...request,
           invocationId: attempt === 1 ? request.invocationId : `${request.invocationId}:retry`,
           artifactDirectory: attempt === 1 ? request.artifactDirectory : `${request.artifactDirectory}/retry`,
-        });
+        };
+        let providerResult: ProviderRunResult;
+        try {
+          providerResult = await adapter.run(attemptRequest);
+        } catch (error) {
+          providerResult = adapterExceptionResult(attemptRequest, adapterIndex, error);
+        }
+        const result = providerResult.ok && !validResult(validateResult, providerResult)
+          ? { ...providerResult, ok: false, failureClass: "invalid_output" as const }
+          : providerResult;
         if (result.ok) {
           this.cooldowns.delete(adapter);
           this.persistence.saveCheckpoint({
             invocationId: request.invocationId,
             provider: result.identity.provider,
             threadId: result.threadId,
+            selectedAdapterIndex: adapterIndex,
+            attempt,
+            result,
           });
-          return { disposition: "succeeded", result, failures, fallbackHistory, recoveryCommand: null };
+          return {
+            disposition: "succeeded",
+            result,
+            selectedAdapterIndex: adapterIndex,
+            failures,
+            fallbackHistory,
+            recoveryCommand: null,
+          };
         }
 
         const failureClass = result.failureClass ?? "unknown";
@@ -122,13 +156,13 @@ export class ProviderSupervisor {
 
         if (failureClass === "auth") {
           return {
-            disposition: "blocked", result, failures, fallbackHistory,
+            disposition: "blocked", result, selectedAdapterIndex: null, failures, fallbackHistory,
             recoveryCommand: this.authRecoveryCommand,
           };
         }
         if (failureClass === "unknown") {
           return {
-            disposition: "blocked", result, failures, fallbackHistory,
+            disposition: "blocked", result, selectedAdapterIndex: null, failures, fallbackHistory,
             recoveryCommand: this.unknownRecoveryCommand,
           };
         }
@@ -145,6 +179,7 @@ export class ProviderSupervisor {
     return {
       disposition: fallbackHistory.length > 0 ? "fallback" : "blocked",
       result: null,
+      selectedAdapterIndex: null,
       failures,
       fallbackHistory,
       recoveryCommand: null,
@@ -174,9 +209,49 @@ export class ProviderSupervisor {
   }
 }
 
+function validResult(validateResult: ProviderResultValidator, result: ProviderRunResult): boolean {
+  try {
+    return validateResult(result);
+  } catch {
+    return false;
+  }
+}
+
 export function retryAfterMilliseconds(text: string): number | null {
   const match = text.match(/retry-after\s*:\s*(\d+)/iu);
   if (!match) return null;
   const seconds = Number(match[1]);
   return Number.isSafeInteger(seconds) ? seconds * 1_000 : null;
+}
+
+function adapterExceptionResult(
+  request: ProviderRunRequest,
+  adapterIndex: number,
+  error: unknown,
+): ProviderRunResult {
+  const stderr = error instanceof Error ? error.message : String(error);
+  const failureClass = classifyProviderFailure(stderr);
+  return {
+    invocationId: request.invocationId,
+    ok: false,
+    cancelled: false,
+    identity: {
+      provider: `adapter-${adapterIndex}`,
+      model: null,
+      executable: "unknown",
+      version: null,
+    },
+    threadId: null,
+    events: [],
+    finalOutput: null,
+    stderr,
+    exitCode: null,
+    signal: null,
+    durationMs: 0,
+    usage: null,
+    failureClass,
+    eventsPath: resolve(request.artifactDirectory, "events.jsonl"),
+    finalOutputPath: resolve(request.artifactDirectory, "final.json"),
+    stderrPath: resolve(request.artifactDirectory, "stderr.log"),
+  };
 }

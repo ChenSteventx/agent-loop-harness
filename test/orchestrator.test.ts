@@ -332,7 +332,7 @@ describe("Orchestrator", () => {
     expect(view.operations.filter((operation) => operation.kind === "repair")).toHaveLength(1);
     expect(view.operations.filter((operation) => operation.kind === "checkpoint-commit")).toHaveLength(2);
     expect(view.operations.filter((operation) => operation.kind === "verify:check")).toHaveLength(2);
-    expect(provider.requests[1]?.prompt).toContain("Deterministic failure evidence:");
+    expect(provider.requests[1]?.prompt).toContain("Deterministic proof-gap evidence:");
     expect(provider.requests[1]?.prompt).toContain("expected fixed, received broken");
     expect(Number(git(view.worktreePath, ["rev-list", "--count", "HEAD"]))).toBe(3);
     expect(view.evidence.filter((item) => item.kind === "verification_failure")).toHaveLength(1);
@@ -835,5 +835,6 @@ describe("CLI surface", () => {
     for (const command of ["init", "run", "status", "resume", "verify", "mark-merged"]) {
       expect(result.stdout).toContain(command);
     }
+    expect(result.stdout).toContain("--provider-profile");
   });
 });

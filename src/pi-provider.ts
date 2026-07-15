@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
-import type { ProviderAdapter, ProviderFailureClass, ProviderIdentity, ProviderProbe, ProviderRunRequest, ProviderRunResult, ProviderUsage } from "./provider.js";
+import type { ProviderAdapter, ProviderFailureClass, ProviderIdentity, ProviderProbe, ProviderRunRequest, ProviderRunResult, ProviderUsage, ProviderWorkspaceIsolation } from "./provider.js";
 import { classifyProviderFailure } from "./provider.js";
 
 export interface PiModelConfig { id: string; displayName?: string }
@@ -23,6 +23,11 @@ export interface PiAdapterConfig {
 interface PiProbeData { version?: string; rpc?: boolean; json?: boolean; models?: Array<{ id: string; displayName?: string }> }
 
 export class PiAdapter implements ProviderAdapter {
+  readonly workspaceIsolation: ProviderWorkspaceIsolation = {
+    readOnly: "unverified",
+    workspaceWrite: "unverified",
+  };
+
   private readonly config: PiAdapterConfig;
   private readonly executable: string;
   private readonly baseArgs: readonly string[];

@@ -53,10 +53,10 @@ export function selectReviewer(
   risk: Risk,
   availability: ReviewAvailability,
 ): ReviewRoutingDecision {
-  if (availability.primaryAvailable && profile.reviewer.family !== profile.author.family) {
+  if (availability.primaryAvailable && isIndependentReceipt(profile.author, profile.reviewer)) {
     return { disposition: "independent", reviewer: profile.reviewer };
   }
-  if (availability.fallbackAvailable && profile.fallbackReviewer.family !== profile.author.family) {
+  if (availability.fallbackAvailable && isIndependentReceipt(profile.author, profile.fallbackReviewer)) {
     return { disposition: "fallback", reviewer: profile.fallbackReviewer };
   }
   if (risk === "high") return { disposition: "needs-human", reviewer: null };
@@ -64,7 +64,15 @@ export function selectReviewer(
 }
 
 export function isIndependentReceipt(author: ConfiguredProvider, reviewer: ConfiguredProvider): boolean {
-  return author.family !== reviewer.family;
+  return author.family !== reviewer.family && author.adapter !== reviewer.adapter;
+}
+
+export function independentReviewCandidates(profile: ProviderProfile): ConfiguredProvider[] {
+  return [profile.reviewer, profile.fallbackReviewer].filter((candidate, index, candidates) =>
+    isIndependentReceipt(profile.author, candidate) &&
+    candidate.adapter.workspaceIsolation?.readOnly === "enforced" &&
+    candidates.findIndex((item) => item.adapter === candidate.adapter) === index
+  );
 }
 
 export function createReviewerSupervisor(

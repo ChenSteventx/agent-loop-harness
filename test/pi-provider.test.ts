@@ -12,6 +12,10 @@ function adapter(mode: string, route: "highCapability" | "fastAuxiliary" = "high
 afterEach(() => roots.splice(0).forEach((directory) => rmSync(directory, { recursive: true, force: true })));
 
 describe("PiAdapter", () => {
+  it("does not claim workspace isolation that the CLI cannot enforce", () => {
+    expect(adapter("success").workspaceIsolation).toEqual({ readOnly: "unverified", workspaceWrite: "unverified" });
+  });
+
   it("probes RPC and model metadata, then captures identity and usage", async () => {
     const directory = root(); const provider = adapter("success"); const probe = await provider.probe(); const result = await provider.run(request(directory, "run"));
     expect(probe).toMatchObject({ available: true, capabilities: { structuredOutput: true, resume: false }, identity: { provider: "configured-provider", model: "configured-high", modelDisplayName: "Probe High", version: "1.2.3" } });

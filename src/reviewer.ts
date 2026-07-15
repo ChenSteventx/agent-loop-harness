@@ -58,6 +58,7 @@ export interface ReviewerInput {
   diff: string;
   reviewedCommit: string;
   diffHash: string;
+  controlStateHash: string;
   verificationEvidence: readonly VerificationEvidence[];
   allowedRepositoryRoots: readonly string[];
   contextBudget: number;
@@ -66,6 +67,7 @@ export interface ReviewerInput {
 export interface ReviewSnapshot {
   commit: string;
   diffHash: string;
+  controlStateHash: string;
   dirty: boolean;
 }
 
@@ -97,7 +99,12 @@ export async function runReviewer(
     contextBudget: input.contextBudget,
   });
   const after = snapshot();
-  if (after.dirty || after.commit !== input.reviewedCommit || after.diffHash !== input.diffHash) {
+  if (
+    after.dirty ||
+    after.commit !== input.reviewedCommit ||
+    after.diffHash !== input.diffHash ||
+    after.controlStateHash !== input.controlStateHash
+  ) {
     throw new Error("Reviewer violated the read-only workspace boundary or review binding changed");
   }
   const parsed = providerResult.ok ? reviewerOutputSchema.safeParse(providerResult.finalOutput) : null;
@@ -142,7 +149,12 @@ export function hashReviewDiff(diff: string): string {
 
 function validateBinding(input: ReviewerInput, current: ReviewSnapshot): void {
   if (hashReviewDiff(input.diff) !== input.diffHash) throw new Error("Reviewer diff hash does not match the supplied diff");
-  if (current.dirty || current.commit !== input.reviewedCommit || current.diffHash !== input.diffHash) {
+  if (
+    current.dirty ||
+    current.commit !== input.reviewedCommit ||
+    current.diffHash !== input.diffHash ||
+    current.controlStateHash !== input.controlStateHash
+  ) {
     throw new Error("Reviewer input is stale or workspace is dirty");
   }
   if (!Number.isSafeInteger(input.contextBudget) || input.contextBudget <= 0) throw new Error("Reviewer context budget must be a positive integer");

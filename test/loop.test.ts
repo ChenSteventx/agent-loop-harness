@@ -6,6 +6,7 @@ const base: ProofGapSnapshot = {
   template: "solo",
   exploration: "not-required",
   writer: "missing",
+  acceptance: "not-required",
   verification: "missing",
   review: "not-required",
   repairsUsed: 0,
@@ -46,7 +47,10 @@ describe("bounded proof-gap decision", () => {
   it("requires human risk classification and a reviewed proof when applicable", () => {
     expect(decideNextAction({ ...base, risk: "unknown" })).toEqual({ kind: "resolve-risk" });
     expect(decideNextAction({
-      ...base, risk: "high", template: "reviewed", writer: "committed", verification: "passed", review: "missing",
+      ...base, risk: "high", template: "reviewed", writer: "committed", acceptance: "satisfied", verification: "passed", review: "missing",
     })).toEqual({ kind: "review" });
+    expect(decideNextAction({
+      ...base, risk: "high", template: "reviewed", writer: "committed", acceptance: "missing",
+    })).toEqual({ kind: "bind-acceptance" });
   });
 });

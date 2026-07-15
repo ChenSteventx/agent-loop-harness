@@ -11,7 +11,7 @@ import {
   type CandidateCommit,
 } from "./execution.js";
 import type { ProjectAdapter, VerificationCommand } from "./ports.js";
-import type { ProviderAdapter } from "./provider.js";
+import type { ProviderAdapter, ProviderRunRequest, ProviderRunResult } from "./provider.js";
 import { loadTaskSpec } from "./project.js";
 import { SqliteStore } from "./store.js";
 import type { Evidence, Operation, Run } from "./domain.js";
@@ -36,6 +36,21 @@ import {
   defaultRoleOutputSchemas,
   type RoleOutputSchemas,
 } from "./role-output-schemas.js";
+import {
+  independentReviewCandidates,
+  withFallbackOutbox,
+  type ConfiguredProvider,
+  type ProviderProfile,
+} from "./profiles.js";
+import { ProviderSupervisor, type ProviderSupervisorResult } from "./provider-supervisor.js";
+import {
+  hashReviewDiff,
+  isBlockingFinding,
+  reviewReportSchema,
+  reviewerOutputSchema,
+  runReviewer,
+  type VerificationEvidence,
+} from "./reviewer.js";
 
 export function defaultLoopHome(): string {
   return resolve(homedir(), ".agent-loop-harness");
@@ -43,7 +58,8 @@ export function defaultLoopHome(): string {
 
 export interface OrchestratorOptions {
   loopHome?: string;
-  provider: ProviderAdapter;
+  provider?: ProviderAdapter;
+  providerProfile?: ProviderProfile;
   projectAdapter: ProjectAdapter;
   roleOutputSchemas?: Partial<RoleOutputSchemas>;
   /** @deprecated Supply roleOutputSchemas instead. */
@@ -59,6 +75,7 @@ export interface OrchestratorOptions {
     afterWriterOperationCreated?: (role: "author" | "repair") => void;
     afterCandidateEvidenceInstalled?: () => void;
     afterExplorerOperationCompleted?: () => void;
+    afterReviewProviderCompletion?: () => void;
   };
 }
 
@@ -89,10 +106,20 @@ interface WriterProviderCompletion {
   outputHash: string;
 }
 
+interface ReviewProviderCompletion {
+  operationId: string;
+  operationInputHash: string;
+  selectedAdapterIndex: number;
+  attempt: number;
+  configuredReviewer: { family: string; name: string };
+  result: ProviderRunResult;
+}
+
 export class Orchestrator {
   readonly loopHome: string;
   readonly store: SqliteStore;
   private readonly provider: ProviderAdapter;
+  private readonly providerProfile: ProviderProfile | null;
   private readonly projectAdapter: ProjectAdapter;
   private readonly roleOutputSchemas: RoleOutputSchemas;
   private readonly commandRunner: CommandRunner;
@@ -102,6 +129,7 @@ export class Orchestrator {
   private readonly afterWriterOperationCreated?: (role: "author" | "repair") => void;
   private readonly afterCandidateEvidenceInstalled?: () => void;
   private readonly afterExplorerOperationCompleted?: () => void;
+  private readonly afterReviewProviderCompletion?: () => void;
   private readonly explorerContextBudget: number;
   private readonly providerProfileName: string;
   private readonly maxLoopSteps: number;
@@ -110,7 +138,8 @@ export class Orchestrator {
     this.loopHome = resolve(options.loopHome ?? process.env.LOOP_HOME ?? defaultLoopHome());
     mkdirSync(this.loopHome, { recursive: true });
     this.store = new SqliteStore(resolve(this.loopHome, "state.sqlite"));
-    this.provider = options.provider;
+    this.providerProfile = options.providerProfile ?? null;
+    this.provider = this.providerProfile?.author.adapter ?? options.provider ?? missingProvider();
     this.projectAdapter = options.projectAdapter;
     const defaults = defaultRoleOutputSchemas();
     const legacySchema = options.outputSchemaPath ? resolve(options.outputSchemaPath) : null;
@@ -126,8 +155,9 @@ export class Orchestrator {
     this.afterWriterOperationCreated = options.faults?.afterWriterOperationCreated;
     this.afterCandidateEvidenceInstalled = options.faults?.afterCandidateEvidenceInstalled;
     this.afterExplorerOperationCompleted = options.faults?.afterExplorerOperationCompleted;
+    this.afterReviewProviderCompletion = options.faults?.afterReviewProviderCompletion;
     this.explorerContextBudget = options.explorerContextBudget ?? 8_000;
-    this.providerProfileName = options.providerProfileName ?? "LEGACY_SINGLE_PROVIDER";
+    this.providerProfileName = this.providerProfile?.name ?? options.providerProfileName ?? "LEGACY_SINGLE_PROVIDER";
     this.maxLoopSteps = options.maxLoopSteps ?? 32;
     if (!Number.isSafeInteger(this.maxLoopSteps) || this.maxLoopSteps <= 0) {
       throw new Error("maxLoopSteps must be a positive integer");
@@ -255,12 +285,11 @@ export class Orchestrator {
       if (action.kind === "explore") await this.executeExplorer(runId);
       else if (action.kind === "author") await this.executeWriter(runId, "author", action.attempt);
       else if (action.kind === "checkpoint-commit") this.executeCheckpointCommit(runId);
+      else if (action.kind === "bind-acceptance") this.executeAcceptanceBinding(runId);
       else if (action.kind === "verify") await this.executeVerification(runId);
       else if (action.kind === "repair") await this.executeWriter(runId, "repair", action.attempt);
-      else if (action.kind === "review") {
-        this.block(runId, "Independent Reviewer is not configured in the Runtime", "independent-review");
-        return this.status(runId);
-      } else if (action.kind === "advance-ready") {
+      else if (action.kind === "review") await this.executeReview(runId);
+      else if (action.kind === "advance-ready") {
         const commitSha = new GitService(this.requireBoundRun(runId).binding.worktreePath).head();
         this.store.transitionRun(runId, "ready", {}, { commitSha });
         return this.status(runId);
@@ -338,6 +367,43 @@ export class Orchestrator {
         ? "passed"
         : "missing";
 
+    const acceptanceReceipt = this.acceptanceEvidenceReceipt(runId, git.head());
+    const acceptance = binding.executionTemplate !== "reviewed"
+      ? "not-required"
+      : validEvidence.some((item) =>
+          item.kind === "acceptance_binding" && item.dependencyHash === acceptanceReceipt.dependencyHash
+        )
+        ? "satisfied"
+        : "missing";
+
+    let review: ProofGapSnapshot["review"] = "not-required";
+    if (binding.executionTemplate === "reviewed" && acceptance === "satisfied" && verification === "passed") {
+      const candidates = this.safeReviewCandidates();
+      const reviewInput = this.reviewOperationInput(
+        runId,
+        git.head(),
+        hashReviewDiff(git.diffBetween(binding.baselineCommit, git.head())),
+        git.controlStateHash(),
+        candidates,
+      );
+      const reviewOperation = this.store.getOperation(this.reviewOperationId(runId, git.head(), reviewInput));
+      const receipt = validEvidence.find((item) =>
+        item.kind === "independent_review" &&
+        item.commitSha === git.head() &&
+        reviewOperation !== null &&
+        candidates.some((candidate) =>
+          this.matchesReviewEvidence(runId, item, candidate, reviewOperation, reviewInput)
+        )
+      );
+      if (receipt) {
+        review = isRecord(receipt.data) && receipt.data.blocking === true ? "blocking" : "passed";
+      } else if (reviewOperation?.status === "failed") {
+        review = "unavailable";
+      } else {
+        review = "missing";
+      }
+    }
+
     const latestFailure = currentFailures.at(-1);
     const signature = failureEvidenceSignature(latestFailure);
     const repeatedFailure = signature !== null && allEvidence.some((item) =>
@@ -349,8 +415,9 @@ export class Orchestrator {
       template: binding.executionTemplate,
       exploration,
       writer: writerProof,
+      acceptance,
       verification,
-      review: binding.executionTemplate === "reviewed" ? "unavailable" : "not-required",
+      review,
       repairsUsed,
       maximumRepairs: template.maximumRepairs,
       repeatedFailure,
@@ -360,6 +427,15 @@ export class Orchestrator {
   private async executeExplorer(runId: string): Promise<void> {
     const run = this.requireBoundRun(runId);
     const binding = run.binding;
+    if (this.providerProfile && this.provider.workspaceIsolation?.readOnly !== "enforced") {
+      this.requireHumanReview(
+        runId,
+        "The configured Explorer cannot prove read-only isolation",
+        { profile: this.providerProfile.name, author: configuredProviderFact(this.providerProfile.author) },
+        "provider-isolation",
+      );
+      return;
+    }
     const operation = this.store.createOperation({
       id: `${runId}:explorer`,
       runId,
@@ -428,6 +504,15 @@ export class Orchestrator {
   ): Promise<void> {
     const run = this.requireBoundRun(runId);
     const binding = run.binding;
+    if (this.providerProfile && this.provider.workspaceIsolation?.workspaceWrite !== "enforced") {
+      this.requireHumanReview(
+        runId,
+        "The configured Author cannot prove workspace-write isolation",
+        { profile: this.providerProfile.name, author: configuredProviderFact(this.providerProfile.author) },
+        "provider-isolation",
+      );
+      return;
+    }
     const git = new GitService(binding.worktreePath);
     if (git.isDirty()) {
       this.block(runId, `${role} cannot start from a dirty worktree`, "worktree");
@@ -435,7 +520,9 @@ export class Orchestrator {
     }
     const failureEvidence = role === "repair"
       ? this.store.listEvidence(runId, "valid").filter((item) =>
-          item.kind === "verification_failure" && item.commitSha === git.head()
+          item.commitSha === git.head() &&
+          (item.kind === "verification_failure" ||
+            (item.kind === "independent_review" && isRecord(item.data) && item.data.blocking === true))
         )
       : [];
     const operationId = role === "author" ? `${runId}:author` : `${runId}:repair:${attempt}`;
@@ -446,6 +533,7 @@ export class Orchestrator {
       gitControlHash: git.controlStateHash(),
       taskSpecHash: binding.taskSpecHash,
       acceptanceHash: binding.acceptanceHash,
+      configuredAuthor: this.providerProfile ? configuredProviderFact(this.providerProfile.author) : null,
       failureEvidenceIds: failureEvidence.map((item) => item.id),
       failureSignatures: failureEvidence.map(failureEvidenceSignature).filter((value): value is string => value !== null),
     };
@@ -538,6 +626,232 @@ export class Orchestrator {
     const candidate = this.ensureCandidateCommit(runId, git, writer.id, commitAttempt, input.baseCommit);
     if (!candidate) return;
     this.afterCandidateEvidenceInstalled?.();
+  }
+
+  private executeAcceptanceBinding(runId: string): void {
+    const run = this.requireBoundRun(runId);
+    const git = new GitService(run.binding.worktreePath);
+    if (git.isDirty()) {
+      this.block(runId, "Acceptance binding requires a clean Harness candidate", "acceptance-binding");
+      return;
+    }
+    const receipt = this.acceptanceEvidenceReceipt(runId, git.head());
+    let operation = this.store.createOperation({
+      id: receipt.operationId,
+      runId,
+      kind: "acceptance-binding",
+      idempotencyKey: receipt.operationId,
+      input: receipt.operationInput,
+    });
+    if (operation.status === "running") {
+      operation = this.store.finishOperation(operation.id, "succeeded", {
+        commitSha: git.head(),
+        taskSpecHash: run.binding.taskSpecHash,
+        acceptanceHash: run.binding.acceptanceHash,
+        policyVersion: run.binding.policyVersion,
+        acceptance: run.binding.taskSpec.acceptance,
+      });
+    }
+    if (operation.status !== "succeeded") {
+      this.block(runId, "Acceptance binding could not be established", operation.id);
+      return;
+    }
+    this.store.installEvidence({
+      id: `${runId}:evidence:acceptance:${receipt.dependencyHash.slice(0, 12)}`,
+      runId,
+      operationId: operation.id,
+      kind: "acceptance_binding",
+      commitSha: git.head(),
+      policyVersion: run.binding.policyVersion,
+      stepId: receipt.stepId,
+      dependencyHash: receipt.dependencyHash,
+      dependencies: receipt.dependencies,
+      data: operation.result,
+    });
+  }
+
+  private async executeReview(runId: string): Promise<void> {
+    const run = this.requireBoundRun(runId);
+    const candidates = this.safeReviewCandidates();
+    if (!this.providerProfile || candidates.length === 0) {
+      this.requireHumanReview(
+        runId,
+        "No independently configured Reviewer can prove read-only isolation",
+        {
+          profile: this.providerProfile?.name ?? null,
+          author: this.providerProfile ? configuredProviderFact(this.providerProfile.author) : null,
+          configuredReviewers: this.providerProfile
+            ? [this.providerProfile.reviewer, this.providerProfile.fallbackReviewer].map(configuredProviderFact)
+            : [],
+        },
+        "independent-review",
+      );
+      return;
+    }
+
+    const binding = run.binding;
+    const git = new GitService(binding.worktreePath);
+    if (git.isDirty()) {
+      this.requireHumanReview(
+        runId,
+        "Independent review requires a clean Harness candidate",
+        { commitSha: git.head() },
+        "independent-review",
+      );
+      return;
+    }
+    const reviewedCommit = git.head();
+    const diff = git.diffBetween(binding.baselineCommit, reviewedCommit);
+    const diffHash = hashReviewDiff(diff);
+    const controlStateHash = git.controlStateHash();
+    const operationInput = this.reviewOperationInput(runId, reviewedCommit, diffHash, controlStateHash, candidates);
+    const operationId = this.reviewOperationId(runId, reviewedCommit, operationInput);
+    let operation = this.store.createOperation({
+      id: operationId,
+      runId,
+      kind: "independent-review",
+      idempotencyKey: operationId,
+      input: operationInput,
+    });
+    if (operation.status === "succeeded") {
+      if (!this.installSavedReviewEvidence(runId, operation, candidates)) {
+        this.requireHumanReview(
+          runId,
+          "Saved independent review cannot prove a valid bound receipt",
+          { operationId: operation.id },
+          operation.id,
+        );
+      }
+      return;
+    }
+    if (operation.status === "failed") {
+      this.requireHumanReview(
+        runId,
+        "Independent review previously failed",
+        { operationId: operation.id, result: operation.result },
+        operation.id,
+      );
+      return;
+    }
+
+    const savedCompletion = this.reviewProviderCompletion(runId, operation.id);
+    if (savedCompletion) {
+      this.recoverReviewOperation(runId, operation, candidates, savedCompletion);
+      return;
+    }
+
+    const persistence = withFallbackOutbox({
+      saveCheckpoint: (checkpoint) => {
+        const selected = candidates[checkpoint.selectedAdapterIndex];
+        if (!selected) throw new Error("Provider Supervisor selected an unknown Reviewer adapter");
+        this.store.appendEvent(runId, "review.provider-completed", {
+          operationId: operation.id,
+          operationInputHash: operation.inputHash,
+          selectedAdapterIndex: checkpoint.selectedAdapterIndex,
+          attempt: checkpoint.attempt,
+          configuredReviewer: configuredProviderFact(selected),
+          result: checkpoint.result,
+        });
+        this.store.appendEvent(runId, "provider.checkpoint", {
+          invocationId: checkpoint.invocationId,
+          provider: checkpoint.provider,
+          threadId: checkpoint.threadId,
+          selectedAdapterIndex: checkpoint.selectedAdapterIndex,
+          attempt: checkpoint.attempt,
+        });
+        try {
+          this.afterReviewProviderCompletion?.();
+        } catch (error) {
+          throw new ReviewProviderCompletionInterruption(errorMessage(error));
+        }
+      },
+      saveFailure: (failure) => this.store.appendEvent(runId, "provider.failure", failure),
+      saveFallback: (fallback) => this.store.appendEvent(runId, "provider.fallback", fallback),
+    }, this.store, runId);
+    const supervisor = new ProviderSupervisor({
+      adapters: candidates.map((candidate) => candidate.adapter),
+      persistence,
+      authRecoveryCommand: `Authenticate the configured Reviewer, then run: agent-loop resume --run-id ${runId}`,
+      unknownRecoveryCommand: `Inspect Reviewer artifacts, then run: agent-loop resume --run-id ${runId}`,
+    });
+    const supervised = new SupervisedReviewerAdapter(supervisor);
+    const verificationEvidence = this.reviewVerificationEvidence(runId, reviewedCommit);
+    const reviewDirectory = resolve(this.loopHome, "runs", runId, "review", reviewedCommit);
+    const reviewerCwd = resolve(reviewDirectory, "workspace");
+    mkdirSync(reviewerCwd, { recursive: true });
+    try {
+      const result = await runReviewer(supervised, {
+        task: binding.taskSpec,
+        diff,
+        reviewedCommit,
+        diffHash,
+        controlStateHash,
+        verificationEvidence,
+        allowedRepositoryRoots: [reviewerCwd],
+        contextBudget: this.explorerContextBudget,
+      }, () => ({
+        commit: git.head(),
+        diffHash: hashReviewDiff(git.diffBetween(binding.baselineCommit, git.head())),
+        controlStateHash: git.controlStateHash(),
+        dirty: git.isDirty(),
+      }), {
+        invocationId: operation.id,
+        cwd: reviewerCwd,
+        artifactDirectory: resolve(reviewDirectory, "artifacts"),
+        outputSchemaPath: this.roleOutputSchemas.reviewer,
+      });
+      const outcome = supervised.outcome;
+      const selected = outcome?.selectedAdapterIndex === null || outcome?.selectedAdapterIndex === undefined
+        ? null
+        : candidates[outcome.selectedAdapterIndex] ?? null;
+      if (!result.report || !outcome?.result || !selected) {
+        const providerBlock = {
+          reason: "No configured independent Reviewer produced a valid structured report",
+          supervisor: outcome,
+        };
+        this.store.appendEvent(runId, "review.provider-blocked", {
+          operationId: operation.id,
+          operationInputHash: operation.inputHash,
+          ...providerBlock,
+        });
+        this.requireHumanReview(runId, "Independent review is unavailable", providerBlock, "provider-recovery");
+        return;
+      }
+      this.store.recordAgentCall(runId, {
+        role: "reviewer",
+        provider: result.provider.identity.provider,
+        latencyMs: result.provider.durationMs,
+        usage: result.provider.usage,
+      });
+      const blockingFindings = result.report.findings.filter((finding) => isBlockingFinding(finding));
+      operation = this.store.finishOperation(operation.id, "succeeded", {
+        report: result.report,
+        blocking: blockingFindings.length > 0,
+        blockingFindingIds: blockingFindings.map((finding) => finding.id),
+        reviewedCommit,
+        diffHash,
+        selectedReviewer: {
+          configuredFamily: selected.family,
+          configuredName: selected.name,
+          observedIdentity: result.provider.identity,
+        },
+        supervisor: outcome,
+      });
+      if (!this.installSavedReviewEvidence(runId, operation, candidates)) {
+        this.requireHumanReview(
+          runId,
+          "Completed independent review could not be bound to its configured Reviewer",
+          { operationId: operation.id },
+          operation.id,
+        );
+      }
+    } catch (error) {
+      if (error instanceof ReviewProviderCompletionInterruption) throw error;
+      operation = this.store.finishOperation(operation.id, "failed", {
+        reason: `Independent Reviewer violated its boundary or the review binding changed: ${errorMessage(error)}`,
+      });
+      this.requireHumanReview(runId, "Independent Reviewer boundary check failed", operation.result, operation.id);
+    }
   }
 
   private async executeVerification(runId: string): Promise<void> {
@@ -652,6 +966,282 @@ export class Orchestrator {
       dependencies: receipt.dependencies,
       data: { report: report.data, result: operation.result },
     });
+  }
+
+  private acceptanceEvidenceReceipt(runId: string, commitSha: string): {
+    operationId: string;
+    operationInput: unknown;
+    dependencies: ReturnType<typeof evidenceDependencies>;
+    dependencyHash: string;
+    stepId: string;
+  } {
+    const run = this.requireBoundRun(runId);
+    const stepId = "acceptance-binding";
+    const operationId = `${runId}:acceptance-binding:${commitSha}`;
+    const operationInput = {
+      role: "acceptance-binding",
+      commitSha,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+    };
+    const dependencies = evidenceDependencies({
+      commitSha,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      operationInputHash: operationInputHash(operationInput),
+    });
+    return { operationId, operationInput, dependencies, dependencyHash: evidenceDependencyHash(dependencies), stepId };
+  }
+
+  private safeReviewCandidates(): ConfiguredProvider[] {
+    return this.providerProfile ? independentReviewCandidates(this.providerProfile) : [];
+  }
+
+  private reviewOperationId(runId: string, commitSha: string, operationInput: unknown): string {
+    return `${runId}:independent-review:${commitSha}:${operationInputHash(operationInput).slice(0, 16)}`;
+  }
+
+  private reviewOperationInput(
+    runId: string,
+    reviewedCommit: string,
+    diffHash: string,
+    controlStateHash: string,
+    candidates: readonly ConfiguredProvider[],
+  ): unknown {
+    const run = this.requireBoundRun(runId);
+    return {
+      role: "independent-review",
+      baselineCommit: run.binding.baselineCommit,
+      reviewedCommit,
+      diffHash,
+      controlStateHash,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+      verificationDependencyHashes: this.store.listEvidence(runId, "valid")
+        .filter((item) => item.kind === "command" && item.commitSha === reviewedCommit && item.stepId.startsWith("verify:"))
+        .map((item) => item.dependencyHash)
+        .sort(),
+      configuredAuthor: this.providerProfile ? configuredProviderFact(this.providerProfile.author) : null,
+      configuredReviewers: candidates.map(configuredProviderFact),
+    };
+  }
+
+  private reviewEvidenceReceipt(
+    runId: string,
+    commitSha: string,
+    operationInput: unknown,
+    reviewer: ConfiguredProvider,
+  ): {
+    dependencies: ReturnType<typeof evidenceDependencies>;
+    dependencyHash: string;
+    stepId: string;
+  } {
+    const run = this.requireBoundRun(runId);
+    const stepId = `independent-review:${reviewer.family}:${reviewer.name}`;
+    const dependencies = evidenceDependencies({
+      commitSha,
+      taskSpecHash: run.binding.taskSpecHash,
+      acceptanceHash: run.binding.acceptanceHash,
+      policyVersion: run.binding.policyVersion,
+      stepId,
+      operationInputHash: operationInputHash(operationInput),
+    });
+    return { dependencies, dependencyHash: evidenceDependencyHash(dependencies), stepId };
+  }
+
+  private matchesReviewEvidence(
+    runId: string,
+    evidence: Evidence,
+    reviewer: ConfiguredProvider,
+    operation: Operation,
+    currentInput: unknown,
+  ): boolean {
+    if (
+      operation.status !== "succeeded" ||
+      evidence.operationId !== operation.id ||
+      operationInputHash(operation.input) !== operationInputHash(currentInput) ||
+      !isRecord(evidence.data)
+    ) return false;
+    const selected = isRecord(evidence.data.selectedReviewer) ? evidence.data.selectedReviewer : null;
+    if (
+      selected?.configuredFamily !== reviewer.family ||
+      selected.configuredName !== reviewer.name
+    ) return false;
+    const receipt = this.reviewEvidenceReceipt(runId, evidence.commitSha, operation.input, reviewer);
+    return evidence.dependencyHash === receipt.dependencyHash;
+  }
+
+  private installSavedReviewEvidence(
+    runId: string,
+    operation: Operation,
+    candidates: readonly ConfiguredProvider[],
+  ): Evidence | null {
+    if (operation.status !== "succeeded" || !isRecord(operation.result)) return null;
+    const selectedFact = isRecord(operation.result.selectedReviewer) ? operation.result.selectedReviewer : null;
+    const selected = candidates.find((candidate) =>
+      candidate.family === selectedFact?.configuredFamily && candidate.name === selectedFact.configuredName
+    );
+    const report = reviewReportSchema.safeParse(operation.result.report);
+    const reviewedCommit = operation.result.reviewedCommit;
+    const diffHash = operation.result.diffHash;
+    if (!selected || !report.success || typeof reviewedCommit !== "string" || typeof diffHash !== "string") return null;
+    const run = this.requireBoundRun(runId);
+    const expectedInput = this.reviewOperationInput(
+      runId,
+      reviewedCommit,
+      diffHash,
+      new GitService(run.binding.worktreePath).controlStateHash(),
+      candidates,
+    );
+    if (operationInputHash(operation.input) !== operationInputHash(expectedInput)) return null;
+    const receipt = this.reviewEvidenceReceipt(runId, reviewedCommit, operation.input, selected);
+    return this.store.installEvidence({
+      id: `${runId}:evidence:review:${receipt.dependencyHash.slice(0, 12)}`,
+      runId,
+      operationId: operation.id,
+      kind: "independent_review",
+      commitSha: reviewedCommit,
+      policyVersion: this.requireBoundRun(runId).binding.policyVersion,
+      stepId: receipt.stepId,
+      dependencyHash: receipt.dependencyHash,
+      dependencies: receipt.dependencies,
+      data: {
+        report: report.data,
+        blocking: operation.result.blocking === true,
+        blockingFindingIds: operation.result.blockingFindingIds,
+        reviewedCommit,
+        diffHash,
+        selectedReviewer: selectedFact,
+      },
+    });
+  }
+
+  private reviewVerificationEvidence(runId: string, commitSha: string): VerificationEvidence[] {
+    return this.store.listEvidence(runId, "valid").flatMap((item) => {
+      if (item.kind !== "command" || item.commitSha !== commitSha || !item.stepId.startsWith("verify:") || !isRecord(item.data)) {
+        return [];
+      }
+      if (!Array.isArray(item.data.argv) || item.data.argv.some((part) => typeof part !== "string") || item.data.exitCode !== 0) {
+        return [];
+      }
+      return [{ command: item.data.argv as string[], exitCode: 0, commitSha, result: "passed" }];
+    });
+  }
+
+  private reviewProviderCompletion(runId: string, operationId: string): ReviewProviderCompletion | null {
+    const event = [...this.store.listEvents(runId)].reverse().find((item) =>
+      item.type === "review.provider-completed" &&
+      isRecord(item.data) &&
+      item.data.operationId === operationId
+    );
+    if (!event || !isRecord(event.data)) return null;
+    const data = event.data;
+    const configuredReviewer = isRecord(data.configuredReviewer) ? data.configuredReviewer : null;
+    const result = providerRunResultFromUnknown(data.result);
+    if (
+      typeof data.operationId !== "string" ||
+      typeof data.operationInputHash !== "string" ||
+      typeof data.selectedAdapterIndex !== "number" ||
+      !Number.isSafeInteger(data.selectedAdapterIndex) ||
+      data.selectedAdapterIndex < 0 ||
+      typeof data.attempt !== "number" ||
+      !Number.isSafeInteger(data.attempt) ||
+      data.attempt <= 0 ||
+      typeof configuredReviewer?.family !== "string" ||
+      typeof configuredReviewer.name !== "string" ||
+      !result
+    ) return null;
+    return {
+      operationId: data.operationId,
+      operationInputHash: data.operationInputHash,
+      selectedAdapterIndex: data.selectedAdapterIndex,
+      attempt: data.attempt,
+      configuredReviewer: { family: configuredReviewer.family, name: configuredReviewer.name },
+      result,
+    };
+  }
+
+  private recoverReviewOperation(
+    runId: string,
+    operation: Operation,
+    candidates: readonly ConfiguredProvider[],
+    completion: ReviewProviderCompletion,
+  ): void {
+    const run = this.requireBoundRun(runId);
+    const input = reviewOperationData(operation.input);
+    const selected = candidates[completion.selectedAdapterIndex];
+    const git = new GitService(run.binding.worktreePath);
+    const currentDiffHash = hashReviewDiff(git.diffBetween(run.binding.baselineCommit, git.head()));
+    const boundaryViolation =
+      completion.operationInputHash !== operation.inputHash ||
+      completion.operationId !== operation.id ||
+      !selected ||
+      selected.family !== completion.configuredReviewer.family ||
+      selected.name !== completion.configuredReviewer.name ||
+      git.isDirty() ||
+      git.head() !== input.reviewedCommit ||
+      currentDiffHash !== input.diffHash ||
+      git.controlStateHash() !== input.controlStateHash;
+    const report = boundaryViolation ? null : reviewReportFromProvider(completion.result, input.reviewedCommit);
+    if (boundaryViolation || !report) {
+      const failed = this.store.finishOperation(operation.id, "failed", {
+        reason: boundaryViolation
+          ? "Recovered Reviewer completion no longer matches the bound Git or Provider configuration"
+          : "Recovered Reviewer completion has invalid structured output",
+        providerCompletion: completion,
+      });
+      this.requireHumanReview(runId, "Independent Reviewer recovery failed closed", failed.result, failed.id);
+      return;
+    }
+    this.store.recordAgentCall(runId, {
+      role: "reviewer",
+      provider: completion.result.identity.provider,
+      latencyMs: completion.result.durationMs,
+      usage: completion.result.usage,
+    });
+    const blockingFindings = report.findings.filter((finding) => isBlockingFinding(finding));
+    const completed = this.store.finishOperation(operation.id, "succeeded", {
+      report,
+      blocking: blockingFindings.length > 0,
+      blockingFindingIds: blockingFindings.map((finding) => finding.id),
+      reviewedCommit: input.reviewedCommit,
+      diffHash: input.diffHash,
+      selectedReviewer: {
+        configuredFamily: selected.family,
+        configuredName: selected.name,
+        observedIdentity: completion.result.identity,
+      },
+      recoveredAfterProviderCompletion: true,
+      providerCompletion: completion,
+    });
+    if (!this.installSavedReviewEvidence(runId, completed, candidates)) {
+      this.requireHumanReview(
+        runId,
+        "Recovered independent review could not be bound to Evidence",
+        { operationId: completed.id },
+        completed.id,
+      );
+    }
+  }
+
+  private requireHumanReview(runId: string, reason: string, evidence: unknown, checkpointRef: string): void {
+    const question = `${reason}. How should this Run proceed?`;
+    if (!this.store.listHumanInbox(runId).some((item) => item.question === question)) {
+      this.store.createHumanInbox(runId, {
+        question,
+        options: ["configure-independent-reviewer", "inspect-evidence", "cancel"],
+        recommendation: "configure-independent-reviewer",
+        evidence,
+        risk: "high",
+        consequence: "The Harness will not mark this candidate ready without the required independent proof",
+        resumeCommand: `agent-loop resume --run-id ${runId}`,
+      });
+    }
+    this.block(runId, reason, checkpointRef);
   }
 
   private reconcileCommitBoundEvidence(runId: string, currentCommit: string): void {
@@ -1256,7 +1846,7 @@ function repairPrompt(
     `Goal: ${task.goal}`,
     `Acceptance: ${JSON.stringify(task.acceptance)}`,
     `Current candidate commit: ${currentCommit}`,
-    `Deterministic failure evidence: ${JSON.stringify(failureEvidence.map((item) => ({ id: item.id, data: item.data })))}`,
+    `Deterministic proof-gap evidence: ${JSON.stringify(failureEvidence.map((item) => ({ id: item.id, kind: item.kind, data: item.data })))}`,
     "Fix only the demonstrated failure within the task scope.",
     "Edit files only; do not run git add, git commit, or change Git metadata.",
     "Leave a non-empty working diff for the Harness to inspect and commit deterministically.",
@@ -1283,4 +1873,129 @@ function commandArtifactText(value: unknown, field: "stdoutPath" | "stderrPath")
   } catch {
     return "";
   }
+}
+
+class SupervisedReviewerAdapter implements ProviderAdapter {
+  readonly workspaceIsolation = { readOnly: "enforced", workspaceWrite: "unverified" } as const;
+  outcome: ProviderSupervisorResult | null = null;
+
+  constructor(private readonly supervisor: ProviderSupervisor) {}
+
+  async probe() {
+    return {
+      available: true,
+      identity: supervisorIdentity(),
+      error: null,
+    };
+  }
+
+  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    this.outcome = await this.supervisor.run(
+      request,
+      (result) => reviewerOutputSchema.safeParse(result.finalOutput).success,
+    );
+    return this.outcome.result ?? unavailableReviewResult(request);
+  }
+
+  async cancel(): Promise<boolean> {
+    return false;
+  }
+}
+
+class ReviewProviderCompletionInterruption extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReviewProviderCompletionInterruption";
+  }
+}
+
+function reviewOperationData(value: unknown): {
+  reviewedCommit: string;
+  diffHash: string;
+  controlStateHash: string;
+} {
+  if (
+    !isRecord(value) ||
+    typeof value.reviewedCommit !== "string" ||
+    typeof value.diffHash !== "string" ||
+    typeof value.controlStateHash !== "string"
+  ) throw new Error("Review operation has invalid persisted input");
+  return {
+    reviewedCommit: value.reviewedCommit,
+    diffHash: value.diffHash,
+    controlStateHash: value.controlStateHash,
+  };
+}
+
+function providerRunResultFromUnknown(value: unknown): ProviderRunResult | null {
+  if (
+    !isRecord(value) ||
+    value.ok !== true ||
+    typeof value.invocationId !== "string" ||
+    !isRecord(value.identity) ||
+    typeof value.identity.provider !== "string" ||
+    typeof value.identity.executable !== "string" ||
+    !Array.isArray(value.events) ||
+    typeof value.stderr !== "string" ||
+    typeof value.durationMs !== "number" ||
+    typeof value.eventsPath !== "string" ||
+    typeof value.finalOutputPath !== "string" ||
+    typeof value.stderrPath !== "string"
+  ) return null;
+  return value as unknown as ProviderRunResult;
+}
+
+function reviewReportFromProvider(result: ProviderRunResult, reviewedCommit: string) {
+  const parsed = reviewerOutputSchema.safeParse(result.finalOutput);
+  if (!result.ok || !parsed.success) return null;
+  return reviewReportSchema.parse({
+    findings: parsed.data.findings.map((finding) => ({
+      ...finding,
+      reviewerIdentity: {
+        provider: result.identity.provider,
+        model: result.identity.model,
+        executable: result.identity.executable,
+        version: result.identity.version,
+      },
+      reviewedCommit,
+    })),
+  });
+}
+
+function unavailableReviewResult(request: ProviderRunRequest): ProviderRunResult {
+  return {
+    invocationId: request.invocationId,
+    ok: false,
+    cancelled: false,
+    identity: supervisorIdentity(),
+    threadId: null,
+    events: [],
+    finalOutput: null,
+    stderr: "No configured independent Reviewer produced a valid result",
+    exitCode: null,
+    signal: null,
+    durationMs: 0,
+    usage: null,
+    failureClass: "unavailable",
+    eventsPath: resolve(request.artifactDirectory, "events.jsonl"),
+    finalOutputPath: resolve(request.artifactDirectory, "final.json"),
+    stderrPath: resolve(request.artifactDirectory, "stderr.log"),
+  };
+}
+
+function supervisorIdentity() {
+  return {
+    provider: "provider-supervisor",
+    model: null,
+    executable: "agent-loop-harness",
+    version: null,
+  };
+}
+
+function configuredProviderFact(provider: ConfiguredProvider): { family: string; name: string } {
+  return { family: provider.family, name: provider.name };
+}
+
+function missingProvider(): never {
+  throw new Error("Orchestrator requires either provider or providerProfile");
 }

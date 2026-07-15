@@ -10,6 +10,7 @@ import type {
   ProviderRunRequest,
   ProviderRunResult,
   ProviderUsage,
+  ProviderWorkspaceIsolation,
 } from "./provider.js";
 import { classifyProviderFailure } from "./provider.js";
 
@@ -28,6 +29,11 @@ export interface ClaudeCodeAdapterConfig {
 const CAPABILITIES: ProviderCapabilities = { structuredOutput: true, resume: true };
 
 export class ClaudeCodeAdapter implements ProviderAdapter {
+  readonly workspaceIsolation: ProviderWorkspaceIsolation = {
+    readOnly: "enforced",
+    workspaceWrite: "unverified",
+  };
+
   private readonly executable: string;
   private readonly baseArgs: readonly string[];
   private readonly model: string | null;
@@ -109,7 +115,16 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     const finalOutputPath = resolve(artifactDirectory, "final.json");
     const stderrPath = resolve(artifactDirectory, "stderr.log");
     const schema = readFileSync(resolve(request.outputSchemaPath), "utf8");
-    const args = buildClaudeCodeArgs(this.baseArgs, this.model, schema, resumeSessionId);
+    const args = buildClaudeCodeArgs(
+      this.baseArgs,
+      this.model,
+      schema,
+      resumeSessionId,
+      request.workspaceAccess ?? "workspace-write",
+    );
+    const invocationEnvironment = request.workspaceAccess === "read-only"
+      ? { ...this.environment, CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" }
+      : this.environment;
     const started = Date.now();
     let stdout = "";
     let stderr = "";
@@ -119,7 +134,7 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     const completion = await new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((done) => {
       const child = spawn(this.executable, args, {
         cwd: request.cwd,
-        env: this.environment,
+        env: invocationEnvironment,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       });
@@ -197,12 +212,21 @@ export function buildClaudeCodeArgs(
   model: string | null,
   schema: string,
   resumeSessionId: string | null,
+  workspaceAccess: ProviderRunRequest["workspaceAccess"] = "workspace-write",
 ): string[] {
   return [
     ...baseArgs,
     "--print",
     "--output-format", "json",
     "--json-schema", schema,
+    ...(workspaceAccess === "read-only" ? [
+      "--tools", "",
+      "--disallowedTools", "mcp__*",
+      "--strict-mcp-config",
+      "--setting-sources", "",
+      "--permission-mode", "plan",
+      "--no-session-persistence",
+    ] : []),
     ...(model ? ["--model", model] : []),
     ...(resumeSessionId ? ["--resume", resumeSessionId] : []),
   ];
