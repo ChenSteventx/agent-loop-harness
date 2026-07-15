@@ -171,7 +171,8 @@ evaluation
         completedOfflineComparisons: evaluationStore.listOfflineComparisons()
           .filter((comparison) => comparison.status === "completed" && comparison.guardrailsSatisfied).length,
         completedShadowRuns: evaluationStore.listShadowEvaluations().length,
-        humanCanaryApproval: false,
+        humanCanaryApproval: evaluationStore.listCanaryApprovals()
+          .some((approval) => approval.authority === "human" && approval.expiresAt > new Date().toISOString()),
       });
       evaluationStore.recordReadiness(report);
       print(report);

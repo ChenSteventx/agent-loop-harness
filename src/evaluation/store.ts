@@ -13,6 +13,12 @@ import type {
   RollbackDecision,
 } from "../evolution/proposals.js";
 import type { OfflineComparison, ShadowEvaluation } from "./compare.js";
+import type {
+  CanaryApproval,
+  CanaryAssignment,
+  CanaryObservation,
+  EvolutionOutboxEvent,
+} from "../evolution/canary.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -415,6 +421,149 @@ export class EvaluationStore {
     return rows.map((row) => JSON.parse(row.shadow_json) as ShadowEvaluation);
   }
 
+  installCanaryApproval(approval: CanaryApproval): CanaryApproval {
+    const existing = this.getCanaryApproval(approval.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(approval)) throw new Error(`Canary Approval ${approval.id} is immutable`);
+      return existing;
+    }
+    if (approval.authority !== "human" || approval.allowedRisk !== "low") {
+      throw new Error("Canary Approval requires human authority and low-risk scope");
+    }
+    this.database.prepare(
+      `INSERT INTO canary_approvals
+       (id, project_scope, proposal_id, challenger_id, maximum_basis_points, approval_json, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(approval.id, approval.projectScope, approval.proposalId, approval.challengerId,
+      approval.maximumBasisPoints, JSON.stringify(approval), approval.createdAt, approval.expiresAt);
+    return this.getCanaryApproval(approval.id)!;
+  }
+
+  getCanaryApproval(id: string): CanaryApproval | null {
+    const row = this.database.prepare("SELECT approval_json FROM canary_approvals WHERE id = ?")
+      .get(id) as { approval_json: string } | undefined;
+    return row ? JSON.parse(row.approval_json) as CanaryApproval : null;
+  }
+
+  listCanaryApprovals(projectScope?: string): CanaryApproval[] {
+    const rows = (projectScope
+      ? this.database.prepare("SELECT approval_json FROM canary_approvals WHERE project_scope = ? ORDER BY created_at, id").all(projectScope)
+      : this.database.prepare("SELECT approval_json FROM canary_approvals ORDER BY project_scope, created_at, id").all()) as
+      Array<{ approval_json: string }>;
+    return rows.map((row) => JSON.parse(row.approval_json) as CanaryApproval);
+  }
+
+  installCanaryAssignment(assignment: CanaryAssignment): CanaryAssignment {
+    const existing = this.getCanaryAssignment(assignment.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(assignment)) throw new Error(`Canary Assignment ${assignment.id} is immutable`);
+      return existing;
+    }
+    this.database.prepare(
+      `INSERT INTO canary_assignments
+       (id, project_scope, task_key, proposal_id, selected, assignment_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(assignment.id, assignment.projectScope, assignment.taskKey, assignment.proposalId,
+      assignment.selected, JSON.stringify(assignment), assignment.createdAt);
+    return this.getCanaryAssignment(assignment.id)!;
+  }
+
+  getCanaryAssignment(id: string): CanaryAssignment | null {
+    const row = this.database.prepare("SELECT assignment_json FROM canary_assignments WHERE id = ?")
+      .get(id) as { assignment_json: string } | undefined;
+    return row ? JSON.parse(row.assignment_json) as CanaryAssignment : null;
+  }
+
+  installCanaryObservation(observation: CanaryObservation): CanaryObservation {
+    const existing = this.getCanaryObservation(observation.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(observation)) throw new Error(`Canary Observation ${observation.id} is immutable`);
+      return existing;
+    }
+    this.database.prepare(
+      `INSERT INTO canary_observations
+       (id, assignment_id, formal_run_id, guardrail_violation, observation_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(observation.id, observation.assignmentId, observation.formalRunId,
+      observation.guardrailViolation ? 1 : 0, JSON.stringify(observation), observation.createdAt);
+    return this.getCanaryObservation(observation.id)!;
+  }
+
+  getCanaryObservation(id: string): CanaryObservation | null {
+    const row = this.database.prepare("SELECT observation_json FROM canary_observations WHERE id = ?")
+      .get(id) as { observation_json: string } | undefined;
+    return row ? JSON.parse(row.observation_json) as CanaryObservation : null;
+  }
+
+  applyCanaryObservation(
+    observation: CanaryObservation,
+    rollback: RollbackDecision | null,
+  ): CanaryObservation {
+    const existing = this.getCanaryObservation(observation.id);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(observation)) {
+        throw new Error(`Canary Observation ${observation.id} is immutable`);
+      }
+      return existing;
+    }
+    const transaction = this.database.transaction(() => {
+      if (rollback) {
+        this.rollbackCanary(rollback);
+        this.enqueueEvolutionOutbox("canary-rollback", rollback.projectScope, {
+          decisionId: rollback.id,
+          formalRunId: observation.formalRunId,
+          factHash: observation.factHash,
+        }, observation.createdAt);
+      }
+      return this.installCanaryObservation(observation);
+    });
+    return transaction();
+  }
+
+  rollbackCanary(decision: RollbackDecision): ConfigurationVariant {
+    const transaction = this.database.transaction(() => {
+      const champion = this.activeChampion(decision.projectScope);
+      const challenger = this.getConfigurationVariant(decision.fromChampionId);
+      if (!champion || champion.id !== decision.restoreChampionId || !challenger ||
+          challenger.status !== "challenger" || challenger.projectScope !== decision.projectScope ||
+          decision.authority !== "automatic-guardrail") {
+        throw new Error("Canary Rollback Decision does not match active Champion and Challenger");
+      }
+      const rolledBack: ConfigurationVariant = { ...challenger, status: "rolled-back", retiredAt: decision.decidedAt };
+      this.writeVariant(rolledBack);
+      if (challenger.proposalId) {
+        const proposal = this.getChangeProposal(challenger.proposalId);
+        if (proposal) {
+          const updated: ChangeProposal = { ...proposal, status: "rolled-back" };
+          this.database.prepare("UPDATE change_proposals SET status = ?, proposal_json = ? WHERE id = ?")
+            .run(updated.status, JSON.stringify(updated), updated.id);
+        }
+      }
+      this.insertEvolutionDecision(decision.id, decision.projectScope, "rollback", decision, decision.decidedAt);
+      return this.getConfigurationVariant(champion.id)!;
+    });
+    return transaction();
+  }
+
+  enqueueEvolutionOutbox(
+    type: "canary-rollback",
+    projectScope: string,
+    payload: unknown,
+    createdAt: string,
+  ): EvolutionOutboxEvent {
+    const result = this.database.prepare(
+      "INSERT INTO evolution_outbox (type, project_scope, payload_json, created_at, delivered_at) VALUES (?, ?, ?, ?, NULL)",
+    ).run(type, projectScope, JSON.stringify(payload), createdAt);
+    return { id: Number(result.lastInsertRowid), type, projectScope, payload, createdAt, deliveredAt: null };
+  }
+
+  listPendingEvolutionOutbox(): EvolutionOutboxEvent[] {
+    return (this.database.prepare("SELECT * FROM evolution_outbox WHERE delivered_at IS NULL ORDER BY id").all() as
+      Array<{ id: number; type: "canary-rollback"; project_scope: string; payload_json: string; created_at: string; delivered_at: string | null }>)
+      .map((row) => ({ id: row.id, type: row.type, projectScope: row.project_scope,
+        payload: JSON.parse(row.payload_json) as unknown, createdAt: row.created_at, deliveredAt: row.delivered_at }));
+  }
+
   private migrate(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS fact_bundles (
@@ -522,6 +671,41 @@ export class EvaluationStore {
         shadow_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         FOREIGN KEY(source_run_id, source_fact_hash) REFERENCES fact_bundles(run_id, fact_hash)
+      );
+      CREATE TABLE IF NOT EXISTS canary_approvals (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        proposal_id TEXT NOT NULL REFERENCES change_proposals(id),
+        challenger_id TEXT NOT NULL REFERENCES configuration_variants(id),
+        maximum_basis_points INTEGER NOT NULL,
+        approval_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS canary_assignments (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        task_key TEXT NOT NULL,
+        proposal_id TEXT NOT NULL REFERENCES change_proposals(id),
+        selected TEXT NOT NULL CHECK(selected IN ('champion', 'challenger')),
+        assignment_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS canary_observations (
+        id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL REFERENCES canary_assignments(id),
+        formal_run_id TEXT NOT NULL,
+        guardrail_violation INTEGER NOT NULL CHECK(guardrail_violation IN (0, 1)),
+        observation_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS evolution_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL CHECK(type = 'canary-rollback'),
+        project_scope TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        delivered_at TEXT
       );
     `);
   }
