@@ -23,6 +23,7 @@ import {
   type ExplorerReport,
 } from "./explorer.js";
 import { decideNextAction, type NextAction, type ProofGapSnapshot } from "./loop.js";
+import { LoopController } from "./loop-controller.js";
 import {
   acceptanceHash,
   createRunBinding,
@@ -45,10 +46,16 @@ import {
 } from "./profiles.js";
 import { ProviderSupervisor, type ProviderSupervisorResult } from "./provider-supervisor.js";
 import {
+  ReviewExecutor,
+  ReviewProviderCompletionInterruption,
+  providerRunResultFromUnknown,
+  reviewReportFromProvider,
+} from "./review-executor.js";
+import { WriterExecutor, writerBoundaryViolation } from "./writer-executor.js";
+import {
   hashReviewDiff,
   isBlockingFinding,
   reviewReportSchema,
-  reviewerOutputSchema,
   runReviewer,
   type Finding,
   type ReviewReport,
@@ -280,45 +287,53 @@ export class Orchestrator {
   }
 
   private async runUntilStable(runId: string): Promise<RunView> {
-    for (let step = 0; step < this.maxLoopSteps; step += 1) {
-      const run = this.store.getRun(runId);
-      if (!run) throw new Error(`Run not found: ${runId}`);
-      if (run.status !== "open") return this.status(runId);
-      const action = this.nextAction(runId);
-      this.store.appendEvent(runId, "loop.action", { step: step + 1, action });
-      if (action.kind === "resolve-risk") {
-        if (this.store.listHumanInbox(runId).length === 0) {
-          this.store.createHumanInbox(runId, {
-            question: "Classify this task risk before execution",
-            options: ["low", "normal", "high", "cancel"],
-            recommendation: "high",
-            evidence: { taskId: run.taskId, taskSpecHash: run.binding?.taskSpecHash },
-            risk: "unknown",
-            consequence: "The Harness cannot select a safe fixed template",
-            resumeCommand: `agent-loop resume --run-id ${runId}`,
-          });
-        }
-        this.block(runId, "Risk must be classified before execution", "risk-classification");
+    return new LoopController<RunView>(this.maxLoopSteps).run({
+      isActive: () => this.store.getRun(runId)?.status === "open",
+      status: () => this.status(runId),
+      nextAction: () => this.nextAction(runId),
+      recordAction: (step, action) => this.store.appendEvent(runId, "loop.action", { step, action }),
+      execute: (action) => this.executeLoopAction(runId, action),
+      exhausted: () => {
+        this.block(runId, "Loop step budget exhausted", "loop-budget");
         return this.status(runId);
+      },
+    });
+  }
+
+  private async executeLoopAction(runId: string, action: NextAction): Promise<RunView | null> {
+    const run = this.store.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    if (action.kind === "resolve-risk") {
+      if (this.store.listHumanInbox(runId).length === 0) {
+        this.store.createHumanInbox(runId, {
+          question: "Classify this task risk before execution",
+          options: ["low", "normal", "high", "cancel"],
+          recommendation: "high",
+          evidence: { taskId: run.taskId, taskSpecHash: run.binding?.taskSpecHash },
+          risk: "unknown",
+          consequence: "The Harness cannot select a safe fixed template",
+          resumeCommand: `agent-loop resume --run-id ${runId}`,
+        });
       }
-      if (action.kind === "explore") await this.executeExplorer(runId);
-      else if (action.kind === "author") await this.executeWriter(runId, "author", action.attempt);
-      else if (action.kind === "checkpoint-commit") this.executeCheckpointCommit(runId);
-      else if (action.kind === "bind-acceptance") this.executeAcceptanceBinding(runId);
-      else if (action.kind === "verify") await this.executeVerification(runId);
-      else if (action.kind === "repair") await this.executeWriter(runId, "repair", action.attempt);
-      else if (action.kind === "review") await this.executeReview(runId);
-      else if (action.kind === "advance-ready") {
-        const commitSha = new GitService(this.requireBoundRun(runId).binding.worktreePath).head();
-        this.store.transitionRun(runId, "ready", {}, { commitSha });
-        return this.status(runId);
-      } else if (action.kind === "block") {
-        this.block(runId, this.durableBlockReason(runId, action.reason), this.failureCheckpoint(runId));
-        return this.status(runId);
-      }
+      this.block(runId, "Risk must be classified before execution", "risk-classification");
+      return this.status(runId);
     }
-    this.block(runId, "Loop step budget exhausted", "loop-budget");
-    return this.status(runId);
+    if (action.kind === "explore") await this.executeExplorer(runId);
+    else if (action.kind === "author") await this.executeWriter(runId, "author", action.attempt);
+    else if (action.kind === "checkpoint-commit") this.executeCheckpointCommit(runId);
+    else if (action.kind === "bind-acceptance") this.executeAcceptanceBinding(runId);
+    else if (action.kind === "verify") await this.executeVerification(runId);
+    else if (action.kind === "repair") await this.executeWriter(runId, "repair", action.attempt);
+    else if (action.kind === "review") await this.executeReview(runId);
+    else if (action.kind === "advance-ready") {
+      const commitSha = new GitService(this.requireBoundRun(runId).binding.worktreePath).head();
+      this.store.transitionRun(runId, "ready", {}, { commitSha });
+      return this.status(runId);
+    } else if (action.kind === "block") {
+      this.block(runId, this.durableBlockReason(runId, action.reason), this.failureCheckpoint(runId));
+      return this.status(runId);
+    }
+    return null;
   }
 
   private nextAction(runId: string): NextAction {
@@ -339,7 +354,7 @@ export class Orchestrator {
     const explorerDependencyHash = explorer
       ? this.explorationEvidenceReceipt(runId, explorer).dependencyHash
       : null;
-    const exploration = binding.executionTemplate !== "assisted"
+    const exploration = !template.requiresExplorer
       ? "not-required"
       : explorerDependencyHash && validEvidence.some((item) =>
           item.kind === "exploration" && item.dependencyHash === explorerDependencyHash
@@ -387,7 +402,7 @@ export class Orchestrator {
         : "missing";
 
     const acceptanceReceipt = this.acceptanceEvidenceReceipt(runId, git.head());
-    const acceptance = binding.executionTemplate !== "reviewed"
+    const acceptance = !template.requiresIndependentReview
       ? "not-required"
       : validEvidence.some((item) =>
           item.kind === "acceptance_binding" && item.dependencyHash === acceptanceReceipt.dependencyHash
@@ -396,7 +411,7 @@ export class Orchestrator {
         : "missing";
 
     let review: ProofGapSnapshot["review"] = "not-required";
-    if (binding.executionTemplate === "reviewed" && acceptance === "satisfied" && verification === "passed") {
+    if (template.requiresIndependentReview && acceptance === "satisfied" && verification === "passed") {
       const candidates = this.safeReviewCandidates(runId);
       const reviewInput = this.reviewOperationInput(
         runId,
@@ -684,10 +699,8 @@ export class Orchestrator {
       workspaceAccess: "workspace-write",
       allowedRepositoryRoots: [binding.worktreePath],
     };
-    let providerResult: ProviderRunResult;
-    let selectedAuthor: ConfiguredProvider | null = null;
-    if (this.providerProfile) {
-      const persistence = withFallbackOutbox({
+    const persistence = this.providerProfile
+      ? withFallbackOutbox({
         saveCheckpoint: (checkpoint) => {
           const selected = candidates[checkpoint.selectedAdapterIndex];
           if (!selected) throw new Error("Provider Supervisor selected an unknown Author adapter");
@@ -718,44 +731,47 @@ export class Orchestrator {
         },
         saveFailure: (failure) => this.store.appendEvent(runId, "provider.failure", { role, ...failure }),
         saveFallback: (fallback) => this.store.appendEvent(runId, "provider.fallback", { role, ...fallback }),
-      }, this.store, runId);
-      const outcome = await new ProviderSupervisor({
-        adapters: candidates.map((candidate) => candidate.adapter),
-        persistence,
-        authRecoveryCommand: `Authenticate a configured Author, then run: agent-loop resume --run-id ${runId}`,
-        unknownRecoveryCommand: `Inspect Author artifacts, then run: agent-loop resume --run-id ${runId}`,
-      }).run(request, (result) => authorOutputSchema.safeParse(result.finalOutput).success);
-      selectedAuthor = outcome.selectedAdapterIndex === null ? null : candidates[outcome.selectedAdapterIndex] ?? null;
-      if (outcome.disposition !== "succeeded" || !outcome.result || !selectedAuthor) {
-        const providerBlock = {
-          reason: "No configured Author produced a valid structured result",
-          supervisor: outcome,
-        };
-        this.store.appendEvent(runId, "writer.provider-blocked", {
-          operationId: operation.id,
-          operationInputHash: operation.inputHash,
-          role,
-          ...providerBlock,
-        });
-        this.requireHumanReview(runId, "Author is unavailable", providerBlock, "provider-recovery");
-        return;
-      }
-      providerResult = outcome.result;
-    } else {
-      providerResult = await this.provider.run(request);
+        }, this.store, runId)
+      : null;
+    const execution = await new WriterExecutor().execute({
+      request,
+      legacyProvider: this.provider,
+      candidates,
+      persistence,
+      authRecoveryCommand: `Authenticate a configured Author, then run: agent-loop resume --run-id ${runId}`,
+      unknownRecoveryCommand: `Inspect Author artifacts, then run: agent-loop resume --run-id ${runId}`,
+    });
+    if (!this.providerProfile && execution.result) {
+      const legacyResult = execution.result;
       this.store.appendEvent(runId, "writer.provider-completed", {
         operationId: operation.id,
-        invocationId: providerResult.invocationId,
+        invocationId: legacyResult.invocationId,
         operationInputHash: operation.inputHash,
-        ok: providerResult.ok,
-        exitCode: providerResult.exitCode,
-        signal: providerResult.signal,
-        failureClass: providerResult.failureClass,
-        identity: providerResult.identity,
-        outputHash: operationInputHash(providerResult.finalOutput),
+        ok: legacyResult.ok,
+        exitCode: legacyResult.exitCode,
+        signal: legacyResult.signal,
+        failureClass: legacyResult.failureClass,
+        identity: legacyResult.identity,
+        outputHash: operationInputHash(legacyResult.finalOutput),
       });
       this.afterProviderCompletion?.();
     }
+    if (execution.disposition === "blocked" || !execution.result) {
+      const providerBlock = {
+        reason: "No configured Author produced a valid structured result",
+        supervisor: execution.supervisor,
+      };
+      this.store.appendEvent(runId, "writer.provider-blocked", {
+        operationId: operation.id,
+        operationInputHash: operation.inputHash,
+        role,
+        ...providerBlock,
+      });
+      this.requireHumanReview(runId, "Author is unavailable", providerBlock, "provider-recovery");
+      return;
+    }
+    const providerResult = execution.result;
+    const selectedAuthor = execution.selectedAuthor;
     this.store.recordAgentCall(runId, {
       role,
       provider: providerResult.identity.provider,
@@ -951,7 +967,7 @@ export class Orchestrator {
       authRecoveryCommand: `Authenticate the configured Reviewer, then run: agent-loop resume --run-id ${runId}`,
       unknownRecoveryCommand: `Inspect Reviewer artifacts, then run: agent-loop resume --run-id ${runId}`,
     });
-    const supervised = new SupervisedReviewerAdapter(supervisor);
+    const supervised = new ReviewExecutor(supervisor);
     const verificationEvidence = this.reviewVerificationEvidence(runId, reviewedCommit);
     const reviewDirectory = resolve(this.loopHome, "runs", runId, "review", reviewedCommit);
     const reviewerCwd = binding.worktreePath;
@@ -2227,22 +2243,6 @@ function explorerOperationInput(value: unknown): { currentCommit: string; gitCon
   return { currentCommit: value.currentCommit, gitControlHash: value.gitControlHash };
 }
 
-function writerBoundaryViolation(
-  git: GitService,
-  baseCommit: string,
-  validOutput: boolean,
-  expectedControlHash: string,
-): string | null {
-  if (git.head() !== baseCommit) return "Writer changed Git HEAD; only the Harness may commit";
-  if (git.hasStagedChanges()) return "Writer changed the Git index; only the Harness may stage files";
-  if (git.controlStateHash() !== expectedControlHash) {
-    return "Writer changed Git refs or reflogs; only the Harness may change Git control state";
-  }
-  if (!git.isDirty()) return "Writer produced no working diff";
-  if (!validOutput) return "Writer returned invalid structured output";
-  return null;
-}
-
 function repairPrompt(
   task: ReturnType<typeof loadTaskSpec>,
   attempt: number,
@@ -2284,33 +2284,6 @@ function commandArtifactText(value: unknown, field: "stdoutPath" | "stderrPath")
   }
 }
 
-class SupervisedReviewerAdapter implements ProviderAdapter {
-  readonly workspaceIsolation = { readOnly: "enforced", workspaceWrite: "unverified" } as const;
-  outcome: ProviderSupervisorResult | null = null;
-
-  constructor(private readonly supervisor: ProviderSupervisor) {}
-
-  async probe() {
-    return {
-      available: true,
-      identity: supervisorIdentity(),
-      error: null,
-    };
-  }
-
-  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
-    this.outcome = await this.supervisor.run(
-      request,
-      (result) => reviewerOutputSchema.safeParse(result.finalOutput).success,
-    );
-    return this.outcome.result ?? unavailableReviewResult(request);
-  }
-
-  async cancel(): Promise<boolean> {
-    return false;
-  }
-}
-
 class SupervisedRoleAdapter implements ProviderAdapter {
   readonly workspaceIsolation = { readOnly: "enforced", workspaceWrite: "unverified" } as const;
   outcome: ProviderSupervisorResult | null = null;
@@ -2338,13 +2311,6 @@ class SupervisedRoleAdapter implements ProviderAdapter {
   }
 }
 
-class ReviewProviderCompletionInterruption extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ReviewProviderCompletionInterruption";
-  }
-}
-
 function reviewOperationData(value: unknown): {
   reviewedCommit: string;
   diffHash: string;
@@ -2361,45 +2327,6 @@ function reviewOperationData(value: unknown): {
     diffHash: value.diffHash,
     controlStateHash: value.controlStateHash,
   };
-}
-
-function providerRunResultFromUnknown(value: unknown): ProviderRunResult | null {
-  if (
-    !isRecord(value) ||
-    value.ok !== true ||
-    typeof value.invocationId !== "string" ||
-    !isRecord(value.identity) ||
-    typeof value.identity.provider !== "string" ||
-    typeof value.identity.executable !== "string" ||
-    !Array.isArray(value.events) ||
-    typeof value.stderr !== "string" ||
-    typeof value.durationMs !== "number" ||
-    typeof value.eventsPath !== "string" ||
-    typeof value.finalOutputPath !== "string" ||
-    typeof value.stderrPath !== "string"
-  ) return null;
-  return value as unknown as ProviderRunResult;
-}
-
-function reviewReportFromProvider(result: ProviderRunResult, reviewedCommit: string) {
-  const parsed = reviewerOutputSchema.safeParse(result.finalOutput);
-  if (!result.ok || !parsed.success) return null;
-  return reviewReportSchema.parse({
-    findings: parsed.data.findings.map((finding) => ({
-      ...finding,
-      reviewerIdentity: {
-        provider: result.identity.provider,
-        model: result.identity.model,
-        executable: result.identity.executable,
-        version: result.identity.version,
-      },
-      reviewedCommit,
-    })),
-  });
-}
-
-function unavailableReviewResult(request: ProviderRunRequest): ProviderRunResult {
-  return unavailableProviderResult(request, "No configured independent Reviewer produced a valid result");
 }
 
 function unavailableProviderResult(request: ProviderRunRequest, message: string): ProviderRunResult {

@@ -9,15 +9,17 @@ import {
 describe("fixed execution templates", () => {
   it("defines only the three bounded execution sequences", () => {
     expect(executionTemplates).toEqual({
-      solo: { name: "solo", steps: ["author", "verification"], maximumRepairs: 1 },
+      solo: { name: "solo", requiresExplorer: false, requiresIndependentReview: false, maximumRepairs: 1 },
       assisted: {
         name: "assisted",
-        steps: ["explorer", "author", "verification"],
+        requiresExplorer: true,
+        requiresIndependentReview: false,
         maximumRepairs: 1,
       },
       reviewed: {
         name: "reviewed",
-        steps: ["author", "verification", "independent-review", "repair", "verification", "independent-review"],
+        requiresExplorer: false,
+        requiresIndependentReview: true,
         maximumRepairs: 1,
       },
     });

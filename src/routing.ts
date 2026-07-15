@@ -5,33 +5,31 @@ export type Risk = (typeof riskValues)[number];
 export const executionTemplateNames = ["solo", "assisted", "reviewed"] as const;
 
 export type ExecutionTemplateName = (typeof executionTemplateNames)[number];
-export type ExecutionStep =
-  | "explorer"
-  | "author"
-  | "verification"
-  | "independent-review"
-  | "repair";
 
 export interface ExecutionTemplate {
   name: ExecutionTemplateName;
-  steps: readonly ExecutionStep[];
+  requiresExplorer: boolean;
+  requiresIndependentReview: boolean;
   maximumRepairs: 0 | 1;
 }
 
 export const executionTemplates: Readonly<Record<ExecutionTemplateName, ExecutionTemplate>> = {
   solo: {
     name: "solo",
-    steps: ["author", "verification"],
+    requiresExplorer: false,
+    requiresIndependentReview: false,
     maximumRepairs: 1,
   },
   assisted: {
     name: "assisted",
-    steps: ["explorer", "author", "verification"],
+    requiresExplorer: true,
+    requiresIndependentReview: false,
     maximumRepairs: 1,
   },
   reviewed: {
     name: "reviewed",
-    steps: ["author", "verification", "independent-review", "repair", "verification", "independent-review"],
+    requiresExplorer: false,
+    requiresIndependentReview: true,
     maximumRepairs: 1,
   },
 };
