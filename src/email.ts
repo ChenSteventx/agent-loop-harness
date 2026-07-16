@@ -46,6 +46,9 @@ export class SmtpEmailTransport implements EmailTransport {
     if ((username === null) !== (password === null)) {
       throw new Error("SMTP username and password must be supplied together");
     }
+    if (security === "none" && username !== null) {
+      throw new Error("SMTP authentication requires TLS or STARTTLS");
+    }
     return new SmtpEmailTransport({
       host,
       port,
@@ -230,6 +233,9 @@ function validateConfiguration(configuration: SmtpConfiguration): void {
   }
   if ((configuration.username === null) !== (configuration.password === null)) {
     throw new Error("SMTP username and password must be supplied together");
+  }
+  if (configuration.security === "none" && configuration.username !== null) {
+    throw new Error("SMTP authentication requires TLS or STARTTLS");
   }
 }
 

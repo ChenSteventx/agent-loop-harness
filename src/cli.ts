@@ -47,7 +47,7 @@ import {
 } from "./evolution/canary.js";
 import { SmtpEmailTransport } from "./email.js";
 import { NotificationDispatcher, type NotificationDispatcherOptions } from "./notifications.js";
-import { digestWindow, renderMetricsDigest, type DigestPeriod } from "./evaluation/digest.js";
+import { digestEventCounts, digestWindow, renderMetricsDigest, type DigestPeriod } from "./evaluation/digest.js";
 import {
   createProviderProfile,
   providerProfileNames,
@@ -495,11 +495,14 @@ notify
     const now = new Date().toISOString();
     const window = digestWindow(period, now);
     withEvaluationStores((development, evaluationStore) => {
-      const projections = development.listRuns()
-        .filter((run) => run.updatedAt >= window.windowStartsAt && run.updatedAt < window.windowEndsAt)
+      const runs = development.listRuns()
         .filter((run) => !options.project || run.binding?.projectAdapterName === options.project)
+      const counts = digestEventCounts(runs.flatMap((run) => development.listEvents(run.id)), window);
+      const selectedRunIds = new Set(counts.runIds);
+      const projections = runs
+        .filter((run) => selectedRunIds.has(run.id))
         .map((run) => projectRunMetrics(exportRunFacts(development, run.id)));
-      const digest = renderMetricsDigest(period, summarizeMetrics(projections), now);
+      const digest = renderMetricsDigest(period, summarizeMetrics(projections), now, counts);
       print(evaluationStore.enqueueEvolutionOutbox(
         "metrics-digest",
         options.project ?? "all-projects",

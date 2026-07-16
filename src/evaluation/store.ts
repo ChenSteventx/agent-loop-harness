@@ -206,7 +206,7 @@ export class EvaluationStore {
   getCandidateMemory(id: string): CandidateMemory | null {
     const row = this.database.prepare("SELECT memory_json FROM candidate_memories WHERE id = ?")
       .get(id) as { memory_json: string } | undefined;
-    return row ? JSON.parse(row.memory_json) as CandidateMemory : null;
+    return row ? normalizeCandidateMemory(JSON.parse(row.memory_json) as Partial<CandidateMemory>) : null;
   }
 
   listCandidateMemories(projectScope?: string): CandidateMemory[] {
@@ -214,7 +214,7 @@ export class EvaluationStore {
       ? this.database.prepare("SELECT memory_json FROM candidate_memories WHERE project_scope = ? ORDER BY id").all(projectScope)
       : this.database.prepare("SELECT memory_json FROM candidate_memories ORDER BY project_scope, id").all()) as
       Array<{ memory_json: string }>;
-    return rows.map((row) => JSON.parse(row.memory_json) as CandidateMemory);
+    return rows.map((row) => normalizeCandidateMemory(JSON.parse(row.memory_json) as Partial<CandidateMemory>));
   }
 
   decideCandidateMemory(input: {
@@ -231,7 +231,13 @@ export class EvaluationStore {
       reason: input.reason, decidedAt: input.decidedAt };
     if (current.status === input.status && canonicalJson(current.decision) === canonicalJson(decision)) return current;
     validateMemoryDecision(current, input);
-    const updated: CandidateMemory = { ...current, status: input.status, decision };
+    const updated: CandidateMemory = {
+      ...current,
+      status: input.status,
+      decision,
+      validatedAt: input.status === "approved" ? input.decidedAt : current.validatedAt,
+      invalidationReason: input.status === "invalidated" ? input.reason : current.invalidationReason,
+    };
     this.database.prepare(
       "UPDATE candidate_memories SET status = ?, memory_json = ?, decided_at = ? WHERE id = ?",
     ).run(updated.status, JSON.stringify(updated), input.decidedAt, input.id);
@@ -765,7 +771,7 @@ export class EvaluationStore {
         project_scope TEXT NOT NULL,
         kind TEXT NOT NULL CHECK(kind IN ('failure-pattern', 'finding-rule', 'provider-observation')),
         content_hash TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('candidate', 'approved', 'rejected', 'superseded', 'expired', 'invalidated')),
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'evaluating', 'approved', 'rejected', 'deprecated', 'invalidated')),
         memory_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
@@ -915,7 +921,7 @@ export class EvaluationStore {
     const row = this.database.prepare(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'candidate_memories'",
     ).get() as { sql: string } | undefined;
-    if (!row || row.sql.includes("'invalidated'")) return;
+    if (!row || row.sql.includes("'evaluating'") && row.sql.includes("'deprecated'")) return;
     this.database.exec(`
       ALTER TABLE candidate_memories RENAME TO candidate_memories_before_invalidation;
       CREATE TABLE candidate_memories (
@@ -923,7 +929,7 @@ export class EvaluationStore {
         project_scope TEXT NOT NULL,
         kind TEXT NOT NULL CHECK(kind IN ('failure-pattern', 'finding-rule', 'provider-observation')),
         content_hash TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('candidate', 'approved', 'rejected', 'superseded', 'expired', 'invalidated')),
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'evaluating', 'approved', 'rejected', 'deprecated', 'invalidated')),
         memory_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
@@ -932,7 +938,11 @@ export class EvaluationStore {
       );
       INSERT INTO candidate_memories
         (id, project_scope, kind, content_hash, status, memory_json, created_at, expires_at, decided_at)
-      SELECT id, project_scope, kind, content_hash, status, memory_json, created_at, expires_at, decided_at
+      SELECT id, project_scope, kind, content_hash,
+        CASE status WHEN 'superseded' THEN 'deprecated' WHEN 'expired' THEN 'deprecated' ELSE status END,
+        replace(replace(memory_json, '"status":"superseded"', '"status":"deprecated"'),
+          '"status":"expired"', '"status":"deprecated"'),
+        created_at, expires_at, decided_at
       FROM candidate_memories_before_invalidation;
       DROP TABLE candidate_memories_before_invalidation;
     `);
@@ -1007,18 +1017,42 @@ function validateMemoryDecision(
   },
 ): void {
   if (!input.decidedBy.trim() || !input.reason.trim()) throw new Error("Memory decision requires actor and reason");
-  if (input.status === "expired" && input.authority !== "system-expiry") {
-    throw new Error("Only the deterministic expiry mechanism can expire Candidate Memory");
+  if (input.status === "deprecated" && input.authority !== "system-expiry" && input.authority !== "human") {
+    throw new Error("Candidate Memory deprecation requires explicit authority");
   }
-  if (input.status !== "expired" && input.authority !== "human") {
-    throw new Error("Only a human decision can approve, reject, or supersede Candidate Memory");
+  if (input.status !== "deprecated" && input.authority !== "human") {
+    throw new Error("Only a human decision can evaluate, approve, reject, or invalidate Candidate Memory");
   }
   const allowed = current.status === "candidate"
-    ? ["approved", "rejected", "expired", "invalidated"]
+    ? ["evaluating", "approved", "rejected", "deprecated", "invalidated"]
+    : current.status === "evaluating"
+      ? ["approved", "rejected", "deprecated", "invalidated"]
     : current.status === "approved"
-      ? ["rejected", "superseded", "expired", "invalidated"]
+      ? ["rejected", "deprecated", "invalidated"]
       : [];
   if (!allowed.includes(input.status)) throw new Error(`Illegal Candidate Memory decision: ${current.status} -> ${input.status}`);
+}
+
+function normalizeCandidateMemory(memory: Partial<CandidateMemory>): CandidateMemory {
+  const legacyStatus = memory.status === ("superseded" as CandidateMemoryStatus) ||
+    memory.status === ("expired" as CandidateMemoryStatus)
+    ? "deprecated"
+    : memory.status ?? "candidate";
+  const sourceRunIds = memory.sourceRunIds ?? [];
+  return {
+    ...(memory as CandidateMemory),
+    repositoryScope: memory.repositoryScope ?? memory.projectScope ?? "unknown",
+    operationType: memory.operationType ?? "verification",
+    sourceRunIds,
+    sourceCommits: memory.sourceCommits ?? [],
+    evidenceRefs: memory.evidenceRefs ?? [],
+    supportCount: memory.supportCount ?? sourceRunIds.length,
+    status: legacyStatus,
+    validatedAt: memory.validatedAt ?? null,
+    invalidationReason: memory.invalidationReason ?? null,
+    preconditions: memory.preconditions ?? [],
+    counterexamples: memory.counterexamples ?? [],
+  };
 }
 
 interface EvolutionOutboxRow {

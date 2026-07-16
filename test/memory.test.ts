@@ -49,7 +49,12 @@ function facts(id: string, factHash: string, projectScope = "generic-node"): San
       },
     },
     operations: [],
-    evidence: [],
+    evidence: [{
+      id: `${id}:verification-failure`, kind: "verification_failure", status: "valid",
+      commitSha: `commit-${id}`, policyVersion: "generic-node/v2", stepId: "test",
+      dependencyHash: `dependency-${id}`, createdAt: "2026-07-15T00:00:01.000Z", invalidatedAt: null,
+      findingValidation: null,
+    }],
     events: [{ id: 1, type: "provider.failure", createdAt: "2026-07-15T00:00:01.000Z", failureClass: "quota" }],
     manifests: [],
     human: [],
@@ -83,7 +88,8 @@ describe("quarantined Candidate Memory", () => {
     const schema = store.database.prepare(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'candidate_memories'",
     ).get() as { sql: string };
-    expect(schema.sql).toContain("invalidated");
+    expect(schema.sql).toContain("evaluating");
+    expect(schema.sql).toContain("deprecated");
     store.close();
   });
 
@@ -99,10 +105,10 @@ describe("quarantined Candidate Memory", () => {
     store.installCandidateMemory(candidate!);
 
     expect(retrieveApprovedMemory(store, {
-      projectScope: "generic-node", query: "provider quota fallback",
+      projectScope: "generic-node", query: "failure signature affected useful root",
     })).toEqual([]);
     expect(retrieveApprovedMemory(store, {
-      projectScope: "generic-node", query: "provider quota fallback", enabled: true,
+      projectScope: "generic-node", query: "failure signature affected useful root", enabled: true,
     })).toEqual([]);
 
     const approved = approveCandidateMemory(store, {
@@ -113,13 +119,13 @@ describe("quarantined Candidate Memory", () => {
     });
     expect(approved).toMatchObject({ status: "approved", decision: { authority: "human" } });
     const retrieved = retrieveApprovedMemory(store, {
-      projectScope: "generic-node", query: "provider quota fallback", enabled: true,
+      projectScope: "generic-node", query: "failure signature affected useful root", enabled: true,
       now: "2026-07-15T00:03:00.000Z",
     });
     expect(retrieved).toHaveLength(1);
-    expect(retrieved[0]?.matchedTerms).toEqual(expect.arrayContaining(["provider", "quota", "fallback"]));
+    expect(retrieved[0]?.matchedTerms).toEqual(expect.arrayContaining(["failure", "signature", "root"]));
     expect(retrieveApprovedMemory(store, {
-      projectScope: "another-project", query: "provider quota fallback", enabled: true,
+      projectScope: "another-project", query: "failure signature affected useful root", enabled: true,
     })).toEqual([]);
 
     invalidateCandidateMemory(store, {
@@ -127,7 +133,7 @@ describe("quarantined Candidate Memory", () => {
       decidedAt: "2026-07-15T00:04:00.000Z",
     });
     expect(retrieveApprovedMemory(store, {
-      projectScope: "generic-node", query: "provider quota fallback", enabled: true,
+      projectScope: "generic-node", query: "failure signature affected useful root", enabled: true,
     })).toEqual([]);
     store.close();
   });
@@ -141,6 +147,8 @@ describe("quarantined Candidate Memory", () => {
     expect(store.listPendingEvolutionOutbox().find((event) => event.type === "memory-quarantined"))
       .toMatchObject({ payload: expect.objectContaining({ candidateId: overfit!.id }) });
     expect(scanCandidateMemory(overfit!)).toMatchObject({ passed: false, overfit: true });
+    const [sameRunTwice] = deriveCandidateMemories([facts("run-same", "fact-a"), facts("run-same", "fact-b")]);
+    expect(scanCandidateMemory(sameRunTwice!)).toMatchObject({ passed: false, overfit: true });
     expect(() => approveCandidateMemory(store, {
       id: overfit!.id, approvedBy: "human", reason: "too soon",
     })).toThrow("failed approval scans");
@@ -152,7 +160,7 @@ describe("quarantined Candidate Memory", () => {
     expect(store.listPendingEvolutionOutbox().find((event) => event.type === "memory-conflict"))
       .toMatchObject({ payload: expect.objectContaining({ conflictingMemoryId: overfit!.id }) });
     expect(expireCandidateMemories(store, "2100-01-01T00:00:00.000Z")).toEqual([
-      expect.objectContaining({ status: "expired", decision: expect.objectContaining({ authority: "system-expiry" }) }),
+      expect.objectContaining({ status: "deprecated", decision: expect.objectContaining({ authority: "system-expiry" }) }),
     ]);
     store.close();
   });

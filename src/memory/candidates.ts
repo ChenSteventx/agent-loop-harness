@@ -2,7 +2,7 @@ import { operationInputHash } from "../bindings.js";
 import type { SanitizedFactBundle } from "../evaluation/facts.js";
 
 export const candidateMemoryStatuses = [
-  "candidate", "approved", "rejected", "superseded", "expired", "invalidated",
+  "candidate", "evaluating", "approved", "rejected", "deprecated", "invalidated",
 ] as const;
 export type CandidateMemoryStatus = (typeof candidateMemoryStatuses)[number];
 export type CandidateMemoryKind = "failure-pattern" | "finding-rule" | "provider-observation";
@@ -18,15 +18,24 @@ export interface CandidateMemory {
   schemaVersion: 1;
   id: string;
   projectScope: string;
+  repositoryScope: string;
+  operationType: string;
   kind: CandidateMemoryKind;
   summary: string;
   terms: string[];
   contentHash: string;
   sourceFactHashes: string[];
+  sourceRunIds: string[];
+  sourceCommits: string[];
+  evidenceRefs: string[];
   supportCount: number;
   status: CandidateMemoryStatus;
   createdAt: string;
   expiresAt: string;
+  validatedAt: string | null;
+  invalidationReason: string | null;
+  preconditions: string[];
+  counterexamples: string[];
   decision: null | {
     status: Exclude<CandidateMemoryStatus, "candidate">;
     authority: "human" | "system-expiry";
@@ -64,22 +73,14 @@ export function deriveCandidateMemories(
 ): CandidateMemory[] {
   const now = options.now ?? new Date().toISOString();
   const expiresAt = addDays(now, options.ttlDays ?? 90);
-  const groups = new Map<string, { projectScope: string; kind: CandidateMemoryKind; summary: string; facts: Set<string> }>();
+  const groups = new Map<string, MemoryGroup>();
   for (const fact of facts.filter((item) => item.source === "real" && item.run.binding)) {
     const projectScope = fact.run.binding!.projectAdapterName;
-    for (const failureClass of ["quota", "rate_limit"] as const) {
-      if (fact.events.some((event) => event.type === "provider.failure" && event.failureClass === failureClass)) {
-        addGroup(groups, projectScope, "provider-observation",
-          `Provider ${failureClass} failures require bounded fallback evidence`, fact.factHash);
-      }
-    }
-    if (fact.evidence.some((item) => item.kind === "verification_failure")) {
+    const failures = fact.evidence.filter((item) => item.kind === "verification_failure");
+    if (failures.length > 0) {
       addGroup(groups, projectScope, "failure-pattern",
-        "Verification failure evidence must be repaired and re-verified on the bound commit", fact.factHash);
-    }
-    for (const finding of fact.reviewerFindings.filter((item) => item.authority === "human")) {
-      addGroup(groups, projectScope, "finding-rule",
-        `${finding.category} ${finding.severity} Findings require independent machine or human resolution`, fact.factHash);
+        `Failure signature in ${projectScope}; affected area is the bound project; useful tests are the recorded verification steps; root cause requires evidence`,
+        fact, failures.map((item) => item.id));
     }
   }
   return [...groups.values()].map((group) => candidate({
@@ -87,6 +88,9 @@ export function deriveCandidateMemories(
     kind: group.kind,
     summary: group.summary,
     sourceFactHashes: [...group.facts].sort(),
+    sourceRunIds: [...group.runs].sort(),
+    sourceCommits: [...group.commits].sort(),
+    evidenceRefs: [...group.evidence].sort(),
     now,
     expiresAt,
   })).sort((left, right) => left.id.localeCompare(right.id));
@@ -103,7 +107,7 @@ export function scanCandidateMemory(
   const absolutePaths = source.match(/(?:[A-Z]:[\\/][^\s]+|\/(?:home|Users|mnt|private|var)\/[^\s]+)/giu) ?? [];
   const forbiddenIdentifiers = (options.forbiddenIdentifiers ?? [])
     .filter((identifier) => identifier.trim().length > 0 && lower.includes(identifier.toLowerCase()));
-  const overfit = memory.supportCount < 2 || new Set(memory.sourceFactHashes).size < 2;
+  const overfit = memory.supportCount < 2 || new Set(memory.sourceRunIds).size < 2;
   return {
     passed: secretMarkers.length === 0 && absolutePaths.length === 0 && forbiddenIdentifiers.length === 0 && !overfit,
     secretMarkers,
@@ -165,10 +169,10 @@ export function expireCandidateMemories(
   now = new Date().toISOString(),
 ): CandidateMemory[] {
   return repository.listCandidateMemories()
-    .filter((memory) => (memory.status === "candidate" || memory.status === "approved") && memory.expiresAt <= now)
+    .filter((memory) => ["candidate", "evaluating", "approved"].includes(memory.status) && memory.expiresAt <= now)
     .map((memory) => repository.decideCandidateMemory({
       id: memory.id,
-      status: "expired",
+      status: "deprecated",
       authority: "system-expiry",
       decidedBy: "candidate-memory-expiry",
       reason: "Candidate Memory reached its explicit expiry time",
@@ -202,12 +206,17 @@ function candidate(input: {
   kind: CandidateMemoryKind;
   summary: string;
   sourceFactHashes: string[];
+  sourceRunIds: string[];
+  sourceCommits: string[];
+  evidenceRefs: string[];
   now: string;
   expiresAt: string;
 }): CandidateMemory {
   const terms = tokenize(input.summary);
   const contentHash = operationInputHash({
     projectScope: input.projectScope,
+    repositoryScope: input.projectScope,
+    operationType: "verification",
     kind: input.kind,
     summary: input.summary,
     terms,
@@ -216,29 +225,55 @@ function candidate(input: {
     schemaVersion: 1,
     id: `memory:${input.projectScope}:${input.kind}:${contentHash.slice(0, 16)}`,
     projectScope: input.projectScope,
+    repositoryScope: input.projectScope,
+    operationType: "verification",
     kind: input.kind,
     summary: input.summary,
     terms,
     contentHash,
     sourceFactHashes: input.sourceFactHashes,
-    supportCount: input.sourceFactHashes.length,
+    sourceRunIds: input.sourceRunIds,
+    sourceCommits: input.sourceCommits,
+    evidenceRefs: input.evidenceRefs,
+    supportCount: input.sourceRunIds.length,
     status: "candidate",
     createdAt: input.now,
     expiresAt: input.expiresAt,
+    validatedAt: null,
+    invalidationReason: null,
+    preconditions: ["same repository scope", "matching operation type", "current evidence remains valid"],
+    counterexamples: [],
     decision: null,
   };
 }
 
+interface MemoryGroup {
+  projectScope: string;
+  kind: CandidateMemoryKind;
+  summary: string;
+  facts: Set<string>;
+  runs: Set<string>;
+  commits: Set<string>;
+  evidence: Set<string>;
+}
+
 function addGroup(
-  groups: Map<string, { projectScope: string; kind: CandidateMemoryKind; summary: string; facts: Set<string> }>,
+  groups: Map<string, MemoryGroup>,
   projectScope: string,
   kind: CandidateMemoryKind,
   summary: string,
-  factHash: string,
+  fact: SanitizedFactBundle,
+  evidenceRefs: readonly string[],
 ): void {
   const key = operationInputHash({ projectScope, kind, summary });
-  const group = groups.get(key) ?? { projectScope, kind, summary, facts: new Set<string>() };
-  group.facts.add(factHash);
+  const group = groups.get(key) ?? {
+    projectScope, kind, summary, facts: new Set<string>(), runs: new Set<string>(),
+    commits: new Set<string>(), evidence: new Set<string>(),
+  };
+  group.facts.add(fact.factHash);
+  group.runs.add(fact.run.id);
+  for (const commit of fact.evidence.map((item) => item.commitSha).filter(Boolean)) group.commits.add(commit);
+  for (const reference of evidenceRefs) group.evidence.add(`${fact.run.id}:${reference}`);
   groups.set(key, group);
 }
 

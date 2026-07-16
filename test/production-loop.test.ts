@@ -3,6 +3,16 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { DatasetCatalog } from "../src/evaluation/datasets.js";
+import { EvaluationStore } from "../src/evaluation/store.js";
+import type { CanaryAssignment } from "../src/evolution/canary.js";
+import {
+  approveChangeProposal,
+  createChangeProposal,
+  createChallenger,
+  createInitialChampion,
+  type EvolutionConfiguration,
+} from "../src/evolution/proposals.js";
 
 const temporaryDirectories: string[] = [];
 const tsxCli = resolve("node_modules/tsx/dist/cli.mjs");
@@ -118,5 +128,77 @@ describe("production CLI loop", () => {
       "--run-id", runId,
     ], environment) as { run: { status: string }; worktreePath: string };
     expect(reloaded).toMatchObject({ run: { status: "ready" }, worktreePath: started.worktreePath });
+  }, 180_000);
+
+  it("runs a low-risk formal Fake Canary with the assigned Challenger configuration", () => {
+    const target = fixture();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-production-canary-home-"));
+    temporaryDirectories.push(loopHome);
+    const configuration: EvolutionConfiguration = {
+      providerOrder: ["codex"], roleModels: {}, retryLimit: 1, timeoutMs: 60_000,
+      contextRanking: ["task", "acceptance", "repository"],
+      riskThresholds: { assisted: 1, reviewed: 2 }, memoryRetrievalEnabled: false,
+    };
+    const evaluation = new EvaluationStore(join(loopHome, "evaluation.sqlite"));
+    const champion = evaluation.installConfigurationVariant(createInitialChampion({
+      id: "formal-champion", projectScope: "generic-node", version: "1", configuration,
+    }));
+    const draft = evaluation.installChangeProposal(createChangeProposal({
+      id: "formal-canary-proposal", projectScope: "generic-node", target: "retry-policy",
+      baseChampion: champion, patch: { retryLimit: 2 },
+      rationale: "exercise the formal Fake Canary path", sourceFactHashes: ["fact-a", "fact-b"],
+      datasets: DatasetCatalog.loadDirectory(resolve("eval")).list("proposal"),
+      metrics: ["readyRate"], minimumSamples: 1,
+    }));
+    const approved = approveChangeProposal(evaluation, {
+      id: draft.id, approvedBy: "test-human", reason: "exercise bounded canary",
+    });
+    const challenger = evaluation.installConfigurationVariant(createChallenger({
+      id: "formal-challenger", version: "2", proposal: approved, champion,
+    }));
+    const assignment: CanaryAssignment = {
+      schemaVersion: 1, id: "formal-assignment", projectScope: "generic-node",
+      taskKey: "PRODUCTION-CLI-1", risk: "low", proposalId: approved.id,
+      championId: champion.id, challengerId: challenger.id, selectedVariantId: challenger.id,
+      selected: "challenger", bucket: 0, basisPoints: 100, extraBudgetTokens: 0,
+      reason: "deterministic Fake Canary", createdAt: "2026-07-16T00:00:00.000Z",
+    };
+    evaluation.installCanaryAssignment(assignment);
+    evaluation.close();
+
+    const started = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "run",
+      "--run-id", "production-cli-canary", "--task", target.taskPath, "--repository", target.root,
+    ], {
+      ...process.env,
+      CODEX_BIN: fakeCodex,
+      FAKE_CODEX_MODE: "production-author",
+      AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY",
+      AGENT_LOOP_CANARY_ENABLED: "true",
+    }) as {
+      run: { status: string; binding: {
+        configurationVariantId: string; configurationHash: string; canaryAssignmentId: string;
+        configSource: string; runtimeConfiguration: EvolutionConfiguration;
+      } };
+      invocationManifests: Array<{ inputs: {
+        configurationVariantId: string; configurationHash: string; canaryAssignmentId: string; configSource: string;
+      } }>;
+    };
+    expect(started.run).toMatchObject({
+      status: "ready",
+      binding: {
+        configurationVariantId: challenger.id,
+        configurationHash: challenger.configurationHash,
+        canaryAssignmentId: assignment.id,
+        configSource: "canary",
+        runtimeConfiguration: { retryLimit: 2, timeoutMs: 60_000 },
+      },
+    });
+    expect(started.invocationManifests[0]?.inputs).toMatchObject({
+      configurationVariantId: challenger.id,
+      configurationHash: challenger.configurationHash,
+      canaryAssignmentId: assignment.id,
+      configSource: "canary",
+    });
   }, 180_000);
 });

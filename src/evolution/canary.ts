@@ -79,6 +79,12 @@ export interface CanaryObservation {
   ready: boolean;
   done: boolean;
   verificationFailures: number;
+  postMergeFailures: number;
+  humanEscalation: boolean;
+  latencyMs: number | null;
+  tokens: number | null;
+  cost: number | null;
+  guardrailResults: Record<ChangeProposal["evaluationPlan"]["requiredGuardrails"][number], boolean | null>;
   guardrailViolation: boolean;
   rollbackDecisionId: string | null;
   createdAt: string;
@@ -89,6 +95,7 @@ export interface CanaryRepository {
   installCanaryAssignment(assignment: CanaryAssignment): CanaryAssignment;
   applyCanaryObservation(observation: CanaryObservation, rollback: RollbackDecision | null): CanaryObservation;
   countCanaryAssignments(projectScope: string, proposalId: string): number;
+  getChangeProposal(id: string): ChangeProposal | null;
 }
 
 export function createCanaryApproval(input: {
@@ -213,15 +220,37 @@ export function recordCanaryObservation(
     ready: boolean;
     done: boolean;
     verificationFailures: number;
+    postMergeFailures?: number;
+    humanEscalation?: boolean;
+    latencyMs?: number | null;
+    tokens?: number | null;
+    cost?: number | null;
     createdAt?: string;
   },
 ): CanaryObservation {
-  if (!Number.isSafeInteger(input.verificationFailures) || input.verificationFailures < 0) {
-    throw new Error("Canary verification failure count must be non-negative");
+  const postMergeFailures = input.postMergeFailures ?? 0;
+  if (!Number.isSafeInteger(input.verificationFailures) || input.verificationFailures < 0 ||
+      !Number.isSafeInteger(postMergeFailures) || postMergeFailures < 0) {
+    throw new Error("Canary failure counts must be non-negative");
   }
   const createdAt = input.createdAt ?? new Date().toISOString();
+  const proposal = repository.getChangeProposal(input.assignment.proposalId);
+  if (!proposal) throw new Error("Canary Proposal not found");
+  const latencyMs = input.latencyMs ?? null;
+  const tokens = input.tokens ?? null;
+  const cost = input.cost ?? null;
+  const guardrailResults: CanaryObservation["guardrailResults"] = {
+    ready: input.ready,
+    done: input.done,
+    verificationFailures: input.verificationFailures === 0,
+    postMergeFailures: postMergeFailures === 0,
+    humanEscalation: input.humanEscalation !== true,
+    latency: latencyMs === null ? null : latencyMs <= 600_000,
+    tokens: tokens === null ? null : tokens >= 0,
+    cost: cost === null ? null : cost >= 0,
+  };
   const guardrailViolation = input.assignment.selected === "challenger" &&
-    (!input.ready || input.verificationFailures > 0);
+    proposal.evaluationPlan.requiredGuardrails.some((guardrail) => guardrailResults[guardrail] !== true);
   const rollbackDecisionId = guardrailViolation ? `${input.id}:rollback` : null;
   const decision: RollbackDecision | null = guardrailViolation
     ? {
@@ -246,6 +275,12 @@ export function recordCanaryObservation(
     ready: input.ready,
     done: input.done,
     verificationFailures: input.verificationFailures,
+    postMergeFailures,
+    humanEscalation: input.humanEscalation ?? false,
+    latencyMs,
+    tokens,
+    cost,
+    guardrailResults,
     guardrailViolation,
     rollbackDecisionId,
     createdAt,

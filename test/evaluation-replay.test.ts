@@ -7,8 +7,10 @@ import type { RunBinding } from "../src/domain.js";
 import { DatasetCatalog, historicalDataset } from "../src/evaluation/datasets.js";
 import { exportRunFacts } from "../src/evaluation/facts.js";
 import { createInvocationManifest } from "../src/evaluation/manifests.js";
+import { FullTaskReplayEvaluator } from "../src/evaluation/evaluators.js";
 import { HistoricalReplay } from "../src/evaluation/replay.js";
 import { EvaluationStore } from "../src/evaluation/store.js";
+import { createInitialChampion } from "../src/evolution/proposals.js";
 import { SqliteStore } from "../src/store.js";
 
 const temporaryDirectories: string[] = [];
@@ -169,6 +171,46 @@ describe("Evaluation Datasets and Historical Replay", () => {
       id: "evaluation-exact", facts, binding, mode: "full", requiredOperationIds: ["run-2:author"],
     });
     expect(result).toMatchObject({ status: "completed", replayability: "manifest-complete", mode: "full" });
+    const worktreeCalls: unknown[] = [];
+    const variant = createInitialChampion({
+      id: "evaluation-champion",
+      projectScope: binding.projectAdapterName,
+      version: "1",
+      configuration: {
+        providerOrder: ["codex"], roleModels: {}, retryLimit: 1, timeoutMs: 60_000,
+        contextRanking: ["task", "acceptance", "repository"],
+        riskThresholds: { assisted: 1, reviewed: 2 }, memoryRetrievalEnabled: false,
+      },
+    });
+    const evaluator = new FullTaskReplayEvaluator(
+      evaluation,
+      {
+        create: (path, branch, baseRef) => {
+          worktreeCalls.push({ action: "create", path, branch, baseRef });
+          return { path, branch, head: baseRef ?? binding.baselineCommit };
+        },
+        remove: (path, force) => { worktreeCalls.push({ action: "remove", path, force }); },
+      },
+      async (input) => {
+        expect(input.configurationVariant.id).toBe(variant.id);
+        expect(input.binding.worktreePath).toBe(input.worktreePath);
+        return { passed: true, evidenceHash: "isolated-result-artifact-hash", diagnostics: [] };
+      },
+      join(directory, "evaluation"),
+      "full-task-replay/test-v1",
+    );
+    const isolated = await evaluator.evaluate({
+      id: "evaluation-isolated", facts, binding, configurationVariant: variant,
+    });
+    expect(isolated).toMatchObject({
+      status: "completed", evaluatorKind: "full-task-replay", evaluatorVersion: "full-task-replay/test-v1",
+      configurationVariantId: variant.id, resultArtifactHash: "isolated-result-artifact-hash",
+    });
+    expect(worktreeCalls).toEqual([
+      expect.objectContaining({ action: "create", baseRef: binding.baselineCommit }),
+      expect.objectContaining({ action: "remove", force: true }),
+    ]);
+    expect(evaluation.getEvaluationRun("evaluation-isolated")).toEqual(isolated);
     expect(() => evaluation.installEvaluationRun({ ...result, status: "failed" })).toThrow("immutable");
     evaluation.close();
     development.close();

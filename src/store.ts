@@ -977,10 +977,19 @@ interface HumanInboxRow { id: number; run_id: string; question: string; options_
 interface AgentCallRow { id: number; run_id: string; role: string; provider: string; latency_ms: number; input_tokens: number | null; cached_input_tokens: number | null; output_tokens: number | null; created_at: string }
 
 function mapRun(row: RunRow): Run {
+  const storedBinding = row.binding_json ? parseJson(row.binding_json) as Run["binding"] : null;
+  const binding = storedBinding ? {
+    ...storedBinding,
+    configurationVariantId: storedBinding.configurationVariantId ?? null,
+    configurationHash: storedBinding.configurationHash ?? null,
+    canaryAssignmentId: storedBinding.canaryAssignmentId ?? null,
+    configSource: storedBinding.configSource ?? "default",
+    runtimeConfiguration: storedBinding.runtimeConfiguration ?? null,
+  } : null;
   return {
     id: row.id,
     taskId: row.task_id,
-    binding: row.binding_json ? parseJson(row.binding_json) as Run["binding"] : null,
+    binding,
     status: row.status,
     blocked: row.blocked_json ? parseJson(row.blocked_json) as Run["blocked"] : null,
     mergeSha: row.merge_sha,

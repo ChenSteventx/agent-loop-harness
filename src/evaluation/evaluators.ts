@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { operationInputHash } from "../bindings.js";
 import type { RunBinding } from "../domain.js";
-import { CommandRunner, GitService, WorktreeService } from "../execution.js";
+import { CommandRunner, GitService, type WorktreeService } from "../execution.js";
 import type { ConfigurationVariant } from "../evolution/proposals.js";
 import type { SanitizedFactBundle } from "./facts.js";
 import {
@@ -74,7 +74,7 @@ export class FullTaskReplayEvaluator {
 
   constructor(
     private readonly repository: EvaluationRunRepository,
-    private readonly worktrees: WorktreeService,
+    private readonly worktrees: Pick<WorktreeService, "create" | "remove">,
     private readonly executor: FullTaskExecutor,
     private readonly evaluationRoot: string,
     readonly version = "full-task-replay/v1",

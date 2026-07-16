@@ -112,5 +112,13 @@ describe("outbox notification delivery", () => {
       AGENT_LOOP_EMAIL_FROM: "loop@example.invalid",
       AGENT_LOOP_EMAIL_TO: "operator@example.invalid,reviewer@example.invalid",
     })).toBeInstanceOf(SmtpEmailTransport);
+    expect(() => SmtpEmailTransport.fromEnvironment({
+      AGENT_LOOP_SMTP_HOST: "smtp.example.invalid",
+      AGENT_LOOP_SMTP_SECURITY: "none",
+      AGENT_LOOP_SMTP_USERNAME: "plaintext-user",
+      AGENT_LOOP_SMTP_PASSWORD: "plaintext-password",
+      AGENT_LOOP_EMAIL_FROM: "loop@example.invalid",
+      AGENT_LOOP_EMAIL_TO: "operator@example.invalid",
+    })).toThrow("requires TLS or STARTTLS");
   });
 });

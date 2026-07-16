@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import type { EmailMessage, EmailTransport } from "../src/email.js";
-import { digestWindow, renderMetricsDigest } from "../src/evaluation/digest.js";
+import { digestEventCounts, digestWindow, renderMetricsDigest } from "../src/evaluation/digest.js";
 import { summarizeMetrics, type RunMetricsProjection } from "../src/evaluation/metrics.js";
 import { EvaluationStore } from "../src/evaluation/store.js";
 import { NotificationDispatcher } from "../src/notifications.js";
@@ -197,6 +197,15 @@ describe("completed-window Metrics digests", () => {
     expect(first.text).toContain("Review recall: unknown");
     expect(first.text).toContain("Cost USD: unknown");
     expect(first.text).toContain("Fixture results are mechanism checks, not production gains.");
+    const counts = digestEventCounts([
+      { runId: "old-updated-run", type: "run.ready", createdAt: "2026-07-15T12:00:00.000Z" },
+      { runId: "active-run", type: "provider.fallback", createdAt: "2026-07-15T13:00:00.000Z" },
+      { runId: "outside", type: "run.done", createdAt: "2026-07-16T00:00:00.000Z" },
+    ], digestWindow("daily", "2026-07-16T12:00:00.000Z"));
+    expect(counts).toEqual({ runIds: ["active-run", "old-updated-run"], activity: 2, ready: 1, done: 0 });
+    const eventDigest = renderMetricsDigest("daily", metrics, "2026-07-16T12:00:00.000Z", counts);
+    expect(eventDigest.text).toContain("Activity in window: 2 runs");
+    expect(eventDigest.text).toContain("Completed outcomes in window: ready=1, done=0");
   });
 
   it("sends the rendered digest subject and text through the fake transport", async () => {

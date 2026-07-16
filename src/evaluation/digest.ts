@@ -10,12 +10,23 @@ export interface MetricsDigest {
   subject: string;
   text: string;
   metrics: MetricsSummary;
+  activityInWindow: number;
+  completedOutcomesInWindow: { ready: number; done: number };
+}
+
+export interface DigestEvent {
+  runId: string;
+  type: string;
+  createdAt: string;
 }
 
 export function renderMetricsDigest(
   period: DigestPeriod,
   metrics: MetricsSummary,
   now = new Date().toISOString(),
+  eventCounts: { activity: number; ready: number; done: number } = {
+    activity: metrics.runCount, ready: 0, done: 0,
+  },
 ): MetricsDigest {
   const window = digestWindow(period, now);
   const label = period === "daily" ? "Daily" : "Weekly";
@@ -27,7 +38,9 @@ export function renderMetricsDigest(
     text: [
       `${label} Agent Loop metrics`,
       `Window: ${window.windowStartsAt} .. ${window.windowEndsAt}`,
-      `Runs: ${metrics.runCount} (real=${metrics.realRunCount}, fixture=${metrics.fixtureRunCount})`,
+      `Activity in window: ${eventCounts.activity} runs`,
+      `Completed outcomes in window: ready=${eventCounts.ready}, done=${eventCounts.done}`,
+      `Activity metrics: ${metrics.runCount} runs (real=${metrics.realRunCount}, fixture=${metrics.fixtureRunCount})`,
       `Ready rate (all sources): ${formatRate(metrics.readySuccessRate)}`,
       `Done rate (all sources): ${formatRate(metrics.doneSuccessRate)}`,
       `First-pass rate: ${formatRate(metrics.firstPassSuccessRate)}`,
@@ -43,6 +56,22 @@ export function renderMetricsDigest(
       "Fixture results are mechanism checks, not production gains.",
     ].join("\n"),
     metrics,
+    activityInWindow: eventCounts.activity,
+    completedOutcomesInWindow: { ready: eventCounts.ready, done: eventCounts.done },
+  };
+}
+
+export function digestEventCounts(events: readonly DigestEvent[], window: {
+  windowStartsAt: string; windowEndsAt: string;
+}): { runIds: string[]; activity: number; ready: number; done: number } {
+  const selected = events.filter((event) =>
+    event.createdAt >= window.windowStartsAt && event.createdAt < window.windowEndsAt);
+  const runIds = [...new Set(selected.map((event) => event.runId))].sort();
+  return {
+    runIds,
+    activity: runIds.length,
+    ready: new Set(selected.filter((event) => event.type === "run.ready").map((event) => event.runId)).size,
+    done: new Set(selected.filter((event) => event.type === "run.done").map((event) => event.runId)).size,
   };
 }
 
