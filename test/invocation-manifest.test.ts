@@ -32,6 +32,8 @@ const binding: RunBinding = {
   providerProfile: "CODEX_PRIMARY",
   projectAdapterName: "generic-node",
   policyVersion: "generic-node/v2",
+  configurationVariantId: null, configurationHash: null, canaryAssignmentId: null,
+  configSource: "default", runtimeConfiguration: null,
 };
 
 function manifest() {

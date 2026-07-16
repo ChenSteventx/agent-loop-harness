@@ -43,6 +43,11 @@ export interface RunBinding {
   providerProfile: string;
   projectAdapterName: string;
   policyVersion: string;
+  configurationVariantId: string | null;
+  configurationHash: string | null;
+  canaryAssignmentId: string | null;
+  configSource: import("./runtime-config.js").ConfigSource;
+  runtimeConfiguration: import("./evolution/proposals.js").EvolutionConfiguration | null;
 }
 
 export type OperationStatus = "running" | "succeeded" | "failed";

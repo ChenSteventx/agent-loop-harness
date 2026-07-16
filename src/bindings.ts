@@ -5,6 +5,7 @@ import type { EvidenceDependencies, RunBinding } from "./domain.js";
 import type { ProjectAdapter } from "./ports.js";
 import { routeRisk, type ExecutionTemplateName, type Risk } from "./routing.js";
 import type { TaskSpec } from "./task-spec.js";
+import { defaultRuntimeConfiguration, type RuntimeConfiguration } from "./runtime-config.js";
 
 export interface CreateRunBindingInput {
   taskSpecPath: string;
@@ -16,10 +17,12 @@ export interface CreateRunBindingInput {
   projectAdapter: ProjectAdapter;
   effectiveRisk?: Risk;
   executionTemplate?: ExecutionTemplateName;
+  runtimeConfiguration?: RuntimeConfiguration;
 }
 
 export function createRunBinding(input: CreateRunBindingInput): RunBinding {
   const effectiveRisk = input.effectiveRisk ?? input.taskSpec.risk;
+  const runtime = input.runtimeConfiguration ?? defaultRuntimeConfiguration();
   return {
     version: 1,
     taskSpecPath: normalizeExistingPath(input.taskSpecPath),
@@ -34,6 +37,11 @@ export function createRunBinding(input: CreateRunBindingInput): RunBinding {
     providerProfile: requiredText(input.providerProfile, "providerProfile"),
     projectAdapterName: requiredText(input.projectAdapter.name, "projectAdapter.name"),
     policyVersion: requiredText(input.projectAdapter.policyVersion, "projectAdapter.policyVersion"),
+    configurationVariantId: runtime.configurationVariantId,
+    configurationHash: runtime.configurationHash,
+    canaryAssignmentId: runtime.canaryAssignmentId,
+    configSource: runtime.configSource,
+    runtimeConfiguration: runtime.configuration,
   };
 }
 

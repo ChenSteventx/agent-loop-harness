@@ -20,7 +20,7 @@ import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { ProviderAdapter, ProviderRunRequest, ProviderRunResult } from "./provider.js";
 import { loadTaskSpec } from "./project.js";
 import { SqliteStore } from "./store.js";
-import type { Evidence, Operation, Run } from "./domain.js";
+import type { Evidence, Operation, Run, RunBinding } from "./domain.js";
 import { EvidenceGate } from "./evidence-gate.js";
 import { applyRiskEscalation, executionTemplates } from "./routing.js";
 import {
@@ -75,6 +75,7 @@ import {
   type InvocationRole,
   type ManifestContextInput,
 } from "./evaluation/manifests.js";
+import type { RuntimeConfigResolver } from "./runtime-config.js";
 
 export function defaultLoopHome(): string {
   return resolve(homedir(), ".agent-loop-harness");
@@ -92,6 +93,7 @@ export interface OrchestratorOptions {
   commandRunner?: CommandRunner;
   explorerContextBudget?: number;
   maxLoopSteps?: number;
+  runtimeConfigResolver?: Pick<RuntimeConfigResolver, "resolve"> & Partial<Pick<RuntimeConfigResolver, "close">>;
   faults?: {
     afterProviderCompletion?: () => void;
     afterHarnessCommit?: () => void;
@@ -171,6 +173,8 @@ export class Orchestrator {
   private readonly explorerContextBudget: number;
   private readonly providerProfileName: string;
   private readonly maxLoopSteps: number;
+  private readonly runtimeConfigResolver: (Pick<RuntimeConfigResolver, "resolve"> &
+    Partial<Pick<RuntimeConfigResolver, "close">>) | null;
 
   constructor(options: OrchestratorOptions) {
     this.loopHome = resolve(options.loopHome ?? process.env.LOOP_HOME ?? defaultLoopHome());
@@ -197,6 +201,7 @@ export class Orchestrator {
     this.explorerContextBudget = options.explorerContextBudget ?? 8_000;
     this.providerProfileName = this.providerProfile?.name ?? options.providerProfileName ?? "LEGACY_SINGLE_PROVIDER";
     this.maxLoopSteps = options.maxLoopSteps ?? 32;
+    this.runtimeConfigResolver = options.runtimeConfigResolver ?? null;
     if (!Number.isSafeInteger(this.maxLoopSteps) || this.maxLoopSteps <= 0) {
       throw new Error("maxLoopSteps must be a positive integer");
     }
@@ -204,6 +209,7 @@ export class Orchestrator {
 
   close(): void {
     this.store.close();
+    this.runtimeConfigResolver?.close?.();
   }
 
   async start(request: StartRunRequest): Promise<RunView> {
@@ -214,6 +220,11 @@ export class Orchestrator {
     const sourceGit = new GitService(request.targetRepository);
     const minimumRisk = this.projectAdapter.minimumRisk({ task });
     const effectiveRisk = applyRiskEscalation(minimumRisk, task.risk);
+    const runtimeConfiguration = this.runtimeConfigResolver?.resolve({
+      projectScope: this.projectAdapter.name,
+      taskKey: task.id,
+      effectiveRisk,
+    });
     const worktreePath = this.worktreePath(runId);
     const binding = createRunBinding({
       taskSpecPath: taskPath,
@@ -224,6 +235,7 @@ export class Orchestrator {
       providerProfile: this.providerProfileName,
       projectAdapter: this.projectAdapter,
       effectiveRisk,
+      runtimeConfiguration,
     });
     this.store.createBoundRun(runId, task.id, binding);
     this.store.appendEvent(runId, "worktree.planned", {
@@ -468,7 +480,7 @@ export class Orchestrator {
     const run = this.requireBoundRun(runId);
     const binding = run.binding;
     const candidates = this.providerProfile
-      ? workspaceRoleCandidates(this.providerProfile, "read-only")
+      ? this.orderProviderCandidates(binding, workspaceRoleCandidates(this.providerProfile, "read-only"))
       : [];
     if (this.providerProfile && candidates.length === 0) {
       this.requireHumanReview(
@@ -581,6 +593,7 @@ export class Orchestrator {
       }, this.store, runId);
       supervised = new SupervisedRoleAdapter(new ProviderSupervisor({
         adapters: candidates.map((candidate) => candidate.adapter),
+        maxAttempts: (binding.runtimeConfiguration?.retryLimit ?? 1) + 1,
         persistence,
         authRecoveryCommand: `Authenticate a configured Explorer, then run: agent-loop resume --run-id ${runId}`,
         unknownRecoveryCommand: `Inspect Explorer artifacts, then run: agent-loop resume --run-id ${runId}`,
@@ -667,7 +680,7 @@ export class Orchestrator {
     const run = this.requireBoundRun(runId);
     const binding = run.binding;
     const candidates = this.providerProfile
-      ? workspaceRoleCandidates(this.providerProfile, "workspace-write")
+      ? this.orderProviderCandidates(binding, workspaceRoleCandidates(this.providerProfile, "workspace-write"))
       : [];
     if (this.providerProfile && candidates.length === 0) {
       this.requireHumanReview(
@@ -1024,6 +1037,7 @@ export class Orchestrator {
     }, this.store, runId);
     const supervisor = new ProviderSupervisor({
       adapters: candidates.map((candidate) => candidate.adapter),
+      maxAttempts: (binding.runtimeConfiguration?.retryLimit ?? 1) + 1,
       persistence,
       authRecoveryCommand: `Authenticate the configured Reviewer, then run: agent-loop resume --run-id ${runId}`,
       unknownRecoveryCommand: `Inspect Reviewer artifacts, then run: agent-loop resume --run-id ${runId}`,
@@ -1857,7 +1871,7 @@ export class Orchestrator {
       actualProvider: input.actualProvider,
       currentCommit: input.currentCommit,
       verificationPlan: this.projectAdapter.verificationCommands(run.binding.taskSpec),
-      context: [
+      context: this.orderManifestContext(run.binding, [
         {
           kind: "task-spec",
           reference: run.binding.taskSpecPath,
@@ -1865,9 +1879,28 @@ export class Orchestrator {
           trust: "project",
         },
         ...(input.context ?? []),
-      ],
+      ]),
       createdAt: input.operation.startedAt,
     }));
+  }
+
+  private orderManifestContext(
+    binding: RunBinding,
+    context: readonly ManifestContextInput[],
+  ): ManifestContextInput[] {
+    const ranking = binding.runtimeConfiguration?.contextRanking;
+    if (!ranking) return [...context];
+    return [...context].sort((left, right) => {
+      const leftRank = ranking.findIndex((value) => left.kind.includes(value));
+      const rightRank = ranking.findIndex((value) => right.kind.includes(value));
+      return (leftRank < 0 ? ranking.length : leftRank) - (rightRank < 0 ? ranking.length : rightRank);
+    });
+  }
+
+  private orderProviderCandidates(binding: RunBinding, candidates: readonly ConfiguredProvider[]): ConfiguredProvider[] {
+    const order = binding.runtimeConfiguration?.providerOrder;
+    if (!order) return [...candidates];
+    return [...candidates].sort((left, right) => providerRank(left, order) - providerRank(right, order));
   }
 
   private savedExplorerReport(runId: string): ExplorerReport | null {
@@ -1976,7 +2009,7 @@ export class Orchestrator {
           cwd: worktreePath,
           artifactDirectory: resolve(this.loopHome, "runs", runId, phase, command.id),
           environmentAllowlist: commandEnvironmentAllowlist(),
-          timeoutMs: 10 * 60_000,
+          timeoutMs: this.requireBoundRun(runId).binding.runtimeConfiguration?.timeoutMs ?? 10 * 60_000,
           outputLimitBytes: 1024 * 1024,
         });
       } catch (error) {
@@ -2581,6 +2614,12 @@ function supervisorIdentity() {
 
 function configuredProviderFact(provider: ConfiguredProvider): { family: string; name: string } {
   return { family: provider.family, name: provider.name };
+}
+
+function providerRank(provider: ConfiguredProvider, order: readonly string[]): number {
+  const searchable = `${provider.family}\0${provider.name}`.toLowerCase();
+  const index = order.findIndex((value) => searchable.includes(value.toLowerCase()));
+  return index < 0 ? order.length : index;
 }
 
 function missingProvider(): never {

@@ -57,6 +57,7 @@ export interface ProviderSupervisorOptions {
   cooldownMs?: number;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
+  maxAttempts?: number;
 }
 
 interface CooldownState {
@@ -75,6 +76,7 @@ export class ProviderSupervisor {
   private readonly cooldownMs: number;
   private readonly now: () => number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly maxAttempts: number;
   private readonly cooldowns = new Map<ProviderAdapter, CooldownState>();
 
   constructor(options: ProviderSupervisorOptions) {
@@ -90,6 +92,10 @@ export class ProviderSupervisor {
     this.cooldownMs = options.cooldownMs ?? 30_000;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+    this.maxAttempts = options.maxAttempts ?? 2;
+    if (!Number.isSafeInteger(this.maxAttempts) || this.maxAttempts < 1 || this.maxAttempts > 4) {
+      throw new Error("Provider supervisor maxAttempts must be between 1 and 4");
+    }
   }
 
   async run(
@@ -106,7 +112,7 @@ export class ProviderSupervisor {
       }
 
       let attempt = 1;
-      while (attempt <= 2) {
+      while (attempt <= this.maxAttempts) {
         const attemptRequest = {
           ...request,
           invocationId: attempt === 1 ? request.invocationId : `${request.invocationId}:retry`,
@@ -167,7 +173,7 @@ export class ProviderSupervisor {
           };
         }
         const retryable = failureClass === "transient" || failureClass === "rate_limit" || failureClass === "invalid_output";
-        if (retryable && attempt === 1) {
+        if (retryable && attempt < this.maxAttempts) {
           await this.sleep(evidence.retryAfterMs ?? this.backoffMs);
           attempt += 1;
           continue;

@@ -54,6 +54,7 @@ import {
   type ProviderProfileName,
 } from "./profiles.js";
 import { riskValues, type Risk } from "./routing.js";
+import { RuntimeConfigResolver } from "./runtime-config.js";
 
 const program = new Command()
   .name("agent-loop")
@@ -652,6 +653,10 @@ function createOrchestrator(loopHome: string): Orchestrator {
     model: process.env.AGENT_LOOP_CLAUDE_MODEL ?? null,
   });
   const deepseek = configuredPiAdapter();
+  const runtimeConfigResolver = new RuntimeConfigResolver(
+    new EvaluationStore(resolve(loopHome, "evaluation.sqlite")),
+    process.env.AGENT_LOOP_CANARY_ENABLED === "true",
+  );
   return new Orchestrator({
     loopHome,
     providerProfile: createProviderProfile(profileName, {
@@ -661,6 +666,7 @@ function createOrchestrator(loopHome: string): Orchestrator {
     }),
     projectAdapter: new GenericNodeProjectAdapter(),
     roleOutputSchemas: defaultRoleOutputSchemas(),
+    runtimeConfigResolver,
   });
 }
 

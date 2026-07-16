@@ -873,6 +873,14 @@ export class EvaluationStore {
     this.migrateEvolutionOutbox();
   }
 
+  findCanaryAssignment(projectScope: string, taskKey: string): CanaryAssignment | null {
+    const row = this.database.prepare(
+      `SELECT assignment_json FROM canary_assignments
+       WHERE project_scope = ? AND task_key = ? ORDER BY created_at DESC, id DESC LIMIT 1`,
+    ).get(projectScope, taskKey) as { assignment_json: string } | undefined;
+    return row ? JSON.parse(row.assignment_json) as CanaryAssignment : null;
+  }
+
   private migrateReplayabilityName(): void {
     const row = this.database.prepare(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'evaluation_runs'",

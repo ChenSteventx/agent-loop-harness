@@ -44,6 +44,10 @@ export interface InvocationManifest {
     baselineCommit: string;
     currentCommit: string;
     verificationPlanHash: string;
+    configurationVariantId: string | null;
+    configurationHash: string | null;
+    canaryAssignmentId: string | null;
+    configSource: RunBinding["configSource"];
   };
   context: Array<{
     kind: string;
@@ -128,6 +132,10 @@ export function createInvocationManifest(input: CreateInvocationManifestInput): 
       baselineCommit: input.binding.baselineCommit,
       currentCommit: requiredText(input.currentCommit, "current commit"),
       verificationPlanHash: sha256(canonicalJson(input.verificationPlan)),
+      configurationVariantId: input.binding.configurationVariantId,
+      configurationHash: input.binding.configurationHash,
+      canaryAssignmentId: input.binding.canaryAssignmentId,
+      configSource: input.binding.configSource,
     },
     context: (input.context ?? []).map((item) => ({
       kind: requiredText(item.kind, "context kind"),
