@@ -2,7 +2,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { DatasetCatalog } from "../src/evaluation/datasets.js";
+import { operationInputHash } from "../src/bindings.js";
+import { compareVariants } from "../src/evaluation/compare.js";
+import { DatasetCatalog, type EvaluationDataset } from "../src/evaluation/datasets.js";
 import { EvaluationStore } from "../src/evaluation/store.js";
 import {
   approveChangeProposal,
@@ -34,7 +36,7 @@ afterEach(() => {
 });
 
 describe("controlled Champion and Challenger evolution", () => {
-  it("allows one bounded Challenger to promote and deterministically roll back", () => {
+  it("allows only a persisted eligible Comparison to promote and deterministically roll back", async () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-loop-evolution-"));
     temporaryDirectories.push(directory);
     const store = new EvaluationStore(join(directory, "evaluation.sqlite"));
@@ -46,7 +48,8 @@ describe("controlled Champion and Challenger evolution", () => {
     expect(() => store.installConfigurationVariant({ ...champion, id: "another-champion" }))
       .toThrow("already has an active Champion");
 
-    const datasets = DatasetCatalog.loadDirectory(resolve("eval")).list("proposal");
+    const catalog = DatasetCatalog.loadDirectory(resolve("eval"));
+    const datasets = catalog.list("proposal").map(asRealDataset);
     const proposal = createChangeProposal({
       id: "proposal-retry-v2",
       projectScope: "generic-node",
@@ -72,6 +75,24 @@ describe("controlled Champion and Challenger evolution", () => {
       createdAt: "2026-07-15T00:03:00.000Z",
     });
     store.installConfigurationVariant(challenger);
+    const comparison = await compareVariants(store, {
+      id: "compare-v2",
+      proposal: approved,
+      champion,
+      challenger,
+      datasets: catalog.list("comparison").map(asRealDataset),
+      evaluatorKind: "full-task-replay",
+      evaluatorVersion: "full-task-replay/v1",
+      evaluate: async (variant, task) => ({
+        passed: variant.id === challenger.id,
+        ready: variant.id === challenger.id,
+        done: false,
+        verificationFailures: 0,
+        latencyMs: variant.id === challenger.id ? 90 : 100,
+        resultHash: operationInputHash({ variant: variant.id, task: task.id }),
+      }),
+      createdAt: "2026-07-15T00:04:00.000Z",
+    });
     store.decideChangeProposal({
       id: proposal.id,
       status: "evaluated",
@@ -80,16 +101,24 @@ describe("controlled Champion and Challenger evolution", () => {
       reason: "offline comparison completed",
       decidedAt: "2026-07-15T00:04:00.000Z",
     });
+    expect(() => promoteChallenger(store, {
+      id: "missing-promotion", comparisonId: "missing", decidedBy: "human-reviewer", reason: "forged",
+    })).toThrow("not found");
+    for (const forged of [
+      { ...comparison, id: "fixture-comparison", dataSource: "fixture" as const },
+      { ...comparison, id: "no-holdout-comparison", holdoutTaskCount: 0 },
+      { ...comparison, id: "no-improvement-comparison",
+        primaryMetricResult: { ...comparison.primaryMetricResult, improvement: 0, passed: false } },
+    ]) {
+      store.installOfflineComparison(forged);
+      expect(() => promoteChallenger(store, {
+        id: `promotion:${forged.id}`, comparisonId: forged.id,
+        decidedBy: "human-reviewer", reason: "forged comparison must fail",
+      })).toThrow("not eligible");
+    }
     const promoted = promoteChallenger(store, {
       id: "promotion-v2",
-      projectScope: "generic-node",
-      proposalId: proposal.id,
-      fromChampionId: champion.id,
-      challengerId: challenger.id,
-      verdict: "promote",
       comparisonId: "compare-v2",
-      thresholdsSatisfied: true,
-      sampleSize: 2,
       decidedBy: "human-reviewer",
       reason: "all guardrails passed",
       decidedAt: "2026-07-15T00:05:00.000Z",
@@ -158,3 +187,15 @@ describe("controlled Champion and Challenger evolution", () => {
     store.close();
   });
 });
+
+function asRealDataset(dataset: EvaluationDataset): EvaluationDataset {
+  const document = {
+    schemaVersion: 1 as const,
+    id: dataset.id,
+    kind: dataset.kind,
+    dataSource: "real" as const,
+    version: dataset.version,
+    tasks: dataset.tasks,
+  };
+  return { ...document, contentHash: operationInputHash(document) };
+}

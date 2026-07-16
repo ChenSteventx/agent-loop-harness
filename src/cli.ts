@@ -273,31 +273,16 @@ config.command("champion").requiredOption("--project <scope>").action((options: 
 });
 config
   .command("activate")
-  .requiredOption("--proposal-id <id>")
-  .requiredOption("--challenger-id <id>")
   .requiredOption("--comparison-id <id>")
   .requiredOption("--decided-by <identity>")
   .requiredOption("--reason <text>")
   .action((options: {
-    proposalId: string; challengerId: string; comparisonId: string; decidedBy: string; reason: string;
+    comparisonId: string; decidedBy: string; reason: string;
   }) => {
     withEvaluationStores((_development, store) => {
-      const proposalValue = store.getChangeProposal(options.proposalId);
-      const challenger = store.getConfigurationVariant(options.challengerId);
-      const comparison = store.getOfflineComparison(options.comparisonId);
-      if (!proposalValue || !challenger || !comparison) throw new Error("Promotion facts are incomplete");
-      const champion = store.activeChampion(proposalValue.projectScope);
-      if (!champion) throw new Error("Active Champion is missing");
       print(promoteChallenger(store, {
-        id: `promotion:${proposalValue.id}:${Date.now()}`,
-        projectScope: proposalValue.projectScope,
-        proposalId: proposalValue.id,
-        fromChampionId: champion.id,
-        challengerId: challenger.id,
-        verdict: "promote",
-        comparisonId: comparison.id,
-        thresholdsSatisfied: comparison.guardrailsSatisfied,
-        sampleSize: comparison.sampleSize,
+        id: `promotion:${options.comparisonId}:${Date.now()}`,
+        comparisonId: options.comparisonId,
         decidedBy: options.decidedBy,
         reason: options.reason,
         decidedAt: new Date().toISOString(),

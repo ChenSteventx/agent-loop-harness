@@ -84,6 +84,8 @@ describe("offline comparison and non-authoritative Shadow", () => {
       champion,
       challenger,
       datasets,
+      evaluatorKind: "verify-only",
+      evaluatorVersion: "verify-only/v1",
       evaluate: async (variant, task) => ({
         passed: true,
         ready: true,
@@ -140,6 +142,8 @@ describe("offline comparison and non-authoritative Shadow", () => {
     const comparison = await compareVariants(evaluation, {
       id: "comparison-failed", proposal: approved, champion, challenger,
       datasets: catalog.list("proposal"),
+      evaluatorKind: "verify-only",
+      evaluatorVersion: "verify-only/v1",
       evaluate: async (variant, task) => ({
         passed: variant.status === "champion",
         ready: variant.status === "champion",

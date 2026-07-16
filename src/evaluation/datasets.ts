@@ -25,6 +25,7 @@ export interface EvaluationDataset {
   schemaVersion: 1;
   id: string;
   kind: DatasetKind;
+  dataSource: "real" | "fixture";
   version: string;
   tasks: EvaluationTask[];
   contentHash: string;
@@ -79,6 +80,7 @@ export function parseDataset(value: unknown): EvaluationDataset {
     schemaVersion: 1,
     id: value.id as string,
     kind: value.kind as DatasetKind,
+    dataSource: value.dataSource === "real" ? "real" : "fixture",
     version: value.version as string,
     tasks,
   };
@@ -90,6 +92,7 @@ export function historicalDataset(id: string, facts: readonly SanitizedFactBundl
     schemaVersion: 1,
     id,
     kind: "historical",
+    dataSource: "real",
     version: "1",
     tasks: facts.map((fact) => ({
       id: `historical:${fact.run.id}:${fact.factHash.slice(0, 12)}`,

@@ -1,5 +1,7 @@
 import { operationInputHash } from "../bindings.js";
+import type { OfflineComparison } from "../evaluation/compare.js";
 import type { EvaluationDataset } from "../evaluation/datasets.js";
+import type { Risk } from "../routing.js";
 
 export const evolutionTargets = [
   "prompt-variant",
@@ -27,8 +29,17 @@ export interface EvolutionConfiguration {
 
 export interface EvaluationPlan {
   datasetIds: string[];
+  datasetHashes: string[];
   metrics: string[];
   minimumSamples: number;
+  primaryMetric: "passRate" | "readyRate" | "doneRate" | "verificationFailures" | "averageLatencyMs";
+  minimumImprovement: number;
+  requiredGuardrails: Array<"ready" | "done" | "verificationFailures" | "postMergeFailures" |
+    "humanEscalation" | "latency" | "tokens" | "cost">;
+  requireHoldout: boolean;
+  risk: Risk;
+  rollbackCondition: string;
+  approvalRequired: boolean;
   guardrails: {
     maximumReadyRegression: number;
     maximumDoneRegression: number;
@@ -80,8 +91,6 @@ export interface PromotionDecision {
   challengerId: string;
   verdict: "promote" | "reject";
   comparisonId: string;
-  thresholdsSatisfied: boolean;
-  sampleSize: number;
   authority: "human";
   decidedBy: string;
   reason: string;
@@ -114,6 +123,7 @@ export interface EvolutionRepository {
   }): ChangeProposal;
   installConfigurationVariant(variant: ConfigurationVariant): ConfigurationVariant;
   getConfigurationVariant(id: string): ConfigurationVariant | null;
+  getOfflineComparison(id: string): OfflineComparison | null;
   activeChampion(projectScope: string): ConfigurationVariant | null;
   activateChallenger(decision: PromotionDecision): ConfigurationVariant;
   rollbackChampion(decision: RollbackDecision): ConfigurationVariant;
@@ -154,6 +164,13 @@ export function createChangeProposal(input: {
   datasets: readonly EvaluationDataset[];
   metrics: readonly string[];
   minimumSamples: number;
+  primaryMetric?: EvaluationPlan["primaryMetric"];
+  minimumImprovement?: number;
+  requiredGuardrails?: EvaluationPlan["requiredGuardrails"];
+  requireHoldout?: boolean;
+  risk?: Risk;
+  rollbackCondition?: string;
+  approvalRequired?: boolean;
   createdAt?: string;
 }): ChangeProposal {
   if (!evolutionTargets.includes(input.target)) throw new Error(`Forbidden evolution target: ${String(input.target)}`);
@@ -169,10 +186,24 @@ export function createChangeProposal(input: {
   if (!Number.isSafeInteger(input.minimumSamples) || input.minimumSamples <= 0) {
     throw new Error("Evaluation Plan minimumSamples must be positive");
   }
+  const datasetBindings = input.datasets
+    .map((dataset) => ({ id: dataset.id, hash: dataset.contentHash }))
+    .sort((left, right) => left.id.localeCompare(right.id));
   const evaluationPlan: EvaluationPlan = {
-    datasetIds: input.datasets.map((dataset) => dataset.id).sort(),
+    datasetIds: datasetBindings.map((dataset) => dataset.id),
+    datasetHashes: datasetBindings.map((dataset) => dataset.hash),
     metrics: [...new Set(input.metrics)].sort(),
     minimumSamples: input.minimumSamples,
+    primaryMetric: input.primaryMetric ?? "readyRate",
+    minimumImprovement: input.minimumImprovement ?? 0.01,
+    requiredGuardrails: input.requiredGuardrails ?? ["ready", "done", "verificationFailures"],
+    requireHoldout: input.requireHoldout ?? true,
+    risk: input.risk ?? "normal",
+    rollbackCondition: requiredText(
+      input.rollbackCondition ?? "rollback on any required guardrail violation",
+      "rollback condition",
+    ),
+    approvalRequired: input.approvalRequired ?? true,
     guardrails: {
       maximumReadyRegression: 0,
       maximumDoneRegression: 0,
@@ -181,6 +212,10 @@ export function createChangeProposal(input: {
   };
   if (evaluationPlan.datasetIds.length === 0 || evaluationPlan.metrics.length === 0) {
     throw new Error("Evaluation Plan requires datasets and metrics");
+  }
+  if (!Number.isFinite(evaluationPlan.minimumImprovement) || evaluationPlan.minimumImprovement < 0 ||
+      evaluationPlan.requiredGuardrails.length === 0) {
+    throw new Error("Evaluation Plan requires a non-negative improvement and guardrails");
   }
   const body = {
     projectScope: input.projectScope,
@@ -248,25 +283,60 @@ export function createChallenger(input: {
 
 export function promoteChallenger(
   repository: EvolutionRepository,
-  input: Omit<PromotionDecision, "schemaVersion" | "authority">,
+  input: {
+    id: string;
+    comparisonId: string;
+    decidedBy: string;
+    reason: string;
+    decidedAt?: string;
+  },
 ): ConfigurationVariant {
   requiredText(input.id, "Promotion Decision id");
   requiredText(input.comparisonId, "offline comparison id");
   requiredText(input.decidedBy, "human decision maker");
   requiredText(input.reason, "promotion reason");
-  const proposal = repository.getChangeProposal(input.proposalId);
-  const challenger = repository.getConfigurationVariant(input.challengerId);
-  const champion = repository.activeChampion(input.projectScope);
+  const comparison = repository.getOfflineComparison(input.comparisonId);
+  if (!comparison) throw new Error("Offline Comparison not found");
+  const proposal = repository.getChangeProposal(comparison.proposalId);
+  const challenger = repository.getConfigurationVariant(comparison.challengerId);
+  const champion = repository.activeChampion(comparison.projectScope);
   if (!proposal || !challenger || !champion) throw new Error("Promotion facts are incomplete");
-  if (!Number.isSafeInteger(input.sampleSize) || input.verdict !== "promote" || !input.thresholdsSatisfied ||
-      input.sampleSize < proposal.evaluationPlan.minimumSamples) {
-    throw new Error("Challenger cannot be promoted without satisfied thresholds and minimum samples");
-  }
   if (proposal.status !== "evaluated" || challenger.status !== "challenger" ||
-      champion.id !== input.fromChampionId || proposal.id !== challenger.proposalId) {
+      champion.id !== comparison.championId || proposal.id !== challenger.proposalId ||
+      proposal.id !== comparison.proposalId || challenger.id !== comparison.challengerId) {
     throw new Error("Promotion facts do not match the active Champion and evaluated Proposal");
   }
-  return repository.activateChallenger({ ...input, schemaVersion: 1, authority: "human" });
+  const plannedDatasets = proposal.evaluationPlan.datasetIds.map((id, index) =>
+    `${id}\0${proposal.evaluationPlan.datasetHashes[index] ?? ""}`);
+  const comparedDatasets = new Set(comparison.datasetIds.map((id, index) =>
+    `${id}\0${comparison.datasetHashes[index] ?? ""}`));
+  const guardrailsPassed = proposal.evaluationPlan.requiredGuardrails.every((guardrail) =>
+    comparison.guardrailResults[guardrail] === true);
+  if (comparison.status !== "completed" || comparison.sampleSize < proposal.evaluationPlan.minimumSamples ||
+      (proposal.evaluationPlan.requireHoldout && comparison.holdoutTaskCount <= 0) ||
+      comparison.dataSource === "fixture" || !comparison.primaryMetricResult.passed ||
+      comparison.primaryMetricResult.metric !== proposal.evaluationPlan.primaryMetric ||
+      comparison.primaryMetricResult.minimumImprovement !== proposal.evaluationPlan.minimumImprovement ||
+      !guardrailsPassed || !comparison.promotionEligible || comparison.promotionBlockers.length > 0 ||
+      plannedDatasets.some((binding) => !comparedDatasets.has(binding)) ||
+      (proposal.evaluationPlan.approvalRequired && proposal.approval?.authority !== "human")) {
+    throw new Error("Offline Comparison is not eligible for promotion");
+  }
+  const decidedAt = input.decidedAt ?? new Date().toISOString();
+  return repository.activateChallenger({
+    schemaVersion: 1,
+    id: input.id,
+    projectScope: comparison.projectScope,
+    proposalId: comparison.proposalId,
+    fromChampionId: comparison.championId,
+    challengerId: comparison.challengerId,
+    verdict: "promote",
+    comparisonId: comparison.id,
+    authority: "human",
+    decidedBy: input.decidedBy,
+    reason: input.reason,
+    decidedAt,
+  });
 }
 
 export function rollbackChampion(

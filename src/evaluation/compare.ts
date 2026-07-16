@@ -1,5 +1,5 @@
 import { operationInputHash } from "../bindings.js";
-import type { ChangeProposal, ConfigurationVariant } from "../evolution/proposals.js";
+import type { ChangeProposal, ConfigurationVariant, EvaluationPlan } from "../evolution/proposals.js";
 import type { EvaluationDataset, EvaluationTask } from "./datasets.js";
 import type { SanitizedFactBundle } from "./facts.js";
 
@@ -31,17 +31,33 @@ export interface OfflineComparison {
   datasetIds: string[];
   datasetHashes: string[];
   holdoutTaskCount: number;
+  evaluatorKind: "verify-only" | "full-task-replay";
+  evaluatorVersion: string;
+  dataSource: "real" | "fixture";
   status: "completed" | "insufficient-samples" | "guardrail-failed";
   sampleSize: number;
   champion: VariantAggregate;
   challenger: VariantAggregate;
   deltas: {
+    passRate: number | null;
     readyRate: number | null;
     doneRate: number | null;
     verificationFailures: number;
     averageLatencyMs: number | null;
   };
+  primaryMetricResult: {
+    metric: EvaluationPlan["primaryMetric"];
+    championValue: number | null;
+    challengerValue: number | null;
+    improvement: number | null;
+    minimumImprovement: number;
+    passed: boolean;
+  };
+  guardrailResults: Record<EvaluationPlan["requiredGuardrails"][number], boolean | null>;
   guardrailsSatisfied: boolean;
+  promotionEligible: boolean;
+  promotionBlockers: string[];
+  resultArtifactHash: string;
   resultHash: string;
   createdAt: string;
 }
@@ -82,6 +98,8 @@ export async function compareVariants(
     champion: ConfigurationVariant;
     challenger: ConfigurationVariant;
     datasets: readonly EvaluationDataset[];
+    evaluatorKind: OfflineComparison["evaluatorKind"];
+    evaluatorVersion: string;
     evaluate: VariantEvaluator;
     createdAt?: string;
   },
@@ -98,39 +116,79 @@ export async function compareVariants(
   const champion = aggregate(championResults);
   const challenger = aggregate(challengerResults);
   const deltas = {
+    passRate: delta(challenger.passRate, champion.passRate),
     readyRate: delta(challenger.readyRate, champion.readyRate),
     doneRate: delta(challenger.doneRate, champion.doneRate),
     verificationFailures: challenger.verificationFailures - champion.verificationFailures,
     averageLatencyMs: delta(challenger.averageLatencyMs, champion.averageLatencyMs),
   };
   const guardrails = input.proposal.evaluationPlan.guardrails;
-  const guardrailsSatisfied =
-    regression(champion.readyRate, challenger.readyRate) <= guardrails.maximumReadyRegression &&
-    regression(champion.doneRate, challenger.doneRate) <= guardrails.maximumDoneRegression &&
-    deltas.verificationFailures <= guardrails.maximumVerificationFailureIncrease;
+  const guardrailResults: OfflineComparison["guardrailResults"] = {
+    ready: regression(champion.readyRate, challenger.readyRate) <= guardrails.maximumReadyRegression,
+    done: regression(champion.doneRate, challenger.doneRate) <= guardrails.maximumDoneRegression,
+    verificationFailures: deltas.verificationFailures <= guardrails.maximumVerificationFailureIncrease,
+    postMergeFailures: null,
+    humanEscalation: null,
+    latency: null,
+    tokens: null,
+    cost: null,
+  };
+  const guardrailsSatisfied = input.proposal.evaluationPlan.requiredGuardrails
+    .every((guardrail) => guardrailResults[guardrail] === true);
   const sampleSize = challenger.samples;
   const status: OfflineComparison["status"] = sampleSize < input.proposal.evaluationPlan.minimumSamples
     ? "insufficient-samples"
     : guardrailsSatisfied ? "completed" : "guardrail-failed";
+  const primaryMetricResult = comparePrimaryMetric(
+    input.proposal.evaluationPlan.primaryMetric,
+    input.proposal.evaluationPlan.minimumImprovement,
+    champion,
+    challenger,
+  );
+  const dataSource: OfflineComparison["dataSource"] = input.datasets.every((dataset) => dataset.dataSource === "real")
+    ? "real"
+    : "fixture";
+  const datasetBindings = input.datasets
+    .map((dataset) => ({ id: dataset.id, hash: dataset.contentHash }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const promotionBlockers = [
+    sampleSize < input.proposal.evaluationPlan.minimumSamples ? "minimum-samples" : null,
+    input.proposal.evaluationPlan.requireHoldout &&
+      input.datasets.filter((dataset) => dataset.kind === "holdout").every((dataset) => dataset.tasks.length === 0)
+      ? "required-holdout" : null,
+    dataSource === "fixture" ? "fixture-data" : null,
+    !primaryMetricResult.passed ? "primary-metric" : null,
+    !guardrailsSatisfied ? "required-guardrails" : null,
+  ].filter((value): value is string => value !== null);
+  const resultArtifactHash = operationInputHash({
+    evaluatorKind: input.evaluatorKind,
+    evaluatorVersion: requiredText(input.evaluatorVersion, "evaluator version"),
+    champion: championResults.map((result) => result.resultHash),
+    challenger: challengerResults.map((result) => result.resultHash),
+  });
   const body = {
     projectScope: input.proposal.projectScope,
     proposalId: input.proposal.id,
     championId: input.champion.id,
     challengerId: input.challenger.id,
-    datasetIds: input.datasets.map((dataset) => dataset.id).sort(),
-    datasetHashes: input.datasets.map((dataset) => dataset.contentHash).sort(),
+    datasetIds: datasetBindings.map((dataset) => dataset.id),
+    datasetHashes: datasetBindings.map((dataset) => dataset.hash),
     holdoutTaskCount: input.datasets.filter((dataset) => dataset.kind === "holdout")
       .reduce((total, dataset) => total + dataset.tasks.length, 0),
+    evaluatorKind: input.evaluatorKind,
+    evaluatorVersion: input.evaluatorVersion,
+    dataSource,
     status,
     sampleSize,
     champion,
     challenger,
     deltas,
+    primaryMetricResult,
+    guardrailResults,
     guardrailsSatisfied,
-    resultHashes: {
-      champion: championResults.map((result) => result.resultHash),
-      challenger: challengerResults.map((result) => result.resultHash),
-    },
+    promotionEligible: status === "completed" && promotionBlockers.length === 0,
+    promotionBlockers,
+    resultArtifactHash,
   };
   const comparison: OfflineComparison = {
     schemaVersion: 1,
@@ -140,6 +198,37 @@ export async function compareVariants(
     createdAt: input.createdAt ?? new Date().toISOString(),
   };
   return repository.installOfflineComparison(comparison);
+}
+
+function comparePrimaryMetric(
+  metric: EvaluationPlan["primaryMetric"],
+  minimumImprovement: number,
+  champion: VariantAggregate,
+  challenger: VariantAggregate,
+): OfflineComparison["primaryMetricResult"] {
+  const championValue = aggregateMetric(champion, metric);
+  const challengerValue = aggregateMetric(challenger, metric);
+  const improvement = championValue === null || challengerValue === null
+    ? null
+    : metric === "verificationFailures" || metric === "averageLatencyMs"
+      ? championValue - challengerValue
+      : challengerValue - championValue;
+  return {
+    metric,
+    championValue,
+    challengerValue,
+    improvement,
+    minimumImprovement,
+    passed: improvement !== null && improvement >= minimumImprovement,
+  };
+}
+
+function aggregateMetric(aggregateValue: VariantAggregate, metric: EvaluationPlan["primaryMetric"]): number | null {
+  if (metric === "passRate") return aggregateValue.passRate;
+  if (metric === "readyRate") return aggregateValue.readyRate;
+  if (metric === "doneRate") return aggregateValue.doneRate;
+  if (metric === "verificationFailures") return aggregateValue.verificationFailures;
+  return aggregateValue.averageLatencyMs;
 }
 
 export async function runShadowEvaluation(
