@@ -23,7 +23,7 @@ function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-function fixture(): { root: string; taskPath: string } {
+function fixture(options: { taskId?: string; risk?: "low" | "normal" | "high" } = {}): { root: string; taskPath: string } {
   const root = mkdtempSync(join(tmpdir(), "agent-loop-production-target-"));
   temporaryDirectories.push(root);
   git(root, ["init", "-b", "main"]);
@@ -35,11 +35,11 @@ function fixture(): { root: string; taskPath: string } {
   );
   const taskPath = join(root, "task.yaml");
   writeFileSync(taskPath, [
-    "id: PRODUCTION-CLI-1",
+    `id: ${options.taskId ?? "PRODUCTION-CLI-1"}`,
     "goal: Prove the public CLI executes the bounded loop",
     "acceptance:",
     "  - changed.txt is created by the Author and committed by the Harness",
-    "risk: low",
+    `risk: ${options.risk ?? "low"}`,
     "verification:",
     "  - id: production-check",
     "    argv: [node, check.mjs]",
@@ -132,6 +132,7 @@ describe("production CLI loop", () => {
 
   it("runs a low-risk formal Fake Canary with the assigned Challenger configuration", () => {
     const target = fixture();
+    const highRiskTarget = fixture({ taskId: "PRODUCTION-CLI-HIGH", risk: "high" });
     const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-production-canary-home-"));
     temporaryDirectories.push(loopHome);
     const configuration: EvolutionConfiguration = {
@@ -164,6 +165,13 @@ describe("production CLI loop", () => {
       reason: "deterministic Fake Canary", createdAt: "2026-07-16T00:00:00.000Z",
     };
     evaluation.installCanaryAssignment(assignment);
+    evaluation.installCanaryAssignment({
+      ...assignment,
+      id: "formal-high-risk-assignment",
+      taskKey: "PRODUCTION-CLI-HIGH",
+      risk: "high",
+      reason: "adversarial assignment must still resolve to Champion",
+    });
     evaluation.close();
 
     const started = runCli([
@@ -199,6 +207,22 @@ describe("production CLI loop", () => {
       configurationHash: challenger.configurationHash,
       canaryAssignmentId: assignment.id,
       configSource: "canary",
+    });
+    const highRisk = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "run",
+      "--run-id", "production-cli-high-risk", "--task", highRiskTarget.taskPath,
+      "--repository", highRiskTarget.root,
+    ], {
+      ...process.env,
+      CODEX_BIN: fakeCodex,
+      FAKE_CODEX_MODE: "production-author",
+      AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY",
+      AGENT_LOOP_CANARY_ENABLED: "true",
+    }) as { run: { binding: { configurationVariantId: string; canaryAssignmentId: string | null; configSource: string } } };
+    expect(highRisk.run.binding).toMatchObject({
+      configurationVariantId: champion.id,
+      canaryAssignmentId: null,
+      configSource: "champion",
     });
   }, 180_000);
 });

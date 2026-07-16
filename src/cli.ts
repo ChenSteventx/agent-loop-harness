@@ -438,9 +438,15 @@ canary.command("observe")
   .option("--ready", "run became ready", false)
   .option("--done", "run became done", false)
   .option("--verification-failures <count>", "verification failures", "0")
+  .option("--post-merge-failures <count>", "post-merge failures", "0")
+  .option("--human-escalation", "run required human escalation", false)
+  .option("--latency-ms <count>", "observed latency in milliseconds")
+  .option("--tokens <count>", "observed token count; omitted remains unknown")
+  .option("--cost <amount>", "observed cost; omitted remains unknown")
   .action((options: {
     id: string; assignmentId: string; runId: string; factHash: string; ready: boolean; done: boolean;
-    verificationFailures: string;
+    verificationFailures: string; postMergeFailures: string; humanEscalation: boolean;
+    latencyMs?: string; tokens?: string; cost?: string;
   }) => {
     withEvaluationStores((_development, store) => {
       const assignment = store.getCanaryAssignment(options.assignmentId);
@@ -449,6 +455,11 @@ canary.command("observe")
         id: options.id, assignment, formalRunId: options.runId, factHash: options.factHash,
         ready: options.ready, done: options.done,
         verificationFailures: nonnegativeInteger(options.verificationFailures, "verification failures"),
+        postMergeFailures: nonnegativeInteger(options.postMergeFailures, "post-merge failures"),
+        humanEscalation: options.humanEscalation,
+        latencyMs: optionalNonnegativeNumber(options.latencyMs, "latency"),
+        tokens: optionalNonnegativeNumber(options.tokens, "tokens"),
+        cost: optionalNonnegativeNumber(options.cost, "cost"),
       }));
     });
   });
@@ -752,6 +763,13 @@ function positiveInteger(value: string, label: string): number {
 function nonnegativeInteger(value: string, label: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${label} must be a non-negative integer`);
+  return parsed;
+}
+
+function optionalNonnegativeNumber(value: string | undefined, label: string): number | null {
+  if (value === undefined) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${label} must be a non-negative number`);
   return parsed;
 }
 

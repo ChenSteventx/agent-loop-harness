@@ -168,4 +168,35 @@ describe("offline comparison and non-authoritative Shadow", () => {
     expect(evaluation.activeChampion("generic-node")?.id).toBe(champion.id);
     evaluation.close();
   });
+
+  it("does not allow Verify-only to evaluate Provider Routing strategy", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-loop-compare-verify-only-"));
+    temporaryDirectories.push(directory);
+    const evaluation = new EvaluationStore(join(directory, "evaluation.sqlite"));
+    const champion = evaluation.installConfigurationVariant(createInitialChampion({
+      id: "champion", projectScope: "generic-node", version: "1", configuration,
+    }));
+    const catalog = DatasetCatalog.loadDirectory(resolve("eval"));
+    const proposal = evaluation.installChangeProposal(createChangeProposal({
+      id: "provider-proposal", projectScope: "generic-node", target: "provider-routing", baseChampion: champion,
+      patch: { providerOrder: ["claude", "codex"] }, rationale: "bounded routing study",
+      sourceFactHashes: ["fact-1", "fact-2"], datasets: catalog.list("proposal"),
+      metrics: ["readyRate"], minimumSamples: 1,
+    }));
+    const approved = approveChangeProposal(evaluation, {
+      id: proposal.id, approvedBy: "human", reason: "verify evaluator boundary",
+    });
+    const challenger = evaluation.installConfigurationVariant(createChallenger({
+      id: "challenger", version: "2", proposal: approved, champion,
+    }));
+    await expect(compareVariants(evaluation, {
+      id: "forbidden-comparison", proposal: approved, champion, challenger,
+      datasets: catalog.list("comparison"), evaluatorKind: "verify-only", evaluatorVersion: "verify-only/v1",
+      evaluate: async () => ({
+        passed: true, ready: true, done: false, verificationFailures: 0, latencyMs: 1, resultHash: "unused",
+      }),
+    })).rejects.toThrow("Verify-only evaluator cannot evaluate");
+    expect(evaluation.listOfflineComparisons()).toEqual([]);
+    evaluation.close();
+  });
 });

@@ -27,6 +27,13 @@ const gates = [
   [18, "rollback restores the preceding Champion", "test/evolution.test.ts", "restored"],
   [19, "sidecar failure is outside the formal task path", "test/architecture.test.ts", "formal Run state"],
   [20, "Fixture proves mechanism but not production readiness", "test/evaluation-metrics.test.ts", "fixtureOnly"],
+  [21, "missing or forged Comparison cannot promote", "test/evolution.test.ts", "missing-promotion"],
+  [22, "fixture, no-Holdout, and failed Primary Metric comparisons cannot promote", "test/evolution.test.ts", "no-holdout-comparison"],
+  [23, "Verify-only cannot evaluate prompt or provider targets", "test/compare-shadow.test.ts", "Verify-only evaluator cannot evaluate"],
+  [24, "formal low-risk Fake Canary uses Challenger config", "test/production-loop.test.ts", "formal-challenger"],
+  [25, "formal high-risk Run always uses Champion", "test/production-loop.test.ts", "production-cli-high-risk"],
+  [26, "SMTP plaintext authentication is rejected", "test/notifications.test.ts", "requires TLS or STARTTLS"],
+  [27, "Digest windows use Event time", "test/evolution-notifications.test.ts", "old-updated-run"],
 ] as const;
 
 describe("Phase 3 final gate traceability", () => {
