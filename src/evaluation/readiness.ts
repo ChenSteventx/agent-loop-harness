@@ -1,7 +1,7 @@
 export interface ReadinessInputs {
   realRunCount: number;
   resolvedFindingCount: number;
-  exactReplayCount: number;
+  manifestCompleteReplayCount: number;
   goldenTaskCount: number;
   holdoutTaskCount: number;
   completedOfflineComparisons: number;
@@ -14,7 +14,7 @@ export interface ReadinessInputs {
 export interface ReadinessThresholds {
   optimizationRealRuns: number;
   optimizationResolvedFindings: number;
-  optimizationExactReplays: number;
+  optimizationManifestCompleteReplays: number;
   optimizationGoldenTasks: number;
   optimizationHoldoutTasks: number;
   canaryOfflineComparisons: number;
@@ -36,7 +36,7 @@ export interface ReadinessReport {
 export const defaultReadinessThresholds: ReadinessThresholds = {
   optimizationRealRuns: 20,
   optimizationResolvedFindings: 10,
-  optimizationExactReplays: 5,
+  optimizationManifestCompleteReplays: 5,
   optimizationGoldenTasks: 5,
   optimizationHoldoutTasks: 5,
   canaryOfflineComparisons: 3,
@@ -53,7 +53,8 @@ export function evaluateReadiness(
     inputs.coverageComplete ? null : "required real-run coverage is incomplete",
     below(inputs.realRunCount, thresholds.optimizationRealRuns, "real development runs"),
     below(inputs.resolvedFindingCount, thresholds.optimizationResolvedFindings, "human or machine resolved Findings"),
-    below(inputs.exactReplayCount, thresholds.optimizationExactReplays, "exact historical replays"),
+    below(inputs.manifestCompleteReplayCount, thresholds.optimizationManifestCompleteReplays,
+      "manifest-complete historical replays"),
     below(inputs.goldenTaskCount, thresholds.optimizationGoldenTasks, "Golden Tasks"),
     below(inputs.holdoutTaskCount, thresholds.optimizationHoldoutTasks, "Holdout Tasks"),
   ].filter((value): value is string => value !== null);

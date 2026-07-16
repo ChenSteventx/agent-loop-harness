@@ -754,7 +754,7 @@ export class EvaluationStore {
         source_run_id TEXT NOT NULL,
         source_fact_hash TEXT NOT NULL,
         mode TEXT NOT NULL CHECK(mode IN ('full', 'verify-only')),
-        replayability TEXT NOT NULL CHECK(replayability IN ('exact', 'verify-only', 'partial', 'none')),
+        replayability TEXT NOT NULL CHECK(replayability IN ('manifest-complete', 'verify-only', 'partial', 'none')),
         status TEXT NOT NULL CHECK(status IN ('completed', 'failed', 'not-replayable')),
         run_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -868,8 +868,39 @@ export class EvaluationStore {
         provider_message_id TEXT
       );
     `);
+    this.migrateReplayabilityName();
     this.migrateCandidateMemoryStatusConstraint();
     this.migrateEvolutionOutbox();
+  }
+
+  private migrateReplayabilityName(): void {
+    const row = this.database.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'evaluation_runs'",
+    ).get() as { sql: string } | undefined;
+    if (!row?.sql.includes("'exact'")) return;
+    this.database.transaction(() => {
+      this.database.exec(`
+        ALTER TABLE evaluation_runs RENAME TO evaluation_runs_before_manifest_complete;
+        CREATE TABLE evaluation_runs (
+          id TEXT PRIMARY KEY,
+          source_run_id TEXT NOT NULL,
+          source_fact_hash TEXT NOT NULL,
+          mode TEXT NOT NULL CHECK(mode IN ('full', 'verify-only')),
+          replayability TEXT NOT NULL CHECK(replayability IN ('manifest-complete', 'verify-only', 'partial', 'none')),
+          status TEXT NOT NULL CHECK(status IN ('completed', 'failed', 'not-replayable')),
+          run_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(source_run_id, source_fact_hash) REFERENCES fact_bundles(run_id, fact_hash)
+        );
+        INSERT INTO evaluation_runs
+          (id, source_run_id, source_fact_hash, mode, replayability, status, run_json, created_at)
+        SELECT id, source_run_id, source_fact_hash, mode,
+          CASE WHEN replayability = 'exact' THEN 'manifest-complete' ELSE replayability END,
+          status, replace(run_json, '"replayability":"exact"', '"replayability":"manifest-complete"'), created_at
+        FROM evaluation_runs_before_manifest_complete;
+        DROP TABLE evaluation_runs_before_manifest_complete;
+      `);
+    })();
   }
 
   private migrateCandidateMemoryStatusConstraint(): void {

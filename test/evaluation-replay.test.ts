@@ -68,7 +68,7 @@ describe("Evaluation Datasets and Historical Replay", () => {
     expect(() => catalog.get("phase3-holdout-v1", "proposal")).toThrow("inaccessible");
   });
 
-  it("blocks full Replay without exact manifests but permits pinned verify-only Replay", async () => {
+  it("blocks full Replay without manifest-complete inputs but permits pinned verify-only Replay", async () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-loop-replay-"));
     temporaryDirectories.push(directory);
     const development = new SqliteStore(join(directory, "state.sqlite"));
@@ -98,7 +98,7 @@ describe("Evaluation Datasets and Historical Replay", () => {
       createdAt: "2026-07-15T00:02:00.000Z",
     });
     expect(full).toMatchObject({ status: "not-replayable", replayability: "verify-only" });
-    expect(full.missingInputs).toContain("exact_replayability");
+    expect(full.missingInputs).toContain("manifest_complete_replayability");
     expect(calls).toBe(0);
 
     const verifyOnly = await replay.run({
@@ -128,7 +128,7 @@ describe("Evaluation Datasets and Historical Replay", () => {
     development.close();
   });
 
-  it("allows full Replay only after the source invocation is exactly reproducible", async () => {
+  it("allows full Replay only after the source invocation manifest is complete", async () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-loop-exact-replay-"));
     temporaryDirectories.push(directory);
     const development = new SqliteStore(join(directory, "state.sqlite"));
@@ -166,7 +166,7 @@ describe("Evaluation Datasets and Historical Replay", () => {
     const result = await replay.run({
       id: "evaluation-exact", facts, binding, mode: "full", requiredOperationIds: ["run-2:author"],
     });
-    expect(result).toMatchObject({ status: "completed", replayability: "exact", mode: "full" });
+    expect(result).toMatchObject({ status: "completed", replayability: "manifest-complete", mode: "full" });
     expect(() => evaluation.installEvaluationRun({ ...result, status: "failed" })).toThrow("immutable");
     evaluation.close();
     development.close();

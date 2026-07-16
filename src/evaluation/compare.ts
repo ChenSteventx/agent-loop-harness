@@ -72,11 +72,30 @@ export interface ShadowEvaluation {
   challengerId: string;
   championAdviceHash: string;
   challengerAdviceHash: string;
+  championDecision: ShadowDecision;
+  challengerDecision: ShadowDecision;
+  differences: ShadowDifference[];
   agrees: boolean;
   authoritative: false;
   providerRoutingChanged: false;
   runStateChanged: false;
   createdAt: string;
+}
+
+export interface ShadowDecision {
+  contextReferences: string[];
+  providerRoute: string;
+  executionTemplate: "solo" | "assisted" | "reviewed";
+  requireReview: boolean;
+  approvedMemoryIds: string[];
+  timeoutMs: number;
+  retryLimit: number;
+}
+
+export interface ShadowDifference {
+  field: keyof ShadowDecision;
+  champion: ShadowDecision[keyof ShadowDecision];
+  challenger: ShadowDecision[keyof ShadowDecision];
 }
 
 export interface ComparisonRepository {
@@ -105,6 +124,10 @@ export async function compareVariants(
   },
 ): Promise<OfflineComparison> {
   validateComparisonBindings(input);
+  if (input.evaluatorKind === "verify-only" &&
+      ["prompt-variant", "context-ranking", "provider-routing", "role-model-selection"].includes(input.proposal.target)) {
+    throw new Error(`Verify-only evaluator cannot evaluate ${input.proposal.target}`);
+  }
   const championResults: TaskEvaluationResult[] = [];
   const challengerResults: TaskEvaluationResult[] = [];
   for (const dataset of input.datasets) {
@@ -238,7 +261,7 @@ export async function runShadowEvaluation(
     facts: SanitizedFactBundle;
     champion: ConfigurationVariant;
     challenger: ConfigurationVariant;
-    advise: (variant: ConfigurationVariant, facts: SanitizedFactBundle) => Promise<unknown>;
+    advise: (variant: ConfigurationVariant, facts: SanitizedFactBundle) => Promise<ShadowDecision>;
     createdAt?: string;
   },
 ): Promise<ShadowEvaluation> {
@@ -247,8 +270,11 @@ export async function runShadowEvaluation(
       input.challenger.status !== "challenger") {
     throw new Error("Shadow Evaluation bindings do not match the source Run and variants");
   }
-  const championAdviceHash = operationInputHash(await input.advise(input.champion, input.facts));
-  const challengerAdviceHash = operationInputHash(await input.advise(input.challenger, input.facts));
+  const championDecision = validateShadowDecision(await input.advise(input.champion, input.facts));
+  const challengerDecision = validateShadowDecision(await input.advise(input.challenger, input.facts));
+  const championAdviceHash = operationInputHash(championDecision);
+  const challengerAdviceHash = operationInputHash(challengerDecision);
+  const differences = shadowDifferences(championDecision, challengerDecision);
   const shadow: ShadowEvaluation = {
     schemaVersion: 1,
     id: requiredText(input.id, "Shadow Evaluation id"),
@@ -259,13 +285,37 @@ export async function runShadowEvaluation(
     challengerId: input.challenger.id,
     championAdviceHash,
     challengerAdviceHash,
-    agrees: championAdviceHash === challengerAdviceHash,
+    championDecision,
+    challengerDecision,
+    differences,
+    agrees: differences.length === 0,
     authoritative: false,
     providerRoutingChanged: false,
     runStateChanged: false,
     createdAt: input.createdAt ?? new Date().toISOString(),
   };
   return repository.installShadowEvaluation(shadow);
+}
+
+function validateShadowDecision(value: ShadowDecision): ShadowDecision {
+  if (!Array.isArray(value.contextReferences) || value.contextReferences.some((item) => !item.trim()) ||
+      !value.providerRoute.trim() || !["solo", "assisted", "reviewed"].includes(value.executionTemplate) ||
+      typeof value.requireReview !== "boolean" || !Array.isArray(value.approvedMemoryIds) ||
+      value.approvedMemoryIds.some((item) => !item.trim()) || !Number.isSafeInteger(value.timeoutMs) ||
+      value.timeoutMs < 1_000 || !Number.isSafeInteger(value.retryLimit) || value.retryLimit < 0) {
+    throw new Error("Shadow evaluator returned an invalid structured decision");
+  }
+  return {
+    ...value,
+    contextReferences: [...value.contextReferences],
+    approvedMemoryIds: [...value.approvedMemoryIds],
+  };
+}
+
+function shadowDifferences(champion: ShadowDecision, challenger: ShadowDecision): ShadowDifference[] {
+  const fields = Object.keys(champion) as Array<keyof ShadowDecision>;
+  return fields.filter((field) => operationInputHash(champion[field]) !== operationInputHash(challenger[field]))
+    .map((field) => ({ field, champion: champion[field], challenger: challenger[field] }));
 }
 
 function validateComparisonBindings(input: {

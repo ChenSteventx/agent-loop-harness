@@ -22,6 +22,12 @@ export interface EvaluationRun {
   datasetPartition: DatasetKind;
   championVersion: string;
   challengerVersion: string | null;
+  evaluatorKind: "verify-only" | "full-task-replay";
+  evaluatorVersion: string;
+  dataSource: "real" | "fixture";
+  configurationVariantId: string | null;
+  configurationHash: string | null;
+  resultArtifactHash: string | null;
   replayability: Replayability;
   status: EvaluationRunStatus;
   verificationCommit: string | null;
@@ -55,6 +61,11 @@ export class HistoricalReplay {
     datasetPartition?: DatasetKind;
     championVersion?: string;
     challengerVersion?: string | null;
+    evaluatorKind?: EvaluationRun["evaluatorKind"];
+    evaluatorVersion?: string;
+    configurationVariantId?: string | null;
+    configurationHash?: string | null;
+    resultArtifactHash?: string | null;
     requiredOperationIds?: readonly string[];
     createdAt?: string;
   }): Promise<EvaluationRun> {
@@ -69,8 +80,8 @@ export class HistoricalReplay {
       ? boundVerificationHash(input.binding, verificationCommit)
       : null;
     const missingInputs = [...report.missingInputs];
-    if (input.mode === "full" && report.grade !== "exact") {
-      missingInputs.push("exact_replayability");
+    if (input.mode === "full" && report.grade !== "manifest-complete") {
+      missingInputs.push("manifest_complete_replayability");
       return this.repository.installEvaluationRun(baseRun(input, report.grade, "not-replayable", null,
         verificationCommit, verificationBindingHash, unique(missingInputs), createdAt));
     }
@@ -134,6 +145,11 @@ function baseRun(
     datasetPartition?: DatasetKind;
     championVersion?: string;
     challengerVersion?: string | null;
+    evaluatorKind?: EvaluationRun["evaluatorKind"];
+    evaluatorVersion?: string;
+    configurationVariantId?: string | null;
+    configurationHash?: string | null;
+    resultArtifactHash?: string | null;
   },
   replayability: Replayability,
   status: EvaluationRunStatus,
@@ -153,6 +169,12 @@ function baseRun(
     datasetPartition: input.datasetPartition ?? "historical",
     championVersion: input.championVersion ?? "development-source",
     challengerVersion: input.challengerVersion ?? null,
+    evaluatorKind: input.evaluatorKind ?? (input.mode === "full" ? "full-task-replay" : "verify-only"),
+    evaluatorVersion: input.evaluatorVersion ?? (input.mode === "full" ? "full-task-replay/v1" : "verify-only/v1"),
+    dataSource: input.facts.source,
+    configurationVariantId: input.configurationVariantId ?? null,
+    configurationHash: input.configurationHash ?? null,
+    resultArtifactHash: input.resultArtifactHash ?? outcome?.evidenceHash ?? null,
     replayability,
     status,
     verificationCommit,

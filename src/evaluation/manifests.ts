@@ -9,7 +9,7 @@ import type { VerificationCommand } from "../ports.js";
 import type { ProviderIdentity } from "../provider.js";
 
 export type InvocationRole = "explorer" | "author" | "repair" | "reviewer";
-export type Replayability = "exact" | "verify-only" | "partial" | "none";
+export type Replayability = "manifest-complete" | "verify-only" | "partial" | "none";
 
 export interface InvocationManifest {
   schemaVersion: 1;
@@ -188,7 +188,7 @@ export function gradeReplayability(input: {
       missing.add(`dependency_fingerprint:${manifest.id}`);
     }
   }
-  if (missing.size === 0) return { grade: "exact", missingInputs: [] };
+  if (missing.size === 0) return { grade: "manifest-complete", missingInputs: [] };
   return {
     grade: input.binding.taskSpec.verification.length > 0 ? "verify-only" : "partial",
     missingInputs: [...missing].sort(),

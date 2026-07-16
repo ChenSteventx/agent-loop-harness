@@ -57,7 +57,7 @@ export interface CanaryAssignment {
   id: string;
   projectScope: string;
   taskKey: string;
-  risk: "low" | "medium" | "high" | "unknown";
+  risk: "low" | "normal" | "high" | "unknown";
   proposalId: string;
   championId: string;
   challengerId: string;
@@ -175,8 +175,9 @@ export function assignCanary(
     } else if (policy.extraBudgetTokens > input.approval.maximumExtraBudgetTokens) {
       reason = "Canary extra budget exceeds human approval";
     }
-    else if (input.comparison.status !== "completed" || !input.comparison.guardrailsSatisfied) {
-      reason = "Offline Comparison guardrails are not satisfied";
+    else if (input.comparison.dataSource === "fixture" || !input.comparison.promotionEligible ||
+        input.comparison.status !== "completed" || !input.comparison.guardrailsSatisfied) {
+      reason = "Offline Comparison is not eligible for Canary";
     } else if (bucket >= policy.basisPoints) reason = "Stable hash selected the Champion cohort";
     else {
       selected = "challenger";

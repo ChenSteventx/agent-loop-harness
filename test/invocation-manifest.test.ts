@@ -113,7 +113,7 @@ describe("Invocation Manifest and replayability", () => {
     store.close();
   });
 
-  it("never calls a historical Run exact when its Invocation Manifest is missing", () => {
+  it("never calls a historical Run manifest-complete when its Invocation Manifest is missing", () => {
     expect(gradeReplayability({ binding, manifests: [], requiredOperationIds: ["run-1:author"] })).toEqual({
       grade: "verify-only",
       missingInputs: [
@@ -128,7 +128,7 @@ describe("Invocation Manifest and replayability", () => {
       binding,
       manifests: [manifest()],
       requiredOperationIds: ["run-1:author"],
-    })).toEqual({ grade: "exact", missingInputs: [] });
+    })).toEqual({ grade: "manifest-complete", missingInputs: [] });
     expect(gradeReplayability({ binding: null, manifests: [] })).toEqual({
       grade: "none",
       missingInputs: ["run_binding"],

@@ -106,11 +106,20 @@ describe("offline comparison and non-authoritative Shadow", () => {
       facts,
       champion,
       challenger,
-      advise: async (variant) => ({ retryLimit: variant.configuration.retryLimit }),
+      advise: async (variant) => ({
+        contextReferences: ["task", "acceptance"],
+        providerRoute: variant.configuration.providerOrder[0]!,
+        executionTemplate: "solo",
+        requireReview: false,
+        approvedMemoryIds: [],
+        timeoutMs: variant.configuration.timeoutMs,
+        retryLimit: variant.configuration.retryLimit,
+      }),
       createdAt: "2026-07-15T00:03:00.000Z",
     });
     expect(shadow).toMatchObject({
       authoritative: false, providerRoutingChanged: false, runStateChanged: false, agrees: false,
+      differences: [expect.objectContaining({ field: "retryLimit", champion: 1, challenger: 2 })],
     });
     expect(evaluation.activeChampion("generic-node")?.id).toBe(champion.id);
     expect(JSON.stringify({ run: development.getRun("run-1"), events: development.listEvents("run-1") })).toBe(before);

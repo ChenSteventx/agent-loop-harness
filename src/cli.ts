@@ -20,9 +20,9 @@ import { projectRunMetrics, summarizeMetrics } from "./evaluation/metrics.js";
 import { evaluateReadiness } from "./evaluation/readiness.js";
 import { EvaluationStore } from "./evaluation/store.js";
 import { DatasetCatalog } from "./evaluation/datasets.js";
-import { HistoricalReplay, pinnedVerificationCommit, type ReplayMode } from "./evaluation/replay.js";
-import { CommandRunner, GitService } from "./execution.js";
-import { operationInputHash } from "./bindings.js";
+import { runShadowEvaluation, type ShadowDecision } from "./evaluation/compare.js";
+import { HistoricalReplay, type ReplayMode } from "./evaluation/replay.js";
+import { VerifyOnlyEvaluator } from "./evaluation/evaluators.js";
 import {
   approveCandidateMemory,
   deriveCandidateMemories,
@@ -33,12 +33,18 @@ import {
 import {
   approveChangeProposal,
   createChangeProposal,
+  createChallenger,
   evolutionTargets,
   promoteChallenger,
   rollbackChampion,
   type EvolutionTarget,
 } from "./evolution/proposals.js";
-import { disabledCanaryPolicy } from "./evolution/canary.js";
+import {
+  assignCanary,
+  createCanaryApproval,
+  disabledCanaryPolicy,
+  recordCanaryObservation,
+} from "./evolution/canary.js";
 import { SmtpEmailTransport } from "./email.js";
 import { NotificationDispatcher, type NotificationDispatcherOptions } from "./notifications.js";
 import { digestWindow, renderMetricsDigest, type DigestPeriod } from "./evaluation/digest.js";
@@ -47,6 +53,7 @@ import {
   providerProfileNames,
   type ProviderProfileName,
 } from "./profiles.js";
+import { riskValues, type Risk } from "./routing.js";
 
 const program = new Command()
   .name("agent-loop")
@@ -176,8 +183,9 @@ evaluation
         realRunCount: realRuns.length,
         resolvedFindingCount: projections.reduce((total, value) =>
           total + value.reviewerFindings.confirmed + value.reviewerFindings.rejected, 0),
-        exactReplayCount: evaluationStore.listEvaluationRuns()
-          .filter((run) => run.status === "completed" && run.replayability === "exact").length,
+        manifestCompleteReplayCount: evaluationStore.listEvaluationRuns()
+          .filter((run) => run.dataSource === "real" && run.status === "completed" &&
+            run.replayability === "manifest-complete").length,
         goldenTaskCount: datasets.filter((dataset) => dataset.kind === "golden")
           .reduce((total, dataset) => total + dataset.tasks.length, 0),
         holdoutTaskCount: datasets.filter((dataset) => dataset.kind === "holdout")
@@ -223,6 +231,36 @@ const shadow = program.command("shadow").description("non-authoritative Shadow r
 shadow.command("report").option("--project <scope>").action((options: { project?: string }) => {
   withEvaluationStores((_development, store) => print(store.listShadowEvaluations(options.project)));
 });
+shadow.command("run")
+  .requiredOption("--id <id>")
+  .requiredOption("--run-id <id>")
+  .requiredOption("--challenger-id <id>")
+  .action(async (options: { id: string; runId: string; challengerId: string }) => {
+    await withEvaluationStoresAsync(async (development, store) => {
+      const facts = store.installFactBundle(exportRunFacts(development, options.runId));
+      const challenger = store.getConfigurationVariant(options.challengerId);
+      const champion = challenger ? store.activeChampion(challenger.projectScope) : null;
+      if (!challenger || !champion) throw new Error("Shadow variants are incomplete");
+      print(await runShadowEvaluation(store, {
+        id: options.id,
+        facts,
+        champion,
+        challenger,
+        advise: async (variant): Promise<ShadowDecision> => ({
+          contextReferences: variant.configuration.contextRanking ?? ["task", "acceptance", "repository"],
+          providerRoute: variant.configuration.providerOrder[0]!,
+          executionTemplate: facts.run.binding?.executionTemplate === "solo" ||
+            facts.run.binding?.executionTemplate === "reviewed"
+            ? facts.run.binding.executionTemplate
+            : "assisted",
+          requireReview: facts.run.binding?.executionTemplate === "reviewed",
+          approvedMemoryIds: [],
+          timeoutMs: variant.configuration.timeoutMs,
+          retryLimit: variant.configuration.retryLimit,
+        }),
+      }));
+    });
+  });
 
 const proposal = program.command("proposal").description("configuration-only Change Proposals");
 proposal
@@ -265,6 +303,22 @@ proposal
   .requiredOption("--reason <text>")
   .action((options: { id: string; approvedBy: string; reason: string }) => {
     withEvaluationStores((_development, store) => print(approveChangeProposal(store, options)));
+  });
+
+proposal
+  .command("challenger")
+  .requiredOption("--proposal-id <id>")
+  .requiredOption("--id <id>")
+  .requiredOption("--version <version>")
+  .action((options: { proposalId: string; id: string; version: string }) => {
+    withEvaluationStores((_development, store) => {
+      const proposalValue = store.getChangeProposal(options.proposalId);
+      const champion = proposalValue ? store.activeChampion(proposalValue.projectScope) : null;
+      if (!proposalValue || !champion) throw new Error("Challenger facts are incomplete");
+      print(store.installConfigurationVariant(createChallenger({
+        id: options.id, version: options.version, proposal: proposalValue, champion,
+      })));
+    });
   });
 
 const config = program.command("config").description("Champion activation and rollback decisions");
@@ -322,6 +376,81 @@ canary.command("status").option("--project <scope>").action((options: { project?
     pendingRollbackEvents: store.listPendingEvolutionOutbox(),
   }));
 });
+canary.command("approve")
+  .requiredOption("--id <id>")
+  .requiredOption("--proposal-id <id>")
+  .requiredOption("--challenger-id <id>")
+  .requiredOption("--approved-by <identity>")
+  .requiredOption("--reason <text>")
+  .requiredOption("--expires-at <timestamp>")
+  .option("--basis-points <count>", "maximum basis points", "100")
+  .option("--maximum-tasks <count>", "maximum tasks", "10")
+  .option("--extra-budget-tokens <count>", "maximum extra tokens", "0")
+  .action((options: {
+    id: string; proposalId: string; challengerId: string; approvedBy: string; reason: string; expiresAt: string;
+    basisPoints: string; maximumTasks: string; extraBudgetTokens: string;
+  }) => {
+    withEvaluationStores((_development, store) => {
+      const proposalValue = store.getChangeProposal(options.proposalId);
+      const challenger = store.getConfigurationVariant(options.challengerId);
+      if (!proposalValue || !challenger) throw new Error("Canary approval facts are incomplete");
+      print(store.installCanaryApproval(createCanaryApproval({
+        id: options.id, projectScope: proposalValue.projectScope, proposal: proposalValue, challenger,
+        maximumBasisPoints: positiveInteger(options.basisPoints, "basis points"),
+        maximumTasks: positiveInteger(options.maximumTasks, "maximum tasks"),
+        maximumExtraBudgetTokens: nonnegativeInteger(options.extraBudgetTokens, "extra budget tokens"),
+        approvedBy: options.approvedBy, reason: options.reason, expiresAt: options.expiresAt,
+      })));
+    });
+  });
+
+canary.command("assign")
+  .requiredOption("--id <id>")
+  .requiredOption("--comparison-id <id>")
+  .requiredOption("--task-key <key>")
+  .requiredOption("--risk <risk>")
+  .requiredOption("--approval-id <id>")
+  .action((options: { id: string; comparisonId: string; taskKey: string; risk: string; approvalId: string }) => {
+    withEvaluationStores((_development, store) => {
+      const comparison = store.getOfflineComparison(options.comparisonId);
+      const proposalValue = comparison ? store.getChangeProposal(comparison.proposalId) : null;
+      const champion = comparison ? store.getConfigurationVariant(comparison.championId) : null;
+      const challenger = comparison ? store.getConfigurationVariant(comparison.challengerId) : null;
+      const approval = store.getCanaryApproval(options.approvalId);
+      const readiness = store.latestReadiness();
+      if (!comparison || !proposalValue || !champion || !challenger || !readiness) {
+        throw new Error("Canary assignment facts are incomplete");
+      }
+      print(assignCanary(store, {
+        id: options.id, projectScope: comparison.projectScope, taskKey: options.taskKey,
+        risk: parseRisk(options.risk), proposal: proposalValue, champion, challenger, comparison,
+        readiness, approval,
+      }));
+    });
+  });
+
+canary.command("observe")
+  .requiredOption("--id <id>")
+  .requiredOption("--assignment-id <id>")
+  .requiredOption("--run-id <id>")
+  .requiredOption("--fact-hash <hash>")
+  .option("--ready", "run became ready", false)
+  .option("--done", "run became done", false)
+  .option("--verification-failures <count>", "verification failures", "0")
+  .action((options: {
+    id: string; assignmentId: string; runId: string; factHash: string; ready: boolean; done: boolean;
+    verificationFailures: string;
+  }) => {
+    withEvaluationStores((_development, store) => {
+      const assignment = store.getCanaryAssignment(options.assignmentId);
+      if (!assignment) throw new Error("Canary Assignment not found");
+      print(recordCanaryObservation(store, {
+        id: options.id, assignment, formalRunId: options.runId, factHash: options.factHash,
+        ready: options.ready, done: options.done,
+        verificationFailures: nonnegativeInteger(options.verificationFailures, "verification failures"),
+      }));
+    });
+  });
 
 const notify = program.command("notify").description("dispatch existing transactional Outbox notifications");
 notify
@@ -488,42 +617,22 @@ async function runReplayCommand(options: { runId: string; mode: string; evaluati
     if (!run) throw new Error(`Run not found: ${options.runId}`);
     const facts = evaluationStore.installFactBundle(exportRunFacts(development, options.runId));
     const evaluationId = options.evaluationId ?? `replay:${options.runId}:${Date.now()}`;
+    const evaluator = new VerifyOnlyEvaluator();
     const replay = new HistoricalReplay(evaluationStore, async (replayFacts, replayMode, binding) => {
       if (replayMode === "full") throw new Error("FullReplayExecutorUnavailable");
-      const commit = pinnedVerificationCommit(replayFacts);
-      if (!commit || new GitService(binding.worktreePath).head() !== commit) {
-        throw new Error("PinnedVerificationCommitUnavailable");
-      }
-      const runner = new CommandRunner();
-      const receipts = [];
-      for (const command of binding.taskSpec.verification) {
-        const result = await runner.run({
-          argv: command.argv,
-          cwd: binding.worktreePath,
-          artifactDirectory: resolve(home, "evaluation-runs", evaluationId, command.id),
-          environmentAllowlist: [
-            "PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE",
-          ],
-          timeoutMs: 60_000,
-          outputLimitBytes: 1024 * 1024,
-          shell: false,
-        });
-        receipts.push({ commandId: command.id, exitCode: result.exitCode, signal: result.signal,
-          timedOut: result.timedOut, commitBefore: result.commitBefore });
-      }
-      const passed = receipts.every((receipt) => receipt.exitCode === 0 && receipt.signal === null &&
-        !receipt.timedOut && receipt.commitBefore === commit);
-      return {
-        passed,
-        evidenceHash: operationInputHash(receipts),
-        diagnostics: receipts.filter((receipt) => receipt.exitCode !== 0).map((receipt) => receipt.commandId),
-      };
+      return evaluator.evaluate({
+        facts: replayFacts,
+        binding,
+        artifactDirectory: resolve(home, "evaluation-runs", evaluationId),
+      });
     });
     print(await replay.run({
       id: evaluationId,
       facts,
       binding: run.binding,
       mode,
+      evaluatorKind: evaluator.kind,
+      evaluatorVersion: evaluator.version,
       requiredOperationIds: development.listOperations(options.runId)
         .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
         .map((operation) => operation.id),
@@ -629,6 +738,17 @@ function positiveInteger(value: string, label: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${label} must be a positive integer`);
   return parsed;
+}
+
+function nonnegativeInteger(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${label} must be a non-negative integer`);
+  return parsed;
+}
+
+function parseRisk(value: string): Risk {
+  if (riskValues.includes(value as Risk)) return value as Risk;
+  throw new Error(`Unknown risk: ${value}`);
 }
 
 function notificationOptionsFromEnvironment(environment: NodeJS.ProcessEnv = process.env): NotificationDispatcherOptions {

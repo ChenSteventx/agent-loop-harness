@@ -116,7 +116,7 @@ describe("sanitized fact projections", () => {
     const report = evaluateReadiness({
       realRunCount: 0,
       resolvedFindingCount: 0,
-      exactReplayCount: 0,
+      manifestCompleteReplayCount: 0,
       goldenTaskCount: 0,
       holdoutTaskCount: 0,
       completedOfflineComparisons: 0,

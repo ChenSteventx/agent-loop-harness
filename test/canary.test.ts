@@ -113,7 +113,7 @@ describe("disabled low-risk Canary", () => {
     const readiness = evaluateReadiness({
       realRunCount: 1,
       resolvedFindingCount: 1,
-      exactReplayCount: 1,
+      manifestCompleteReplayCount: 1,
       goldenTaskCount: 1,
       holdoutTaskCount: 1,
       completedOfflineComparisons: 1,
@@ -124,7 +124,7 @@ describe("disabled low-risk Canary", () => {
     }, {
       optimizationRealRuns: 1,
       optimizationResolvedFindings: 1,
-      optimizationExactReplays: 1,
+      optimizationManifestCompleteReplays: 1,
       optimizationGoldenTasks: 1,
       optimizationHoldoutTasks: 1,
       canaryOfflineComparisons: 1,
@@ -160,7 +160,7 @@ describe("disabled low-risk Canary", () => {
     expect(assignment).toMatchObject({ selected: "challenger", selectedVariantId: challenger.id });
     expect(stableCanaryBucket("generic-node", taskKey, proposal.id, "stable-salt")).toBe(assignment.bucket);
     expect(assignCanary(store, {
-      id: "assignment-medium", projectScope: "generic-node", taskKey, risk: "medium", proposal,
+      id: "assignment-normal", projectScope: "generic-node", taskKey, risk: "normal", proposal,
       champion, challenger, comparison, readiness, approval, policy,
     }).selected).toBe("champion");
     expect(assignCanary(store, {
@@ -195,7 +195,7 @@ describe("disabled low-risk Canary", () => {
     development.close();
   });
 
-  it("keeps medium-risk tasks and unready or unapproved work on the Champion", () => {
+  it("keeps normal-risk tasks and unready or unapproved work on the Champion", () => {
     expect(stableCanaryBucket("scope", "task", "proposal", "salt"))
       .toBe(stableCanaryBucket("scope", "task", "proposal", "salt"));
     expect(disabledCanaryPolicy).toEqual({
