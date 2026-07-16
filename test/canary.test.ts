@@ -171,9 +171,10 @@ describe("disabled low-risk Canary", () => {
     })).toEqual(observation);
     expect(store.activeChampion("generic-node")?.id).toBe(champion.id);
     expect(store.getConfigurationVariant(challenger.id)?.status).toBe("rolled-back");
-    expect(store.listPendingEvolutionOutbox()).toEqual([
-      expect.objectContaining({ type: "canary-rollback", payload: expect.objectContaining({ formalRunId: "formal-run" }) }),
-    ]);
+    expect(store.listPendingEvolutionOutbox().find((event) => event.type === "canary-started"))
+      .toMatchObject({ payload: expect.objectContaining({ assignmentId: "assignment-enabled" }) });
+    expect(store.listPendingEvolutionOutbox().find((event) => event.type === "canary-rolled-back"))
+      .toMatchObject({ payload: expect.objectContaining({ formalRunId: "formal-run" }) });
     expect(JSON.stringify({ run: development.getRun("formal-run"), events: development.listEvents("formal-run") }))
       .toBe(formalBefore);
     store.close();

@@ -114,6 +114,8 @@ describe("offline comparison and non-authoritative Shadow", () => {
     expect(JSON.stringify({ run: development.getRun("run-1"), events: development.listEvents("run-1") })).toBe(before);
     expect(evaluation.listOfflineComparisons()).toEqual([comparison]);
     expect(evaluation.listShadowEvaluations()).toEqual([shadow]);
+    expect(evaluation.listPendingEvolutionOutbox().find((event) => event.type === "shadow-ready"))
+      .toMatchObject({ payload: expect.objectContaining({ shadowId: shadow.id, sourceRunId: "run-1" }) });
     evaluation.close();
     development.close();
   });

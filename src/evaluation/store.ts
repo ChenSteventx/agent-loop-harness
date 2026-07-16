@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { canonicalJson } from "../bindings.js";
+import { canonicalJson, operationInputHash } from "../bindings.js";
 import type { SanitizedFactBundle } from "./facts.js";
 import type { RunMetricsProjection } from "./metrics.js";
 import type { ReadinessReport } from "./readiness.js";
@@ -17,8 +17,12 @@ import type {
   CanaryApproval,
   CanaryAssignment,
   CanaryObservation,
-  EvolutionOutboxEvent,
 } from "../evolution/canary.js";
+import {
+  evolutionOutboxEventTypes,
+  type EvolutionOutboxEvent,
+  type EvolutionOutboxEventType,
+} from "./outbox.js";
 
 type Sqlite = InstanceType<typeof Database>;
 
@@ -130,12 +134,23 @@ export class EvaluationStore {
       if (canonicalJson(existing) !== canonicalJson(run)) throw new Error(`Evaluation Run ${run.id} is immutable`);
       return existing;
     }
-    this.database.prepare(
-      `INSERT INTO evaluation_runs
-       (id, source_run_id, source_fact_hash, mode, replayability, status, run_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(run.id, run.sourceRunId, run.sourceFactHash, run.mode, run.replayability,
-      run.status, JSON.stringify(run), run.createdAt);
+    const transaction = this.database.transaction(() => {
+      this.database.prepare(
+        `INSERT INTO evaluation_runs
+         (id, source_run_id, source_fact_hash, mode, replayability, status, run_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(run.id, run.sourceRunId, run.sourceFactHash, run.mode, run.replayability,
+        run.status, JSON.stringify(run), run.createdAt);
+      const facts = this.getFactBundle(run.sourceRunId, run.sourceFactHash);
+      this.enqueueEvolutionOutbox("evaluation-completed", facts?.run.binding?.projectAdapterName ?? "unbound", {
+        evaluationRunId: run.id,
+        sourceRunId: run.sourceRunId,
+        status: run.status,
+        replayability: run.replayability,
+        passed: run.outcome?.passed ?? null,
+      }, run.createdAt, `evaluation-completed:${run.id}`);
+    });
+    transaction();
     return this.getEvaluationRun(run.id)!;
   }
 
@@ -159,16 +174,32 @@ export class EvaluationStore {
     const duplicate = this.database.prepare(
       "SELECT id FROM candidate_memories WHERE project_scope = ? AND content_hash = ?",
     ).get(memory.projectScope, memory.contentHash) as { id: string } | undefined;
-    if (duplicate) throw new Error(`Candidate Memory duplicates ${duplicate.id}`);
+    if (duplicate) {
+      this.enqueueEvolutionOutbox("memory-conflict", memory.projectScope, {
+        candidateId: memory.id,
+        conflictingMemoryId: duplicate.id,
+        contentHash: memory.contentHash,
+      }, memory.createdAt, `memory-conflict:${memory.projectScope}:${memory.contentHash}`);
+      throw new Error(`Candidate Memory duplicates ${duplicate.id}`);
+    }
     if (memory.status !== "candidate" || memory.decision !== null) {
       throw new Error("Candidate Memory must be installed before any decision");
     }
-    this.database.prepare(
-      `INSERT INTO candidate_memories
-       (id, project_scope, kind, content_hash, status, memory_json, created_at, expires_at, decided_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-    ).run(memory.id, memory.projectScope, memory.kind, memory.contentHash, memory.status,
-      JSON.stringify(memory), memory.createdAt, memory.expiresAt);
+    const transaction = this.database.transaction(() => {
+      this.database.prepare(
+        `INSERT INTO candidate_memories
+         (id, project_scope, kind, content_hash, status, memory_json, created_at, expires_at, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+      ).run(memory.id, memory.projectScope, memory.kind, memory.contentHash, memory.status,
+        JSON.stringify(memory), memory.createdAt, memory.expiresAt);
+      this.enqueueEvolutionOutbox("memory-quarantined", memory.projectScope, {
+        candidateId: memory.id,
+        kind: memory.kind,
+        contentHash: memory.contentHash,
+        supportCount: memory.supportCount,
+      }, memory.createdAt, `memory-quarantined:${memory.id}`);
+    });
+    transaction();
     return this.getCandidateMemory(memory.id)!;
   }
 
@@ -214,12 +245,21 @@ export class EvaluationStore {
       return existing;
     }
     if (proposal.status !== "draft" || proposal.approval !== null) throw new Error("Change Proposal must begin as draft");
-    this.database.prepare(
-      `INSERT INTO change_proposals
-       (id, project_scope, target, base_champion_id, proposal_hash, status, proposal_json, created_at, decided_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-    ).run(proposal.id, proposal.projectScope, proposal.target, proposal.baseChampionId,
-      proposal.proposalHash, proposal.status, JSON.stringify(proposal), proposal.createdAt);
+    const transaction = this.database.transaction(() => {
+      this.database.prepare(
+        `INSERT INTO change_proposals
+         (id, project_scope, target, base_champion_id, proposal_hash, status, proposal_json, created_at, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+      ).run(proposal.id, proposal.projectScope, proposal.target, proposal.baseChampionId,
+        proposal.proposalHash, proposal.status, JSON.stringify(proposal), proposal.createdAt);
+      this.enqueueEvolutionOutbox("proposal-created", proposal.projectScope, {
+        proposalId: proposal.id,
+        target: proposal.target,
+        baseChampionId: proposal.baseChampionId,
+        proposalHash: proposal.proposalHash,
+      }, proposal.createdAt, `proposal-created:${proposal.id}`);
+    });
+    transaction();
     return this.getChangeProposal(proposal.id)!;
   }
 
@@ -329,6 +369,13 @@ export class EvaluationStore {
       this.database.prepare("UPDATE change_proposals SET status = ?, proposal_json = ? WHERE id = ?")
         .run(promoted.status, JSON.stringify(promoted), promoted.id);
       this.insertEvolutionDecision(decision.id, decision.projectScope, "promotion", decision, decision.decidedAt);
+      this.enqueueEvolutionOutbox("canary-promoted", decision.projectScope, {
+        decisionId: decision.id,
+        proposalId: decision.proposalId,
+        championId: activated.id,
+        previousChampionId: retired.id,
+        comparisonId: decision.comparisonId,
+      }, decision.decidedAt, `canary-promoted:${decision.id}`);
       return this.getConfigurationVariant(activated.id)!;
     });
     return transaction();
@@ -398,12 +445,22 @@ export class EvaluationStore {
     if (shadow.authoritative !== false || shadow.providerRoutingChanged !== false || shadow.runStateChanged !== false) {
       throw new Error("Shadow Evaluation must be non-authoritative");
     }
-    this.database.prepare(
-      `INSERT INTO shadow_evaluations
-       (id, source_run_id, source_fact_hash, project_scope, champion_id, challenger_id, agrees, shadow_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(shadow.id, shadow.sourceRunId, shadow.sourceFactHash, shadow.projectScope,
-      shadow.championId, shadow.challengerId, shadow.agrees ? 1 : 0, JSON.stringify(shadow), shadow.createdAt);
+    const transaction = this.database.transaction(() => {
+      this.database.prepare(
+        `INSERT INTO shadow_evaluations
+         (id, source_run_id, source_fact_hash, project_scope, champion_id, challenger_id, agrees, shadow_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(shadow.id, shadow.sourceRunId, shadow.sourceFactHash, shadow.projectScope,
+        shadow.championId, shadow.challengerId, shadow.agrees ? 1 : 0, JSON.stringify(shadow), shadow.createdAt);
+      this.enqueueEvolutionOutbox("shadow-ready", shadow.projectScope, {
+        shadowId: shadow.id,
+        sourceRunId: shadow.sourceRunId,
+        championId: shadow.championId,
+        challengerId: shadow.challengerId,
+        agrees: shadow.agrees,
+      }, shadow.createdAt, `shadow-ready:${shadow.id}`);
+    });
+    transaction();
     return this.getShadowEvaluation(shadow.id)!;
   }
 
@@ -459,12 +516,24 @@ export class EvaluationStore {
       if (canonicalJson(existing) !== canonicalJson(assignment)) throw new Error(`Canary Assignment ${assignment.id} is immutable`);
       return existing;
     }
-    this.database.prepare(
-      `INSERT INTO canary_assignments
-       (id, project_scope, task_key, proposal_id, selected, assignment_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(assignment.id, assignment.projectScope, assignment.taskKey, assignment.proposalId,
-      assignment.selected, JSON.stringify(assignment), assignment.createdAt);
+    const transaction = this.database.transaction(() => {
+      this.database.prepare(
+        `INSERT INTO canary_assignments
+         (id, project_scope, task_key, proposal_id, selected, assignment_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(assignment.id, assignment.projectScope, assignment.taskKey, assignment.proposalId,
+        assignment.selected, JSON.stringify(assignment), assignment.createdAt);
+      if (assignment.selected === "challenger") {
+        this.enqueueEvolutionOutbox("canary-started", assignment.projectScope, {
+          assignmentId: assignment.id,
+          proposalId: assignment.proposalId,
+          challengerId: assignment.challengerId,
+          taskKey: assignment.taskKey,
+          basisPoints: assignment.basisPoints,
+        }, assignment.createdAt, `canary-started:${assignment.id}`);
+      }
+    });
+    transaction();
     return this.getCanaryAssignment(assignment.id)!;
   }
 
@@ -516,7 +585,7 @@ export class EvaluationStore {
     const transaction = this.database.transaction(() => {
       if (rollback) {
         this.rollbackCanary(rollback);
-        this.enqueueEvolutionOutbox("canary-rollback", rollback.projectScope, {
+        this.enqueueEvolutionOutbox("canary-rolled-back", rollback.projectScope, {
           decisionId: rollback.id,
           formalRunId: observation.formalRunId,
           factHash: observation.factHash,
@@ -553,22 +622,100 @@ export class EvaluationStore {
   }
 
   enqueueEvolutionOutbox(
-    type: "canary-rollback",
+    type: EvolutionOutboxEventType,
     projectScope: string,
     payload: unknown,
     createdAt: string,
+    requestedDeduplicationKey?: string,
   ): EvolutionOutboxEvent {
+    if (!evolutionOutboxEventTypes.includes(type)) throw new Error(`Unknown Evolution Outbox event: ${type}`);
+    const deduplicationKey = requestedDeduplicationKey ??
+      `evolution:${operationInputHash({ type, projectScope, payload, createdAt })}`;
+    if (!deduplicationKey.trim()) throw new Error("Evolution Outbox deduplication key is required");
+    const existing = this.database.prepare(
+      "SELECT * FROM evolution_outbox WHERE deduplication_key = ?",
+    ).get(deduplicationKey) as EvolutionOutboxRow | undefined;
+    if (existing) {
+      const installed = mapEvolutionOutbox(existing);
+      if (installed.type !== type || installed.projectScope !== projectScope ||
+          canonicalJson(installed.payload) !== canonicalJson(payload)) {
+        throw new Error(`Evolution Outbox key ${deduplicationKey} was used for different content`);
+      }
+      return installed;
+    }
     const result = this.database.prepare(
-      "INSERT INTO evolution_outbox (type, project_scope, payload_json, created_at, delivered_at) VALUES (?, ?, ?, ?, NULL)",
-    ).run(type, projectScope, JSON.stringify(payload), createdAt);
-    return { id: Number(result.lastInsertRowid), type, projectScope, payload, createdAt, deliveredAt: null };
+      `INSERT INTO evolution_outbox
+       (type, project_scope, payload_json, created_at, delivered_at, attempts, last_error,
+        next_attempt_at, deduplication_key, dead_lettered_at, provider_message_id)
+       VALUES (?, ?, ?, ?, NULL, 0, NULL, ?, ?, NULL, NULL)`,
+    ).run(type, projectScope, JSON.stringify(payload), createdAt, createdAt, deduplicationKey);
+    return this.requireEvolutionOutbox(Number(result.lastInsertRowid));
   }
 
   listPendingEvolutionOutbox(): EvolutionOutboxEvent[] {
-    return (this.database.prepare("SELECT * FROM evolution_outbox WHERE delivered_at IS NULL ORDER BY id").all() as
-      Array<{ id: number; type: "canary-rollback"; project_scope: string; payload_json: string; created_at: string; delivered_at: string | null }>)
-      .map((row) => ({ id: row.id, type: row.type, projectScope: row.project_scope,
-        payload: JSON.parse(row.payload_json) as unknown, createdAt: row.created_at, deliveredAt: row.delivered_at }));
+    return (this.database.prepare(
+      "SELECT * FROM evolution_outbox WHERE delivered_at IS NULL AND dead_lettered_at IS NULL ORDER BY id",
+    ).all() as EvolutionOutboxRow[]).map(mapEvolutionOutbox);
+  }
+
+  listDispatchableOutbox(now = new Date().toISOString(), limit = 100): EvolutionOutboxEvent[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_000) {
+      throw new Error("Evolution Outbox dispatch limit must be between 1 and 1000");
+    }
+    return (this.database.prepare(
+      `SELECT * FROM evolution_outbox
+       WHERE delivered_at IS NULL AND dead_lettered_at IS NULL AND next_attempt_at <= ?
+       ORDER BY next_attempt_at, id LIMIT ?`,
+    ).all(now, limit) as EvolutionOutboxRow[]).map(mapEvolutionOutbox);
+  }
+
+  listDeadLetterOutbox(): EvolutionOutboxEvent[] {
+    return (this.database.prepare(
+      "SELECT * FROM evolution_outbox WHERE dead_lettered_at IS NOT NULL ORDER BY dead_lettered_at, id",
+    ).all() as EvolutionOutboxRow[]).map(mapEvolutionOutbox);
+  }
+
+  outboxStatus(now = new Date().toISOString()): {
+    pending: number; dispatchable: number; delivered: number; deadLettered: number;
+  } {
+    const row = this.database.prepare(`
+      SELECT
+        SUM(CASE WHEN delivered_at IS NULL AND dead_lettered_at IS NULL THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN delivered_at IS NULL AND dead_lettered_at IS NULL AND next_attempt_at <= ? THEN 1 ELSE 0 END) AS dispatchable,
+        SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END) AS delivered,
+        SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END) AS dead_lettered
+      FROM evolution_outbox
+    `).get(now) as { pending: number | null; dispatchable: number | null; delivered: number | null; dead_lettered: number | null };
+    return {
+      pending: row.pending ?? 0,
+      dispatchable: row.dispatchable ?? 0,
+      delivered: row.delivered ?? 0,
+      deadLettered: row.dead_lettered ?? 0,
+    };
+  }
+
+  markOutboxDelivered(id: number, providerMessageId: string | null, now: string): void {
+    this.database.prepare(
+      `UPDATE evolution_outbox
+       SET delivered_at = ?, attempts = attempts + 1, last_error = NULL, provider_message_id = ?
+       WHERE id = ? AND delivered_at IS NULL AND dead_lettered_at IS NULL`,
+    ).run(now, providerMessageId, id);
+  }
+
+  scheduleOutboxRetry(id: number, error: string, nextAttemptAt: string, deadLetteredAt: string | null): void {
+    if (!error.trim()) throw new Error("Evolution Outbox failure requires an error");
+    this.database.prepare(
+      `UPDATE evolution_outbox
+       SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?, dead_lettered_at = ?
+       WHERE id = ? AND delivered_at IS NULL AND dead_lettered_at IS NULL`,
+    ).run(error, nextAttemptAt, deadLetteredAt, id);
+  }
+
+  private requireEvolutionOutbox(id: number): EvolutionOutboxEvent {
+    const row = this.database.prepare("SELECT * FROM evolution_outbox WHERE id = ?")
+      .get(id) as EvolutionOutboxRow | undefined;
+    if (!row) throw new Error(`Evolution Outbox record not found: ${id}`);
+    return mapEvolutionOutbox(row);
   }
 
   private migrate(): void {
@@ -708,14 +855,21 @@ export class EvaluationStore {
       );
       CREATE TABLE IF NOT EXISTS evolution_outbox (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL CHECK(type = 'canary-rollback'),
+        type TEXT NOT NULL,
         project_scope TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        delivered_at TEXT
+        delivered_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        next_attempt_at TEXT NOT NULL,
+        deduplication_key TEXT NOT NULL UNIQUE,
+        dead_lettered_at TEXT,
+        provider_message_id TEXT
       );
     `);
     this.migrateCandidateMemoryStatusConstraint();
+    this.migrateEvolutionOutbox();
   }
 
   private migrateCandidateMemoryStatusConstraint(): void {
@@ -743,6 +897,46 @@ export class EvaluationStore {
       FROM candidate_memories_before_invalidation;
       DROP TABLE candidate_memories_before_invalidation;
     `);
+  }
+
+  private migrateEvolutionOutbox(): void {
+    const row = this.database.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'evolution_outbox'",
+    ).get() as { sql: string } | undefined;
+    if (!row) return;
+    const columns = this.database.pragma("table_info(evolution_outbox)") as Array<{ name: string }>;
+    const complete = [
+      "attempts", "last_error", "next_attempt_at", "deduplication_key", "dead_lettered_at", "provider_message_id",
+    ].every((name) => columns.some((column) => column.name === name));
+    if (complete && !row.sql.includes("canary-rollback")) return;
+    this.database.transaction(() => {
+      this.database.exec(`
+        ALTER TABLE evolution_outbox RENAME TO evolution_outbox_before_reliability;
+        CREATE TABLE evolution_outbox (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          type TEXT NOT NULL,
+          project_scope TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          delivered_at TEXT,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          next_attempt_at TEXT NOT NULL,
+          deduplication_key TEXT NOT NULL UNIQUE,
+          dead_lettered_at TEXT,
+          provider_message_id TEXT
+        );
+        INSERT INTO evolution_outbox
+          (id, type, project_scope, payload_json, created_at, delivered_at, attempts, last_error,
+           next_attempt_at, deduplication_key, dead_lettered_at, provider_message_id)
+        SELECT id,
+          CASE WHEN type = 'canary-rollback' THEN 'canary-rolled-back' ELSE type END,
+          project_scope, payload_json, created_at, delivered_at, 0, NULL,
+          created_at, 'evolution:legacy:' || id, NULL, NULL
+        FROM evolution_outbox_before_reliability;
+        DROP TABLE evolution_outbox_before_reliability;
+      `);
+    })();
   }
 
   private writeVariant(variant: ConfigurationVariant): void {
@@ -786,6 +980,42 @@ function validateMemoryDecision(
       ? ["rejected", "superseded", "expired", "invalidated"]
       : [];
   if (!allowed.includes(input.status)) throw new Error(`Illegal Candidate Memory decision: ${current.status} -> ${input.status}`);
+}
+
+interface EvolutionOutboxRow {
+  id: number;
+  type: EvolutionOutboxEventType;
+  project_scope: string;
+  payload_json: string;
+  created_at: string;
+  delivered_at: string | null;
+  attempts: number;
+  last_error: string | null;
+  next_attempt_at: string;
+  deduplication_key: string;
+  dead_lettered_at: string | null;
+  provider_message_id: string | null;
+}
+
+function mapEvolutionOutbox(row: EvolutionOutboxRow): EvolutionOutboxEvent {
+  if (!evolutionOutboxEventTypes.includes(row.type)) {
+    throw new Error(`Stored Evolution Outbox event is unknown: ${row.type}`);
+  }
+  return {
+    id: row.id,
+    runId: `phase3:${row.project_scope}`,
+    projectScope: row.project_scope,
+    type: row.type,
+    payload: JSON.parse(row.payload_json) as unknown,
+    createdAt: row.created_at,
+    deliveredAt: row.delivered_at,
+    attempts: row.attempts,
+    lastError: row.last_error,
+    nextAttemptAt: row.next_attempt_at,
+    deduplicationKey: row.deduplication_key,
+    deadLetteredAt: row.dead_lettered_at,
+    providerMessageId: row.provider_message_id,
+  };
 }
 
 function stableBundle(bundle: SanitizedFactBundle): Omit<SanitizedFactBundle, "exportedAt"> {

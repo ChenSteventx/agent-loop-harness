@@ -119,6 +119,11 @@ describe("Evaluation Datasets and Historical Replay", () => {
       evidence: development.listEvidence("run-1"), events: development.listEvents("run-1"),
     })).toBe(before);
     expect(evaluation.listEvaluationRuns()).toHaveLength(2);
+    expect(evaluation.listPendingEvolutionOutbox().filter((event) => event.type === "evaluation-completed"))
+      .toEqual([
+        expect.objectContaining({ payload: expect.objectContaining({ evaluationRunId: "evaluation-full" }) }),
+        expect.objectContaining({ payload: expect.objectContaining({ evaluationRunId: "evaluation-verify" }) }),
+      ]);
     evaluation.close();
     development.close();
   });

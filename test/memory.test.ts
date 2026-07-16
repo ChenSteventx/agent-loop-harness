@@ -138,6 +138,8 @@ describe("quarantined Candidate Memory", () => {
     const store = new EvaluationStore(join(directory, "evaluation.sqlite"));
     const [overfit] = deriveCandidateMemories([facts("run-1", "fact-1")]);
     store.installCandidateMemory(overfit!);
+    expect(store.listPendingEvolutionOutbox().find((event) => event.type === "memory-quarantined"))
+      .toMatchObject({ payload: expect.objectContaining({ candidateId: overfit!.id }) });
     expect(scanCandidateMemory(overfit!)).toMatchObject({ passed: false, overfit: true });
     expect(() => approveCandidateMemory(store, {
       id: overfit!.id, approvedBy: "human", reason: "too soon",
@@ -147,6 +149,8 @@ describe("quarantined Candidate Memory", () => {
     })).toMatchObject({ passed: false, overfit: true });
     expect(() => store.installCandidateMemory({ ...overfit!, id: `${overfit!.id}:duplicate` }))
       .toThrow("duplicates");
+    expect(store.listPendingEvolutionOutbox().find((event) => event.type === "memory-conflict"))
+      .toMatchObject({ payload: expect.objectContaining({ conflictingMemoryId: overfit!.id }) });
     expect(expireCandidateMemories(store, "2100-01-01T00:00:00.000Z")).toEqual([
       expect.objectContaining({ status: "expired", decision: expect.objectContaining({ authority: "system-expiry" }) }),
     ]);

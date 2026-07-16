@@ -41,6 +41,7 @@ import {
 import { disabledCanaryPolicy } from "./evolution/canary.js";
 import { SmtpEmailTransport } from "./email.js";
 import { NotificationDispatcher, type NotificationDispatcherOptions } from "./notifications.js";
+import { digestWindow, renderMetricsDigest, type DigestPeriod } from "./evaluation/digest.js";
 import {
   createProviderProfile,
   providerProfileNames,
@@ -342,21 +343,21 @@ notify
   .command("dispatch")
   .description("send currently due Outbox records through environment-configured SMTP")
   .action(async () => {
-    await withDevelopmentStoreAsync(async (store) => {
-      const dispatcher = new NotificationDispatcher(
-        store,
-        SmtpEmailTransport.fromEnvironment(),
-        notificationOptionsFromEnvironment(),
-      );
-      print(await dispatcher.dispatch());
+    await withEvaluationStoresAsync(async (development, evaluationStore) => {
+      const transport = SmtpEmailTransport.fromEnvironment();
+      const options = notificationOptionsFromEnvironment();
+      const formal = await new NotificationDispatcher(development, transport, options).dispatch();
+      const evolution = await new NotificationDispatcher(evaluationStore, transport, options).dispatch();
+      print({ formal, evolution });
     });
   });
 notify
   .command("status")
   .description("show pending, due, delivered, and dead-letter counts without exposing SMTP secrets")
   .action(() => {
-    withDevelopmentStore((store) => print({
-      ...store.outboxStatus(),
+    withEvaluationStores((development, evaluationStore) => print({
+      formal: development.outboxStatus(),
+      evolution: evaluationStore.outboxStatus(),
       emailConfigured: smtpEnvironmentConfigured(process.env),
     }));
   });
@@ -364,7 +365,34 @@ notify
   .command("dead-letters")
   .description("list exhausted notifications for operator inspection")
   .action(() => {
-    withDevelopmentStore((store) => print(store.listDeadLetterOutbox()));
+    withEvaluationStores((development, evaluationStore) => print({
+      formal: development.listDeadLetterOutbox(),
+      evolution: evaluationStore.listDeadLetterOutbox(),
+    }));
+  });
+notify
+  .command("digest")
+  .option("--period <period>", "daily or weekly", "daily")
+  .option("--project <scope>", "limit the digest to one Project Adapter scope")
+  .description("render and enqueue an idempotent completed-window Metrics digest for external Cron")
+  .action((options: { period: string; project?: string }) => {
+    const period = parseDigestPeriod(options.period);
+    const now = new Date().toISOString();
+    const window = digestWindow(period, now);
+    withEvaluationStores((development, evaluationStore) => {
+      const projections = development.listRuns()
+        .filter((run) => run.updatedAt >= window.windowStartsAt && run.updatedAt < window.windowEndsAt)
+        .filter((run) => !options.project || run.binding?.projectAdapterName === options.project)
+        .map((run) => projectRunMetrics(exportRunFacts(development, run.id)));
+      const digest = renderMetricsDigest(period, summarizeMetrics(projections), now);
+      print(evaluationStore.enqueueEvolutionOutbox(
+        "metrics-digest",
+        options.project ?? "all-projects",
+        digest,
+        now,
+        `${digest.deduplicationKey}:${options.project ?? "all-projects"}`,
+      ));
+    });
   });
 
 const human = program.command("human").description("record explicit human decisions");
@@ -564,28 +592,6 @@ function withEvaluationStores(action: (development: SqliteStore, evaluation: Eva
   }
 }
 
-function withDevelopmentStore(action: (store: SqliteStore) => void): void {
-  const home = resolve(program.opts<{ loopHome: string }>().loopHome);
-  mkdirSync(home, { recursive: true });
-  const store = new SqliteStore(resolve(home, "state.sqlite"));
-  try {
-    action(store);
-  } finally {
-    store.close();
-  }
-}
-
-async function withDevelopmentStoreAsync(action: (store: SqliteStore) => Promise<void>): Promise<void> {
-  const home = resolve(program.opts<{ loopHome: string }>().loopHome);
-  mkdirSync(home, { recursive: true });
-  const store = new SqliteStore(resolve(home, "state.sqlite"));
-  try {
-    await action(store);
-  } finally {
-    store.close();
-  }
-}
-
 async function withEvaluationStoresAsync(
   action: (development: SqliteStore, evaluation: EvaluationStore, home: string) => Promise<void>,
 ): Promise<void> {
@@ -613,6 +619,11 @@ function parseProviderProfileName(value: string): ProviderProfileName {
 function parseEvolutionTarget(value: string): EvolutionTarget {
   if (evolutionTargets.includes(value as EvolutionTarget)) return value as EvolutionTarget;
   throw new Error(`Forbidden evolution target: ${value}`);
+}
+
+function parseDigestPeriod(value: string): DigestPeriod {
+  if (value === "daily" || value === "weekly") return value;
+  throw new Error(`Unknown digest period: ${value}`);
 }
 
 function parseObject(value: string): Record<string, unknown> {

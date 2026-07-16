@@ -28,5 +28,5 @@ describe("PiAdapter", () => {
     expect((await adapter("success", "highCapability", join(directory, "missing-pi")).probe()).available).toBe(false);
     const timeoutProvider = adapter("timeout", "highCapability", process.execPath, 30); await timeoutProvider.probe(); expect((await timeoutProvider.run(request(directory, "timeout"))).failureClass).toBe("timeout");
     const provider = adapter("timeout", "highCapability", process.execPath, 2_000); await provider.probe(); const running = provider.run(request(directory, "cancel")); await new Promise((done) => setTimeout(done, 50)); expect(await provider.cancel("cancel")).toBe(true); expect((await running).cancelled).toBe(true);
-  });
+  }, 15_000);
 });

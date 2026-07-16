@@ -84,15 +84,6 @@ export interface CanaryObservation {
   createdAt: string;
 }
 
-export interface EvolutionOutboxEvent {
-  id: number;
-  type: "canary-rollback";
-  projectScope: string;
-  payload: unknown;
-  createdAt: string;
-  deliveredAt: string | null;
-}
-
 export interface CanaryRepository {
   installCanaryApproval(approval: CanaryApproval): CanaryApproval;
   installCanaryAssignment(assignment: CanaryAssignment): CanaryAssignment;

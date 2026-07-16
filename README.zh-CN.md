@@ -138,6 +138,58 @@ npm run loop -- config champion --project <PROJECT_SCOPE>
 npm run loop -- canary status
 ```
 
+## Outbox 邮件通知与 Metrics Digest
+
+通知由两个彼此独立的 SQLite Transactional Outbox 保存：正式 Run 通知写入
+`state.sqlite`，Phase 3 Proposal、Evaluation、Shadow、Canary、Candidate Memory 与
+Metrics Digest 通知写入 `evaluation.sqlite`。以下命令会同时报告或投递两个 Outbox，
+但各自独立记录成功、重试与 Dead Letter：
+
+```bash
+npm run loop -- notify dispatch
+npm run loop -- notify status
+npm run loop -- notify dead-letters
+npm run loop -- notify digest --period daily
+npm run loop -- notify digest --period weekly
+```
+
+`notify digest` 只读取已结束的 UTC 日/周时间窗，渲染 Digest，并以稳定去重键写入
+Evolution Outbox。它不会在进程内启动 Scheduler。由外部 Cron 负责先生成 Digest，
+再投递到 SMTP，例如：
+
+```cron
+# 每天 UTC 00:05 生成上一完整日的 Digest，00:10 投递两个 Outbox
+5 0 * * * cd /path/to/agent-loop-harness && npm run loop -- --loop-home /var/lib/agent-loop notify digest --period daily
+10 0 * * * cd /path/to/agent-loop-harness && npm run loop -- --loop-home /var/lib/agent-loop notify dispatch
+
+# 每周一 UTC 00:15 生成上一完整七日的 Digest
+15 0 * * 1 cd /path/to/agent-loop-harness && npm run loop -- --loop-home /var/lib/agent-loop notify digest --period weekly
+```
+
+SMTP 端点、发件人、收件人和凭据只从调用方注入的 Secret 环境变量读取，不写入
+SQLite、日志或示例配置：
+
+```text
+AGENT_LOOP_SMTP_HOST
+AGENT_LOOP_SMTP_PORT
+AGENT_LOOP_SMTP_SECURITY=tls|starttls|none
+AGENT_LOOP_SMTP_USERNAME
+AGENT_LOOP_SMTP_PASSWORD
+AGENT_LOOP_SMTP_TIMEOUT_MS
+AGENT_LOOP_EMAIL_FROM
+AGENT_LOOP_EMAIL_TO
+
+AGENT_LOOP_NOTIFY_MAX_ATTEMPTS
+AGENT_LOOP_NOTIFY_BASE_DELAY_MS
+AGENT_LOOP_NOTIFY_MAX_DELAY_MS
+AGENT_LOOP_NOTIFY_BATCH_SIZE
+```
+
+邮件投递不是 Loop State，邮件成功不是 Gate。邮件、Digest、Replay、Memory、Shadow
+或 Canary 通知失败，只能更新对应 Outbox 的重试或 Dead Letter 字段，不得回滚已经
+完成的开发结果，也不得修改正式 Run、Operation、Event、Evidence 或 Finding。
+Evolution Outbox 没有正式 Run 的写权限。
+
 ## 文件索引
 
 - `START-CODEX.md`：可直接粘贴给 Codex 的单段总 Prompt。

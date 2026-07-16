@@ -1,6 +1,6 @@
 import { appendFileSync } from "node:fs";
 import type { EmailMessage, EmailTransport } from "./email.js";
-import type { OutboxRecord, SqliteStore } from "./store.js";
+import type { SqliteStore } from "./store.js";
 
 export interface NotificationSink {
   deliver(message: string): void;
@@ -43,6 +43,22 @@ export interface NotificationDispatchResult {
   deadLettered: number;
 }
 
+export interface DispatchableNotification {
+  id: number;
+  runId: string;
+  type: string;
+  payload: unknown;
+  createdAt: string;
+  attempts: number;
+  deduplicationKey: string;
+}
+
+export interface NotificationOutbox {
+  listDispatchableOutbox(now?: string, limit?: number): DispatchableNotification[];
+  markOutboxDelivered(id: number, providerMessageId: string | null, now: string): void;
+  scheduleOutboxRetry(id: number, error: string, nextAttemptAt: string, deadLetteredAt: string | null): void;
+}
+
 export const defaultNotificationDispatcherOptions: NotificationDispatcherOptions = {
   maxAttempts: 5,
   baseDelayMs: 60_000,
@@ -54,7 +70,7 @@ export class NotificationDispatcher {
   private readonly options: NotificationDispatcherOptions;
 
   constructor(
-    private readonly store: SqliteStore,
+    private readonly store: NotificationOutbox,
     private readonly transport: EmailTransport,
     options: Partial<NotificationDispatcherOptions> = {},
   ) {
@@ -87,17 +103,17 @@ export class NotificationDispatcher {
   }
 }
 
-export function renderOutboxEmail(item: OutboxRecord): EmailMessage {
-  const labels: Record<OutboxRecord["type"], string> = {
-    blocked: "Run blocked",
-    "needs-human": "Human decision required",
-    "provider-fallback": "Provider fallback used",
-    ready: "Run ready for review",
-    done: "Run completed",
-  };
+export function renderOutboxEmail(item: DispatchableNotification): EmailMessage {
+  if (item.type === "metrics-digest" && isRenderedDigest(item.payload)) {
+    return {
+      idempotencyKey: item.deduplicationKey,
+      subject: item.payload.subject,
+      text: item.payload.text,
+    };
+  }
   return {
     idempotencyKey: item.deduplicationKey,
-    subject: `[agent-loop] ${labels[item.type]}: ${item.runId}`,
+    subject: `[agent-loop] ${notificationLabel(item.type)}: ${item.runId}`,
     text: [
       `Event: ${item.type}`,
       `Run: ${item.runId}`,
@@ -107,6 +123,32 @@ export function renderOutboxEmail(item: OutboxRecord): EmailMessage {
       JSON.stringify(item.payload, null, 2),
     ].join("\n"),
   };
+}
+
+function isRenderedDigest(value: unknown): value is { subject: string; text: string } {
+  return typeof value === "object" && value !== null &&
+    typeof (value as { subject?: unknown }).subject === "string" &&
+    typeof (value as { text?: unknown }).text === "string";
+}
+
+function notificationLabel(type: string): string {
+  const labels: Record<string, string> = {
+    blocked: "Run blocked",
+    "needs-human": "Human decision required",
+    "provider-fallback": "Provider fallback used",
+    ready: "Run ready for review",
+    done: "Run completed",
+    "proposal-created": "Change Proposal created",
+    "evaluation-completed": "Evaluation completed",
+    "shadow-ready": "Shadow result ready",
+    "canary-started": "Canary started",
+    "canary-promoted": "Canary promoted",
+    "canary-rolled-back": "Canary rolled back",
+    "memory-quarantined": "Candidate Memory quarantined",
+    "memory-conflict": "Candidate Memory conflict",
+    "metrics-digest": "Metrics digest",
+  };
+  return labels[type] ?? `Event ${type}`;
 }
 
 function retryDelay(attempts: number, options: NotificationDispatcherOptions): number {

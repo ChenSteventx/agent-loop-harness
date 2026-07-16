@@ -97,6 +97,10 @@ describe("controlled Champion and Challenger evolution", () => {
     expect(promoted).toMatchObject({ id: challenger.id, status: "champion", configuration: { retryLimit: 2 } });
     expect(store.listConfigurationVariants("generic-node").filter((item) => item.status === "champion"))
       .toEqual([expect.objectContaining({ id: challenger.id })]);
+    expect(store.listPendingEvolutionOutbox().find((event) => event.type === "proposal-created"))
+      .toMatchObject({ payload: expect.objectContaining({ proposalId: proposal.id }) });
+    expect(store.listPendingEvolutionOutbox().find((event) => event.type === "canary-promoted"))
+      .toMatchObject({ payload: expect.objectContaining({ championId: challenger.id }) });
 
     const restored = rollbackChampion(store, {
       id: "rollback-v2",
