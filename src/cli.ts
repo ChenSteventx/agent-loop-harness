@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Command } from "commander";
 import { Orchestrator, defaultLoopHome } from "./orchestrator.js";
@@ -19,10 +19,18 @@ import { exportRunFacts } from "./evaluation/facts.js";
 import { projectRunMetrics, summarizeMetrics } from "./evaluation/metrics.js";
 import { evaluateReadiness } from "./evaluation/readiness.js";
 import { EvaluationStore } from "./evaluation/store.js";
-import { DatasetCatalog } from "./evaluation/datasets.js";
-import { runShadowEvaluation, type ShadowDecision } from "./evaluation/compare.js";
+import { DatasetCatalog, historicalDataset } from "./evaluation/datasets.js";
+import {
+  compareVariants,
+  runShadowEvaluation,
+  type ShadowDecision,
+  type VariantEvaluator,
+} from "./evaluation/compare.js";
 import { HistoricalReplay, type ReplayMode } from "./evaluation/replay.js";
-import { VerifyOnlyEvaluator } from "./evaluation/evaluators.js";
+import { FullTaskReplayEvaluator, VerifyOnlyEvaluator } from "./evaluation/evaluators.js";
+import { createFullTaskExecutor } from "./full-task-executor.js";
+import { WorktreeService } from "./execution.js";
+import { operationInputHash } from "./bindings.js";
 import {
   approveCandidateMemory,
   deriveCandidateMemories,
@@ -207,25 +215,105 @@ evaluation
 evaluation
   .command("replay")
   .requiredOption("--run-id <id>")
-  .option("--mode <mode>", "verify-only; full requires an injected full Replay executor", "verify-only")
+  .option("--mode <mode>", "verify-only or full (re-executes the task from the Baseline Commit)", "verify-only")
   .option("--evaluation-id <id>")
+  .option("--variant-id <id>", "configuration variant for full mode; defaults to the active Champion")
   .description("create a separate immutable Evaluation Run without mutating the development Run")
   .action(runReplayCommand);
 
 program
   .command("replay")
   .requiredOption("--run-id <id>")
-  .option("--mode <mode>", "verify-only; full requires an injected full Replay executor", "verify-only")
+  .option("--mode <mode>", "verify-only or full (re-executes the task from the Baseline Commit)", "verify-only")
   .option("--evaluation-id <id>")
+  .option("--variant-id <id>", "configuration variant for full mode; defaults to the active Champion")
   .description("top-level alias for immutable Historical Replay")
   .action(runReplayCommand);
 
-evaluation
-  .command("compare")
+const dataset = evaluation.command("dataset").description("evaluation dataset controls");
+dataset
+  .command("export")
+  .requiredOption("--run-id <id>")
+  .requiredOption("--id <datasetId>")
+  .requiredOption("--out <path>")
+  .description("export a historical dataset with source pointers from a real development Run")
+  .action((options: { runId: string; id: string; out: string }) => {
+    withEvaluationStores((development, store) => {
+      const facts = store.installFactBundle(exportRunFacts(development, options.runId));
+      const exported = historicalDataset(options.id, [facts]);
+      writeFileSync(resolve(options.out), `${JSON.stringify(exported, null, 2)}\n`);
+      print({ id: exported.id, contentHash: exported.contentHash, tasks: exported.tasks.length, out: resolve(options.out) });
+    });
+  });
+
+const compare = evaluation.command("compare").description("Champion/Challenger offline comparisons");
+compare
+  .command("list")
   .option("--project <scope>")
-  .description("report immutable Champion/Challenger offline comparisons")
+  .description("report immutable offline comparisons")
   .action((options: { project?: string }) => {
     withEvaluationStores((_development, store) => print(store.listOfflineComparisons(options.project)));
+  });
+compare
+  .command("run")
+  .requiredOption("--id <id>")
+  .requiredOption("--proposal-id <id>")
+  .option("--dataset-dir <path>", "dataset directory", "eval")
+  .description("execute a full-task offline comparison of the active Champion against the Challenger")
+  .action(async (options: { id: string; proposalId: string; datasetDir: string }) => {
+    await withEvaluationStoresAsync(async (development, store, home) => {
+      const proposalValue = store.getChangeProposal(options.proposalId);
+      if (!proposalValue) throw new Error(`Change Proposal not found: ${options.proposalId}`);
+      const champion = store.activeChampion(proposalValue.projectScope);
+      const challenger = store.listConfigurationVariants(proposalValue.projectScope)
+        .find((variant) => variant.proposalId === proposalValue.id && variant.status === "challenger");
+      if (!champion || !challenger) throw new Error("Comparison variants are incomplete");
+      const catalog = DatasetCatalog.loadDirectory(resolve(options.datasetDir));
+      const datasets = proposalValue.evaluationPlan.datasetIds.map((id) => catalog.get(id, "comparison"));
+      const executor = createEvaluationFullTaskExecutor();
+      const evaluate: VariantEvaluator = async (variant, task) => {
+        if (!task.sourceRunId || !task.sourceFactHash) {
+          throw new Error(`Dataset task lacks source pointers and cannot be replayed: ${task.id}`);
+        }
+        const facts = store.getFactBundle(task.sourceRunId, task.sourceFactHash);
+        const sourceRun = development.getRun(task.sourceRunId);
+        if (!facts || !sourceRun?.binding) {
+          throw new Error(`Source Run facts are unavailable for task ${task.id}`);
+        }
+        const startedAt = Date.now();
+        const evaluator = new FullTaskReplayEvaluator(
+          store,
+          new WorktreeService(sourceRun.binding.sourceRepository),
+          executor,
+          resolve(home, "evaluation"),
+        );
+        const run = await evaluator.evaluate({
+          id: `${options.id}:${variant.id}:${task.id}`,
+          facts,
+          binding: sourceRun.binding,
+          configurationVariant: variant,
+        });
+        const passed = run.status === "completed" && run.outcome?.passed === true;
+        return {
+          passed,
+          ready: passed,
+          done: false,
+          verificationFailures: passed ? 0 : 1,
+          latencyMs: Date.now() - startedAt,
+          resultHash: run.outcome?.evidenceHash ?? operationInputHash({ evaluationRunId: run.id, status: run.status }),
+        };
+      };
+      print(await compareVariants(store, {
+        id: options.id,
+        proposal: proposalValue,
+        champion,
+        challenger,
+        datasets,
+        evaluatorKind: "full-task-replay",
+        evaluatorVersion: "full-task-replay/v1",
+        evaluate,
+      }));
+    });
   });
 
 const shadow = program.command("shadow").description("non-authoritative Shadow reports");
@@ -625,13 +713,35 @@ memory
     })));
   });
 
-async function runReplayCommand(options: { runId: string; mode: string; evaluationId?: string }): Promise<void> {
+async function runReplayCommand(options: {
+  runId: string; mode: string; evaluationId?: string; variantId?: string;
+}): Promise<void> {
   const mode = parseReplayMode(options.mode);
   await withEvaluationStoresAsync(async (development, evaluationStore, home) => {
     const run = development.getRun(options.runId);
     if (!run) throw new Error(`Run not found: ${options.runId}`);
     const facts = evaluationStore.installFactBundle(exportRunFacts(development, options.runId));
     const evaluationId = options.evaluationId ?? `replay:${options.runId}:${Date.now()}`;
+    const requiredOperationIds = development.listOperations(options.runId)
+      .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
+      .map((operation) => operation.id);
+    if (mode === "full") {
+      if (!run.binding) throw new Error("Full replay requires a bound development Run");
+      const variant = options.variantId
+        ? evaluationStore.getConfigurationVariant(options.variantId)
+        : evaluationStore.activeChampion(run.binding.projectAdapterName);
+      if (!variant) throw new Error("Full replay requires an active Champion or an explicit --variant-id");
+      const evaluator = new FullTaskReplayEvaluator(
+        evaluationStore,
+        new WorktreeService(run.binding.sourceRepository),
+        createEvaluationFullTaskExecutor(),
+        resolve(home, "evaluation"),
+      );
+      print(await evaluator.evaluate({
+        id: evaluationId, facts, binding: run.binding, configurationVariant: variant,
+      }));
+      return;
+    }
     const evaluator = new VerifyOnlyEvaluator();
     const replay = new HistoricalReplay(evaluationStore, async (replayFacts, replayMode, binding) => {
       if (replayMode === "full") throw new Error("FullReplayExecutorUnavailable");
@@ -648,10 +758,24 @@ async function runReplayCommand(options: { runId: string; mode: string; evaluati
       mode,
       evaluatorKind: evaluator.kind,
       evaluatorVersion: evaluator.version,
-      requiredOperationIds: development.listOperations(options.runId)
-        .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
-        .map((operation) => operation.id),
+      requiredOperationIds,
     }));
+  });
+}
+
+function createEvaluationFullTaskExecutor(): ReturnType<typeof createFullTaskExecutor> {
+  const projectAdapter = new GenericNodeProjectAdapter();
+  return createFullTaskExecutor({
+    adapters: {
+      codex: new CodexCliAdapter({
+        sandbox: "workspace-write",
+        model: process.env.AGENT_LOOP_CODEX_MODEL ?? null,
+      }),
+      claude: new ClaudeCodeAdapter({ model: process.env.AGENT_LOOP_CLAUDE_MODEL ?? null }),
+      deepseek: configuredPiAdapter(),
+    },
+    defaultFamily: "codex",
+    verificationCommands: (task) => projectAdapter.verificationCommands(task),
   });
 }
 

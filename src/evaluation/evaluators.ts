@@ -12,7 +12,7 @@ import {
   type EvaluationRunRepository,
 } from "./replay.js";
 
-const safeEnvironment = [
+export const safeEnvironment = [
   "PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME", "USERPROFILE",
 ] as const;
 
@@ -109,7 +109,9 @@ export class FullTaskReplayEvaluator {
           configurationVariant: input.configurationVariant,
         });
       });
-      return replay.run({
+      // Must await inside the try: a bare `return promise` runs the finally
+      // (removing the worktree) before the replay has finished using it.
+      return await replay.run({
         id: input.id,
         facts: input.facts,
         binding: evaluationBinding,

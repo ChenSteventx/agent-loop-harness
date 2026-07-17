@@ -1,0 +1,122 @@
+import { resolve } from "node:path";
+import { operationInputHash } from "./bindings.js";
+import { CommandRunner, GitService } from "./execution.js";
+import type { VerificationCommand } from "./ports.js";
+import type { ProviderAdapter } from "./provider.js";
+import { authorOutputSchema, defaultRoleOutputSchemas } from "./role-output-schemas.js";
+import type { TaskSpec } from "./task-spec.js";
+import { WriterExecutor, writerBoundaryViolation } from "./writer-executor.js";
+import { safeEnvironment, type FullTaskExecutor } from "./evaluation/evaluators.js";
+
+export interface FullTaskExecutorOptions {
+  adapters: Readonly<Record<string, ProviderAdapter>>;
+  defaultFamily: string;
+  verificationCommands: (task: TaskSpec) => readonly VerificationCommand[];
+  commandRunner?: CommandRunner;
+}
+
+export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTaskExecutor {
+  if (!(options.defaultFamily in options.adapters)) {
+    throw new Error(`Full Task Replay default provider family is not configured: ${options.defaultFamily}`);
+  }
+  const runner = options.commandRunner ?? new CommandRunner();
+  return async (input) => {
+    const configuration = input.configurationVariant.configuration;
+    const adapter = selectAuthor(options, configuration.providerOrder);
+    const git = new GitService(input.worktreePath);
+    const baseCommit = git.head();
+    const controlHash = git.controlStateHash();
+    const diagnostics: string[] = [];
+    const attempts = Math.min(Math.max(configuration.retryLimit, 0), 3) + 1;
+    let providerOk = false;
+    let finalOutput: unknown = null;
+    for (let attempt = 1; attempt <= attempts && !providerOk; attempt += 1) {
+      const execution = await new WriterExecutor().execute({
+        request: {
+          invocationId: `${input.facts.run.id}:evaluation-author:${attempt}`,
+          prompt: evaluationAuthorPrompt(input.binding.taskSpec),
+          cwd: input.worktreePath,
+          artifactDirectory: resolve(input.artifactDirectory, `author-attempt-${attempt}`),
+          outputSchemaPath: defaultRoleOutputSchemas().author,
+          workspaceAccess: "workspace-write",
+          allowedRepositoryRoots: [input.worktreePath],
+        },
+        legacyProvider: adapter,
+        candidates: [],
+        persistence: null,
+        authRecoveryCommand: "re-run the offline comparison after re-authenticating the provider",
+        unknownRecoveryCommand: "inspect the evaluation artifacts, then re-run the offline comparison",
+      });
+      if (execution.disposition === "succeeded" && execution.result?.ok) {
+        providerOk = true;
+        finalOutput = execution.result.finalOutput;
+      } else {
+        diagnostics.push(`author-attempt-${attempt}:${execution.result?.failureClass ?? "failed"}`);
+      }
+    }
+    if (!providerOk) return { passed: false, evidenceHash: null, diagnostics };
+    const parsedOutput = authorOutputSchema.safeParse(finalOutput);
+    const violation = writerBoundaryViolation(git, baseCommit, parsedOutput.success, controlHash);
+    if (violation !== null) {
+      return { passed: false, evidenceHash: null, diagnostics: [...diagnostics, violation] };
+    }
+    const candidate = git.commitCandidate({
+      baseCommit,
+      message: `agent-loop(${input.binding.taskSpec.id}): evaluation replay candidate`,
+    });
+    const receipts = [];
+    for (const command of options.verificationCommands(input.binding.taskSpec)) {
+      const result = await runner.run({
+        argv: command.argv,
+        cwd: input.worktreePath,
+        artifactDirectory: resolve(input.artifactDirectory, "verify", command.id),
+        environmentAllowlist: safeEnvironment,
+        timeoutMs: configuration.timeoutMs,
+        outputLimitBytes: 1024 * 1024,
+        shell: false,
+      });
+      receipts.push({
+        commandId: command.id,
+        exitCode: result.exitCode,
+        signal: result.signal,
+        timedOut: result.timedOut,
+        commitBefore: result.commitBefore,
+      });
+    }
+    const passed = receipts.every((receipt) => receipt.exitCode === 0 && receipt.signal === null &&
+      !receipt.timedOut && receipt.commitBefore === candidate.commitSha);
+    return {
+      passed,
+      evidenceHash: operationInputHash({
+        candidateCommit: candidate.commitSha,
+        diffHash: candidate.diffHash,
+        receipts,
+      }),
+      diagnostics: [
+        ...diagnostics,
+        ...receipts.filter((receipt) => receipt.exitCode !== 0).map((receipt) => receipt.commandId),
+      ],
+    };
+  };
+}
+
+function selectAuthor(options: FullTaskExecutorOptions, providerOrder: readonly string[]): ProviderAdapter {
+  for (const family of providerOrder) {
+    const match = Object.keys(options.adapters).find((key) =>
+      key.toLowerCase() === family.toLowerCase() || family.toLowerCase().includes(key.toLowerCase()));
+    if (match) return options.adapters[match]!;
+  }
+  return options.adapters[options.defaultFamily]!;
+}
+
+function evaluationAuthorPrompt(task: TaskSpec): string {
+  return [
+    `Task: ${task.id}`,
+    `Goal: ${task.goal}`,
+    "Acceptance:",
+    ...task.acceptance.map((item) => `- ${item}`),
+    "Work only in the current worktree. Edit files only; do not run git add, git commit, or change Git metadata.",
+    "Leave a non-empty working diff for the Harness to inspect and commit deterministically.",
+    "Return only a concise summary and the changedFiles array required by the Author output schema.",
+  ].join("\n");
+}
