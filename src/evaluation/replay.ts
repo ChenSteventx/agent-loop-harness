@@ -85,8 +85,11 @@ export class HistoricalReplay {
       return this.repository.installEvaluationRun(baseRun(input, report.grade, "not-replayable", null,
         verificationCommit, verificationBindingHash, unique(missingInputs), createdAt));
     }
-    if (!input.binding || !verifyOnlyIsBound(input.facts, input.binding)) {
-      missingInputs.push("pinned_verification_binding");
+    const bound = input.binding !== null && (input.mode === "full"
+      ? fullTaskReplayIsBound(input.facts, input.binding)
+      : verifyOnlyIsBound(input.facts, input.binding));
+    if (!input.binding || !bound) {
+      missingInputs.push(input.mode === "full" ? "full_task_replay_binding" : "pinned_verification_binding");
       return this.repository.installEvaluationRun(baseRun(input, report.grade, "not-replayable", null,
         verificationCommit, verificationBindingHash, unique(missingInputs), createdAt));
     }
@@ -121,6 +124,22 @@ function verifyOnlyIsBound(facts: SanitizedFactBundle, binding: RunBinding): boo
   const stored = facts.run.binding;
   return stored !== null &&
     pinnedVerificationCommit(facts) !== null &&
+    stored.baselineCommit === binding.baselineCommit &&
+    stored.taskSpecHash === binding.taskSpecHash &&
+    stored.acceptanceHash === binding.acceptanceHash &&
+    stored.policyVersion === binding.policyVersion &&
+    stored.projectAdapterName === binding.projectAdapterName &&
+    binding.taskSpec.verification.length > 0 &&
+    stored.verificationStepIds.length === binding.taskSpec.verification.length &&
+    stored.verificationStepIds.every((id, index) => id === binding.taskSpec.verification[index]?.id);
+}
+
+function fullTaskReplayIsBound(facts: SanitizedFactBundle, binding: RunBinding): boolean {
+  // Unlike verify-only, full replay re-executes the task from the Baseline Commit,
+  // so no historical candidate/command evidence (pinned commit) is required —
+  // failed, blocked, and no-candidate runs must remain fully replayable.
+  const stored = facts.run.binding;
+  return stored !== null &&
     stored.baselineCommit === binding.baselineCommit &&
     stored.taskSpecHash === binding.taskSpecHash &&
     stored.acceptanceHash === binding.acceptanceHash &&

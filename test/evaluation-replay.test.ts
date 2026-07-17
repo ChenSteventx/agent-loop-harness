@@ -215,4 +215,60 @@ describe("Evaluation Datasets and Historical Replay", () => {
     evaluation.close();
     development.close();
   });
+
+  it("keeps failed runs without candidate evidence fully replayable but not verify-only replayable", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-loop-failed-replay-"));
+    temporaryDirectories.push(directory);
+    const development = new SqliteStore(join(directory, "state.sqlite"));
+    development.createBoundRun("run-3", binding.taskSpec.id, binding);
+    development.createOperation({
+      id: "run-3:author", runId: "run-3", kind: "author", idempotencyKey: "run-3:author",
+      now: "2026-07-15T00:00:01.000Z",
+    });
+    development.installInvocationManifest(createInvocationManifest({
+      id: "run-3:author:manifest:v1",
+      runId: "run-3",
+      operationId: "run-3:author",
+      role: "author",
+      binding,
+      renderedPrompt: "bounded author prompt",
+      outputSchemaPath: resolve("schemas/author-output.schema.json"),
+      configuredProvider: { provider: "Codex CLI", model: "configured-model" },
+      actualProvider: {
+        provider: "openai-codex", model: "actual-model", modelFamily: "gpt",
+        executable: "codex", version: "1.0.0",
+      },
+      currentCommit: binding.baselineCommit,
+      verificationPlan: binding.taskSpec.verification,
+      context: [{ kind: "task", reference: "task.yaml", content: binding.taskSpec, trust: "project" }],
+      createdAt: "2026-07-15T00:00:01.000Z",
+    }));
+    development.finishOperation("run-3:author", "failed", {}, "2026-07-15T00:00:02.000Z");
+    const facts = exportRunFacts(development, "run-3");
+    expect(facts.evidence).toEqual([]);
+    const evaluation = new EvaluationStore(join(directory, "evaluation.sqlite"));
+    evaluation.installFactBundle(facts);
+    const replay = new HistoricalReplay(evaluation, async (_facts, mode) => ({
+      passed: mode === "full", evidenceHash: "fresh-full-evidence", diagnostics: [],
+    }));
+
+    const full = await replay.run({
+      id: "evaluation-failed-full", facts, binding, mode: "full", requiredOperationIds: ["run-3:author"],
+      createdAt: "2026-07-15T00:02:00.000Z",
+    });
+    expect(full).toMatchObject({
+      status: "completed", mode: "full", replayability: "manifest-complete",
+      verificationCommit: null, outcome: { passed: true, evidenceHash: "fresh-full-evidence" },
+    });
+
+    const verifyOnly = await replay.run({
+      id: "evaluation-failed-verify", facts, binding, mode: "verify-only",
+      requiredOperationIds: ["run-3:author"], createdAt: "2026-07-15T00:03:00.000Z",
+    });
+    expect(verifyOnly.status).toBe("not-replayable");
+    expect(verifyOnly.missingInputs).toContain("pinned_verification_binding");
+    expect(full.missingInputs).not.toContain("pinned_verification_binding");
+    evaluation.close();
+    development.close();
+  });
 });
