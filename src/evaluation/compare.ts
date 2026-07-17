@@ -125,7 +125,8 @@ export async function compareVariants(
 ): Promise<OfflineComparison> {
   validateComparisonBindings(input);
   if (input.evaluatorKind === "verify-only" &&
-      ["prompt-variant", "context-ranking", "provider-routing", "role-model-selection"].includes(input.proposal.target)) {
+      ["prompt-variant", "context-ranking", "provider-routing", "role-model-selection", "memory-retrieval"]
+        .includes(input.proposal.target)) {
     throw new Error(`Verify-only evaluator cannot evaluate ${input.proposal.target}`);
   }
   const championResults: TaskEvaluationResult[] = [];
