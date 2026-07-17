@@ -174,6 +174,18 @@ describe("controlled Champion and Challenger evolution", () => {
     })).toThrow("Forbidden evolution target");
     expect(() => createChangeProposal({
       ...base,
+      target: "prompt-variant",
+      patch: { promptVariant: "concise-v2" },
+      datasets: catalog.list("proposal"),
+    })).toThrow("unsupported-runtime-target");
+    expect(() => createChangeProposal({
+      ...base,
+      target: "memory-retrieval",
+      patch: { memoryRetrievalEnabled: true },
+      datasets: catalog.list("proposal"),
+    })).toThrow("unsupported-runtime-target");
+    expect(() => createChangeProposal({
+      ...base,
       target: "retry-policy",
       patch: { timeoutMs: 90_000 },
       datasets: catalog.list("proposal"),

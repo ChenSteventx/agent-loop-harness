@@ -207,20 +207,13 @@ describe("offline comparison and non-authoritative Shadow", () => {
         passed: true, ready: true, done: false, verificationFailures: 0, latencyMs: 1, resultHash: "unused",
       }),
     })).rejects.toThrow("Verify-only evaluator cannot evaluate");
-    const memoryProposal = evaluation.installChangeProposal(createChangeProposal({
-      id: "memory-retrieval-proposal", projectScope: "generic-node", target: "memory-retrieval",
-      baseChampion: champion, patch: { memoryRetrievalEnabled: true }, rationale: "bounded retrieval study",
-      sourceFactHashes: ["fact-1", "fact-2"], datasets: catalog.list("proposal"),
-      metrics: ["readyRate"], minimumSamples: 1,
-    }));
-    const approvedMemory = approveChangeProposal(evaluation, {
-      id: memoryProposal.id, approvedBy: "human", reason: "verify evaluator boundary",
-    });
-    const memoryChallenger = evaluation.installConfigurationVariant(createChallenger({
-      id: "memory-challenger", version: "2", proposal: approvedMemory, champion,
-    }));
+    // createChangeProposal now rejects memory-retrieval outright (not runtime
+    // wired), so exercise the compare-layer gate on a hand-built proposal: the
+    // "memory-retrieval-proposal" defence must hold even if the factory gate
+    // is bypassed.
+    const memoryProposal = { ...approved, target: "memory-retrieval" as const };
     await expect(compareVariants(evaluation, {
-      id: "forbidden-memory-comparison", proposal: approvedMemory, champion, challenger: memoryChallenger,
+      id: "forbidden-memory-comparison", proposal: memoryProposal, champion, challenger,
       datasets: catalog.list("comparison"), evaluatorKind: "verify-only", evaluatorVersion: "verify-only/v1",
       evaluate: async () => ({
         passed: true, ready: true, done: false, verificationFailures: 0, latencyMs: 1, resultHash: "unused",

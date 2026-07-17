@@ -37,6 +37,7 @@ const gates = [
   [28, "Verify-only cannot evaluate Memory Retrieval strategy", "test/compare-shadow.test.ts", "memory-retrieval-proposal"],
   [29, "Canary rollback restores the Champion for the next formal Run", "test/production-loop.test.ts", "canary-chain-champion-after-rollback"],
   [30, "formal runtime reads evaluation state read-only", "src/cli.ts", "readOnly: true"],
+  [31, "proposals are limited to runtime-wired targets", "test/evolution.test.ts", "unsupported-runtime-target"],
 ] as const;
 
 describe("Phase 3 final gate traceability", () => {

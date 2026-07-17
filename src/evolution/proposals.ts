@@ -15,6 +15,17 @@ export const evolutionTargets = [
 ] as const;
 export type EvolutionTarget = (typeof evolutionTargets)[number];
 
+// The only targets whose configuration genuinely changes formal execution today
+// (provider selection, author retries, command timeouts). Proposals for the
+// other vocabulary entries are rejected until their runtime wiring exists —
+// otherwise a Challenger could be promoted on a configuration that never takes
+// effect, an empty evolution.
+export const runtimeWiredTargets: readonly EvolutionTarget[] = [
+  "provider-routing",
+  "retry-policy",
+  "timeout-policy",
+];
+
 export interface EvolutionConfiguration {
   promptVariant?: string;
   contextRanking?: string[];
@@ -174,6 +185,10 @@ export function createChangeProposal(input: {
   createdAt?: string;
 }): ChangeProposal {
   if (!evolutionTargets.includes(input.target)) throw new Error(`Forbidden evolution target: ${String(input.target)}`);
+  if (!runtimeWiredTargets.includes(input.target)) {
+    throw new Error(`unsupported-runtime-target: ${input.target} is not wired into the formal runtime, ` +
+      "so evolving it would promote a configuration that never takes effect");
+  }
   if (input.baseChampion.status !== "champion" || input.baseChampion.projectScope !== input.projectScope) {
     throw new Error("Change Proposal must bind the active project Champion");
   }
