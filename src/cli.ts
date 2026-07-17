@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { Command } from "commander";
 import { Orchestrator, defaultLoopHome } from "./orchestrator.js";
@@ -667,10 +667,13 @@ function createOrchestrator(loopHome: string): Orchestrator {
     model: process.env.AGENT_LOOP_CLAUDE_MODEL ?? null,
   });
   const deepseek = configuredPiAdapter();
-  const runtimeConfigResolver = new RuntimeConfigResolver(
-    new EvaluationStore(resolve(loopHome, "evaluation.sqlite")),
-    process.env.AGENT_LOOP_CANARY_ENABLED === "true",
-  );
+  const evaluationStatePath = resolve(loopHome, "evaluation.sqlite");
+  const runtimeConfigResolver = existsSync(evaluationStatePath)
+    ? new RuntimeConfigResolver(
+      new EvaluationStore(evaluationStatePath, { readOnly: true }),
+      process.env.AGENT_LOOP_CANARY_ENABLED === "true",
+    )
+    : undefined;
   return new Orchestrator({
     loopHome,
     providerProfile: createProviderProfile(profileName, {

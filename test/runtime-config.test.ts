@@ -1,4 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { EvaluationStore } from "../src/evaluation/store.js";
 import type { CanaryAssignment } from "../src/evolution/canary.js";
 import { createInitialChampion, type ConfigurationVariant, type EvolutionConfiguration } from "../src/evolution/proposals.js";
 import { RuntimeConfigResolver, type RuntimeConfigRepository } from "../src/runtime-config.js";
@@ -48,5 +52,28 @@ describe("read-only Runtime Config resolution", () => {
     expect(new RuntimeConfigResolver(repository).resolve({
       projectScope: "generic-node", taskKey: "TASK-1", effectiveRisk: "low",
     })).toMatchObject({ configSource: "champion", configurationVariantId: "champion" });
+  });
+
+  it("resolves from a read-only evaluation store that mechanically rejects writes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-loop-runtime-config-readonly-"));
+    try {
+      const path = join(directory, "evaluation.sqlite");
+      const writable = new EvaluationStore(path);
+      const champion = writable.installConfigurationVariant(createInitialChampion({
+        id: "readonly-champion", projectScope: "generic-node", version: "1", configuration: championConfiguration,
+      }));
+      writable.close();
+      const readOnly = new EvaluationStore(path, { readOnly: true });
+      expect(new RuntimeConfigResolver(readOnly).resolve({
+        projectScope: "generic-node", taskKey: "TASK-1", effectiveRisk: "low",
+      })).toMatchObject({ configSource: "champion", configurationVariantId: champion.id });
+      expect(() => readOnly.database.exec("DELETE FROM configuration_variants"))
+        .toThrow(/readonly/iu);
+      readOnly.close();
+      expect(() => new EvaluationStore(join(directory, "missing.sqlite"), { readOnly: true }))
+        .toThrow();
+    } finally {
+      rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
   });
 });
