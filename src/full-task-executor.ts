@@ -52,6 +52,13 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
         finalOutput = execution.result.finalOutput;
       } else {
         diagnostics.push(`author-attempt-${attempt}:${execution.result?.failureClass ?? "failed"}`);
+        if (git.isDirty()) {
+          // A failed attempt that already wrote files would contaminate the
+          // next attempt's worktree and the eventual candidate commit; abort
+          // instead of retrying on a tainted tree.
+          diagnostics.push("dirty-worktree-after-failed-attempt");
+          break;
+        }
       }
     }
     if (!providerOk) return { passed: false, evidenceHash: null, diagnostics };
