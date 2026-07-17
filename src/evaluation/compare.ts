@@ -70,6 +70,7 @@ export interface ShadowEvaluation {
   projectScope: string;
   championId: string;
   challengerId: string;
+  dataSource: "real" | "fixture";
   championAdviceHash: string;
   challengerAdviceHash: string;
   championDecision: ShadowDecision;
@@ -284,6 +285,7 @@ export async function runShadowEvaluation(
     projectScope: input.champion.projectScope,
     championId: input.champion.id,
     challengerId: input.challenger.id,
+    dataSource: input.facts.source,
     championAdviceHash,
     challengerAdviceHash,
     championDecision,

@@ -483,7 +483,7 @@ export class EvaluationStore {
       ? this.database.prepare("SELECT shadow_json FROM shadow_evaluations WHERE project_scope = ? ORDER BY created_at, id").all(projectScope)
       : this.database.prepare("SELECT shadow_json FROM shadow_evaluations ORDER BY project_scope, created_at, id").all()) as
       Array<{ shadow_json: string }>;
-    return rows.map((row) => JSON.parse(row.shadow_json) as ShadowEvaluation);
+    return rows.map((row) => normalizeShadowEvaluation(JSON.parse(row.shadow_json) as Partial<ShadowEvaluation>));
   }
 
   installCanaryApproval(approval: CanaryApproval): CanaryApproval {
@@ -1033,6 +1033,11 @@ function validateMemoryDecision(
       ? ["rejected", "deprecated", "invalidated"]
       : [];
   if (!allowed.includes(input.status)) throw new Error(`Illegal Candidate Memory decision: ${current.status} -> ${input.status}`);
+}
+
+function normalizeShadowEvaluation(shadow: Partial<ShadowEvaluation>): ShadowEvaluation {
+  // Rows written before dataSource existed cannot prove real provenance; fail closed to fixture.
+  return { ...(shadow as ShadowEvaluation), dataSource: shadow.dataSource ?? "fixture" };
 }
 
 function normalizeCandidateMemory(memory: Partial<CandidateMemory>): CandidateMemory {

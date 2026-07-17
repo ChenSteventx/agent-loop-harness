@@ -192,16 +192,19 @@ evaluation
         realRunCount: realRuns.length,
         resolvedFindingCount: projections.reduce((total, value) =>
           total + value.reviewerFindings.confirmed + value.reviewerFindings.rejected, 0),
-        manifestCompleteReplayCount: evaluationStore.listEvaluationRuns()
+        completedRealFullTaskReplays: evaluationStore.listEvaluationRuns()
           .filter((run) => run.dataSource === "real" && run.status === "completed" &&
-            run.replayability === "manifest-complete").length,
+            run.replayability === "manifest-complete" && run.mode === "full" &&
+            run.evaluatorKind === "full-task-replay").length,
         goldenTaskCount: datasets.filter((dataset) => dataset.kind === "golden")
           .reduce((total, dataset) => total + dataset.tasks.length, 0),
         holdoutTaskCount: datasets.filter((dataset) => dataset.kind === "holdout")
           .reduce((total, dataset) => total + dataset.tasks.length, 0),
-        completedOfflineComparisons: evaluationStore.listOfflineComparisons()
-          .filter((comparison) => comparison.status === "completed" && comparison.guardrailsSatisfied).length,
-        completedShadowRuns: evaluationStore.listShadowEvaluations().length,
+        promotionEligibleRealComparisons: evaluationStore.listOfflineComparisons()
+          .filter((comparison) => comparison.status === "completed" && comparison.dataSource === "real" &&
+            comparison.promotionEligible).length,
+        completedRealShadowRuns: evaluationStore.listShadowEvaluations()
+          .filter((shadow) => shadow.dataSource === "real").length,
         humanCanaryApproval: evaluationStore.listCanaryApprovals()
           .some((approval) => approval.authority === "human" && approval.expiresAt > new Date().toISOString()),
         coverageComplete: requiredReadinessCoverage(realRuns, factBundles, projections),
