@@ -245,9 +245,10 @@ export function recordCanaryObservation(
     verificationFailures: input.verificationFailures === 0,
     postMergeFailures: postMergeFailures === 0,
     humanEscalation: input.humanEscalation !== true,
-    latency: latencyMs === null ? null : latencyMs <= 600_000,
-    tokens: tokens === null ? null : tokens >= 0,
-    cost: cost === null ? null : cost >= 0,
+    // No proposal-derived baseline exists for these yet; unknown must not satisfy a required guardrail.
+    latency: null,
+    tokens: null,
+    cost: null,
   };
   const guardrailViolation = input.assignment.selected === "challenger" &&
     proposal.evaluationPlan.requiredGuardrails.some((guardrail) => guardrailResults[guardrail] !== true);

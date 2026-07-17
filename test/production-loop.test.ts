@@ -224,5 +224,38 @@ describe("production CLI loop", () => {
       canaryAssignmentId: null,
       configSource: "champion",
     });
-  }, 180_000);
+    const observation = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "canary", "observe",
+      "--id", "formal-degradation", "--assignment-id", assignment.id,
+      "--run-id", "production-cli-canary", "--fact-hash", "formal-canary-fact",
+      "--verification-failures", "1",
+    ], {
+      ...process.env,
+      AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY",
+    }) as { guardrailViolation: boolean; rollbackDecisionId: string | null };
+    expect(observation).toMatchObject({
+      guardrailViolation: true,
+      rollbackDecisionId: "formal-degradation:rollback",
+    });
+    const afterRollback = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "run",
+      "--run-id", "canary-chain-champion-after-rollback", "--task", target.taskPath,
+      "--repository", target.root,
+    ], {
+      ...process.env,
+      CODEX_BIN: fakeCodex,
+      FAKE_CODEX_MODE: "production-author",
+      AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY",
+      AGENT_LOOP_CANARY_ENABLED: "true",
+    }) as { run: { binding: {
+      configurationVariantId: string; configurationHash: string;
+      canaryAssignmentId: string | null; configSource: string;
+    } } };
+    expect(afterRollback.run.binding).toMatchObject({
+      configurationVariantId: champion.id,
+      configurationHash: champion.configurationHash,
+      canaryAssignmentId: null,
+      configSource: "champion",
+    });
+  }, 240_000);
 });
