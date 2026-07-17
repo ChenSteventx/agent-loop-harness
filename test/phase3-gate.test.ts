@@ -34,6 +34,9 @@ const gates = [
   [25, "formal high-risk Run always uses Champion", "test/production-loop.test.ts", "production-cli-high-risk"],
   [26, "SMTP plaintext authentication is rejected", "test/notifications.test.ts", "requires TLS or STARTTLS"],
   [27, "Digest windows use Event time", "test/evolution-notifications.test.ts", "old-updated-run"],
+  [28, "Verify-only cannot evaluate Memory Retrieval strategy", "test/compare-shadow.test.ts", "memory-retrieval-proposal"],
+  [29, "Canary rollback restores the Champion for the next formal Run", "test/production-loop.test.ts", "canary-chain-champion-after-rollback"],
+  [30, "formal runtime reads evaluation state read-only", "src/cli.ts", "readOnly: true"],
 ] as const;
 
 describe("Phase 3 final gate traceability", () => {
