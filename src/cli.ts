@@ -668,10 +668,14 @@ function createOrchestrator(loopHome: string): Orchestrator {
   });
   const deepseek = configuredPiAdapter();
   const evaluationStatePath = resolve(loopHome, "evaluation.sqlite");
+  const canaryEnabled = process.env.AGENT_LOOP_CANARY_ENABLED === "true";
+  if (canaryEnabled && !existsSync(evaluationStatePath)) {
+    throw new Error("AGENT_LOOP_CANARY_ENABLED=true requires an existing evaluation.sqlite in the loop home");
+  }
   const runtimeConfigResolver = existsSync(evaluationStatePath)
     ? new RuntimeConfigResolver(
       new EvaluationStore(evaluationStatePath, { readOnly: true }),
-      process.env.AGENT_LOOP_CANARY_ENABLED === "true",
+      canaryEnabled,
     )
     : undefined;
   return new Orchestrator({

@@ -258,4 +258,19 @@ describe("production CLI loop", () => {
       configSource: "champion",
     });
   }, 240_000);
+
+  it("fails closed when Canary is enabled without evaluation state", () => {
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-production-no-evaluation-"));
+    temporaryDirectories.push(loopHome);
+    const result = spawnSync(process.execPath, [tsxCli, loopCli,
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "status", "--run-id", "missing",
+    ], {
+      cwd: resolve("."),
+      env: { ...process.env, AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY", AGENT_LOOP_CANARY_ENABLED: "true" },
+      encoding: "utf8",
+      timeout: 120_000,
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("AGENT_LOOP_CANARY_ENABLED=true requires an existing evaluation.sqlite");
+  }, 120_000);
 });
