@@ -180,11 +180,16 @@ export class CodexCliAdapter implements ProviderAdapter {
     };
   }
 
-  run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+  async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    // The Invocation Manifest needs the adapter version for replayability;
+    // callers that never probed would otherwise record a permanently null
+    // version and no run could ever grade manifest-complete.
+    if (this.version === null) await this.probe();
     return this.invoke(request, null);
   }
 
-  resume(threadId: string, request: ProviderRunRequest): Promise<ProviderRunResult> {
+  async resume(threadId: string, request: ProviderRunRequest): Promise<ProviderRunResult> {
+    if (this.version === null) await this.probe();
     return this.invoke(request, threadId);
   }
 

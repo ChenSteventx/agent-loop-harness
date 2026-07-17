@@ -38,6 +38,7 @@ const gates = [
   [29, "Canary rollback restores the Champion for the next formal Run", "test/production-loop.test.ts", "canary-chain-champion-after-rollback"],
   [30, "formal runtime reads evaluation state read-only", "src/cli.ts", "readOnly: true"],
   [31, "proposals are limited to runtime-wired targets", "test/evolution.test.ts", "unsupported-runtime-target"],
+  [32, "the vertical slice runs compare, shadow, canary, and rollback through the CLI", "test/phase3-vertical-slice.test.ts", "slice-rollback"],
 ] as const;
 
 describe("Phase 3 final gate traceability", () => {

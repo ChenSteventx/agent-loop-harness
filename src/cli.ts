@@ -297,6 +297,12 @@ compare
           binding: sourceRun.binding,
           configurationVariant: variant,
         });
+        if (run.status === "not-replayable") {
+          // A non-replayable task must abort the comparison: mapping it to a
+          // symmetric failure would let a comparison in which nothing executed
+          // still report promotion eligibility.
+          throw new Error(`Task ${task.id} is not fully replayable: ${run.missingInputs.join(", ")}`);
+        }
         const passed = run.status === "completed" && run.outcome?.passed === true;
         return {
           passed,
