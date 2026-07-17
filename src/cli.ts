@@ -51,6 +51,7 @@ import {
   assignCanary,
   createCanaryApproval,
   disabledCanaryPolicy,
+  policyFromApproval,
   recordCanaryObservation,
 } from "./evolution/canary.js";
 import { SmtpEmailTransport } from "./email.js";
@@ -510,13 +511,14 @@ canary.command("assign")
       const challenger = comparison ? store.getConfigurationVariant(comparison.challengerId) : null;
       const approval = store.getCanaryApproval(options.approvalId);
       const readiness = store.latestReadiness();
-      if (!comparison || !proposalValue || !champion || !challenger || !readiness) {
+      if (!comparison || !proposalValue || !champion || !challenger || !readiness || !approval) {
         throw new Error("Canary assignment facts are incomplete");
       }
       print(assignCanary(store, {
         id: options.id, projectScope: comparison.projectScope, taskKey: options.taskKey,
         risk: parseRisk(options.risk), proposal: proposalValue, champion, challenger, comparison,
         readiness, approval,
+        policy: policyFromApproval(approval),
       }));
     });
   });
@@ -525,32 +527,31 @@ canary.command("observe")
   .requiredOption("--id <id>")
   .requiredOption("--assignment-id <id>")
   .requiredOption("--run-id <id>")
-  .requiredOption("--fact-hash <hash>")
-  .option("--ready", "run became ready", false)
-  .option("--done", "run became done", false)
-  .option("--verification-failures <count>", "verification failures", "0")
-  .option("--post-merge-failures <count>", "post-merge failures", "0")
-  .option("--human-escalation", "run required human escalation", false)
-  .option("--latency-ms <count>", "observed latency in milliseconds")
-  .option("--tokens <count>", "observed token count; omitted remains unknown")
-  .option("--cost <amount>", "observed cost; omitted remains unknown")
-  .action((options: {
-    id: string; assignmentId: string; runId: string; factHash: string; ready: boolean; done: boolean;
-    verificationFailures: string; postMergeFailures: string; humanEscalation: boolean;
-    latencyMs?: string; tokens?: string; cost?: string;
-  }) => {
-    withEvaluationStores((_development, store) => {
+  .description("project a Canary Observation deterministically from stored formal Run facts")
+  .action((options: { id: string; assignmentId: string; runId: string }) => {
+    withEvaluationStores((development, store) => {
       const assignment = store.getCanaryAssignment(options.assignmentId);
       if (!assignment) throw new Error("Canary Assignment not found");
+      const run = development.getRun(options.runId);
+      if (!run?.binding) throw new Error(`Formal Run not found or unbound: ${options.runId}`);
+      if (run.binding.canaryAssignmentId !== assignment.id ||
+          run.binding.configurationVariantId !== assignment.selectedVariantId) {
+        throw new Error("Formal Run binding does not match the Canary Assignment");
+      }
+      const facts = store.installFactBundle(exportRunFacts(development, options.runId));
+      const runMetrics = projectRunMetrics(facts);
       print(recordCanaryObservation(store, {
-        id: options.id, assignment, formalRunId: options.runId, factHash: options.factHash,
-        ready: options.ready, done: options.done,
-        verificationFailures: nonnegativeInteger(options.verificationFailures, "verification failures"),
-        postMergeFailures: nonnegativeInteger(options.postMergeFailures, "post-merge failures"),
-        humanEscalation: options.humanEscalation,
-        latencyMs: optionalNonnegativeNumber(options.latencyMs, "latency"),
-        tokens: optionalNonnegativeNumber(options.tokens, "tokens"),
-        cost: optionalNonnegativeNumber(options.cost, "cost"),
+        id: options.id, assignment, formalRunId: options.runId, factHash: facts.factHash,
+        ready: runMetrics.readySuccess,
+        done: runMetrics.doneSuccess,
+        verificationFailures: runMetrics.verificationFailures,
+        postMergeFailures: runMetrics.postMergeFailureCount,
+        humanEscalation: facts.human.length > 0,
+        latencyMs: runMetrics.latencyMs,
+        tokens: runMetrics.tokens.input === null || runMetrics.tokens.output === null
+          ? null
+          : runMetrics.tokens.input + runMetrics.tokens.output,
+        cost: null,
       }));
     });
   });

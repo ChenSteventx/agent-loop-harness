@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { operationInputHash } from "../bindings.js";
 import type { OfflineComparison } from "../evaluation/compare.js";
 import type { ReadinessReport } from "../evaluation/readiness.js";
 import type { ChangeProposal, ConfigurationVariant, EvolutionTarget, RollbackDecision } from "./proposals.js";
@@ -66,6 +67,9 @@ export interface CanaryAssignment {
   bucket: number;
   basisPoints: number;
   extraBudgetTokens: number;
+  approvalId: string | null;
+  policyHash: string;
+  expiresAt: string | null;
   reason: string;
   createdAt: string;
 }
@@ -205,9 +209,28 @@ export function assignCanary(
     bucket,
     basisPoints: policy.basisPoints,
     extraBudgetTokens: policy.extraBudgetTokens,
+    approvalId: input.approval?.id ?? null,
+    policyHash: operationInputHash(policy),
+    expiresAt: selected === "challenger" ? input.approval!.expiresAt : input.approval?.expiresAt ?? null,
     reason,
     createdAt,
   });
+}
+
+export function policyFromApproval(approval: CanaryApproval): CanaryPolicy {
+  // The approval is the only policy source: an environment variable must never
+  // control traffic percentage or scope. The hash salt stays constant so
+  // cohort bucketing is reproducible across assignments.
+  return {
+    enabled: true,
+    basisPoints: approval.maximumBasisPoints,
+    hashSalt: "agent-loop-canary-v1",
+    projectAllowlist: [approval.projectScope],
+    maxTasks: approval.maximumTasks,
+    windowStartsAt: approval.createdAt,
+    windowEndsAt: approval.expiresAt,
+    extraBudgetTokens: approval.maximumExtraBudgetTokens,
+  };
 }
 
 export function recordCanaryObservation(

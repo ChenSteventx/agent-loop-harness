@@ -23,7 +23,9 @@ function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-function fixture(options: { taskId?: string; risk?: "low" | "normal" | "high" } = {}): { root: string; taskPath: string } {
+function fixture(options: {
+  taskId?: string; risk?: "low" | "normal" | "high"; requiredContent?: string;
+} = {}): { root: string; taskPath: string } {
   const root = mkdtempSync(join(tmpdir(), "agent-loop-production-target-"));
   temporaryDirectories.push(root);
   git(root, ["init", "-b", "main"]);
@@ -31,7 +33,7 @@ function fixture(options: { taskId?: string; risk?: "low" | "normal" | "high" } 
   git(root, ["config", "user.name", "Production Test"]);
   writeFileSync(
     join(root, "check.mjs"),
-    "import { readFileSync } from 'node:fs'; process.exit(readFileSync('changed.txt', 'utf8').includes('production CLI') ? 0 : 5);\n",
+    `import { readFileSync } from 'node:fs'; process.exit(readFileSync('changed.txt', 'utf8').includes('${options.requiredContent ?? "production CLI"}') ? 0 : 5);\n`,
   );
   const taskPath = join(root, "task.yaml");
   writeFileSync(taskPath, [
@@ -60,6 +62,17 @@ function runCli(args: string[], environment: NodeJS.ProcessEnv): unknown {
   expect(result.error).toBeUndefined();
   expect(result.status, result.stderr).toBe(0);
   return JSON.parse(result.stdout) as unknown;
+}
+
+function runCliTolerant(args: string[], environment: NodeJS.ProcessEnv): { status: number | null; stderr: string } {
+  const result = spawnSync(process.execPath, [tsxCli, loopCli, ...args], {
+    cwd: resolve("."),
+    env: environment,
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  expect(result.error).toBeUndefined();
+  return { status: result.status, stderr: result.stderr };
 }
 
 afterEach(() => {
@@ -133,6 +146,10 @@ describe("production CLI loop", () => {
   it("runs a low-risk formal Fake Canary with the assigned Challenger configuration", () => {
     const target = fixture();
     const highRiskTarget = fixture({ taskId: "PRODUCTION-CLI-HIGH", risk: "high" });
+    const degradedTarget = fixture({
+      taskId: "PRODUCTION-CLI-DEGRADED",
+      requiredContent: "content the fake author never writes",
+    });
     const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-production-canary-home-"));
     temporaryDirectories.push(loopHome);
     const configuration: EvolutionConfiguration = {
@@ -150,6 +167,9 @@ describe("production CLI loop", () => {
       rationale: "exercise the formal Fake Canary path", sourceFactHashes: ["fact-a", "fact-b"],
       datasets: DatasetCatalog.loadDirectory(resolve("eval")).list("proposal"),
       metrics: ["readyRate"], minimumSamples: 1,
+      // Observed at the ready stage, before any merge: requiring the done
+      // guardrail here would roll back every healthy pre-merge Canary.
+      requiredGuardrails: ["ready", "verificationFailures"],
     }));
     const approved = approveChangeProposal(evaluation, {
       id: draft.id, approvedBy: "test-human", reason: "exercise bounded canary",
@@ -162,6 +182,8 @@ describe("production CLI loop", () => {
       taskKey: "PRODUCTION-CLI-1", risk: "low", proposalId: approved.id,
       championId: champion.id, challengerId: challenger.id, selectedVariantId: challenger.id,
       selected: "challenger", bucket: 0, basisPoints: 100, extraBudgetTokens: 0,
+      approvalId: "formal-approval", policyHash: "formal-policy-hash",
+      expiresAt: "2027-01-01T00:00:00.000Z",
       reason: "deterministic Fake Canary", createdAt: "2026-07-16T00:00:00.000Z",
     };
     evaluation.installCanaryAssignment(assignment);
@@ -171,6 +193,12 @@ describe("production CLI loop", () => {
       taskKey: "PRODUCTION-CLI-HIGH",
       risk: "high",
       reason: "adversarial assignment must still resolve to Champion",
+    });
+    evaluation.installCanaryAssignment({
+      ...assignment,
+      id: "formal-degraded-assignment",
+      taskKey: "PRODUCTION-CLI-DEGRADED",
+      reason: "deterministic degraded Fake Canary",
     });
     evaluation.close();
 
@@ -224,19 +252,45 @@ describe("production CLI loop", () => {
       canaryAssignmentId: null,
       configSource: "champion",
     });
-    const observation = runCli([
+    const healthyObservation = runCli([
       "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "canary", "observe",
-      "--id", "formal-degradation", "--assignment-id", assignment.id,
-      "--run-id", "production-cli-canary", "--fact-hash", "formal-canary-fact",
-      "--verification-failures", "1",
+      "--id", "formal-healthy", "--assignment-id", assignment.id,
+      "--run-id", "production-cli-canary",
     ], {
       ...process.env,
       AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY",
-    }) as { guardrailViolation: boolean; rollbackDecisionId: string | null };
+    }) as { ready: boolean; verificationFailures: number; guardrailViolation: boolean; factHash: string };
+    expect(healthyObservation).toMatchObject({
+      ready: true, verificationFailures: 0, guardrailViolation: false,
+    });
+    expect(healthyObservation.factHash).toMatch(/^[a-f0-9]{64}$/u);
+
+    const degraded = runCliTolerant([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "run",
+      "--run-id", "production-cli-degraded", "--task", degradedTarget.taskPath,
+      "--repository", degradedTarget.root,
+    ], {
+      ...process.env,
+      CODEX_BIN: fakeCodex,
+      FAKE_CODEX_MODE: "production-author",
+      AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY",
+      AGENT_LOOP_CANARY_ENABLED: "true",
+    });
+    expect(degraded.status).not.toBeNull();
+    const observation = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "canary", "observe",
+      "--id", "formal-degradation", "--assignment-id", "formal-degraded-assignment",
+      "--run-id", "production-cli-degraded",
+    ], {
+      ...process.env,
+      AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY",
+    }) as { ready: boolean; verificationFailures: number; guardrailViolation: boolean; rollbackDecisionId: string | null };
     expect(observation).toMatchObject({
+      ready: false,
       guardrailViolation: true,
       rollbackDecisionId: "formal-degradation:rollback",
     });
+    expect(observation.verificationFailures).toBeGreaterThan(0);
     const afterRollback = runCli([
       "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "run",
       "--run-id", "canary-chain-champion-after-rollback", "--task", target.taskPath,

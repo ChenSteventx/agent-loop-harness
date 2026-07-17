@@ -22,6 +22,7 @@ export class RuntimeConfigResolver {
   constructor(
     private readonly repository: RuntimeConfigRepository,
     private readonly canaryEnabled = false,
+    private readonly now: () => string = () => new Date().toISOString(),
   ) {}
 
   resolve(input: { projectScope: string; taskKey: string; effectiveRisk: Risk }): RuntimeConfiguration {
@@ -29,7 +30,12 @@ export class RuntimeConfigResolver {
     if (!champion) return defaultRuntimeConfiguration();
     if (!this.canaryEnabled || input.effectiveRisk !== "low") return fromVariant(champion, null, "champion");
     const assignment = this.repository.findCanaryAssignment(input.projectScope, input.taskKey);
-    if (!assignment || assignment.risk !== "low" || assignment.selected !== "challenger") {
+    // Assignments bound to a retired Champion, mismatched variants, or an
+    // expired (or legacy pre-expiry) approval fall back to the Champion.
+    if (!assignment || assignment.risk !== "low" || assignment.selected !== "challenger" ||
+        assignment.championId !== champion.id ||
+        assignment.selectedVariantId !== assignment.challengerId ||
+        !assignment.expiresAt || assignment.expiresAt <= this.now()) {
       return fromVariant(champion, null, "champion");
     }
     const challenger = this.repository.getConfigurationVariant(assignment.selectedVariantId);

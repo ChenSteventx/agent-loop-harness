@@ -9,6 +9,7 @@ import {
   assignCanary,
   createCanaryApproval,
   disabledCanaryPolicy,
+  policyFromApproval,
   recordCanaryObservation,
   stableCanaryBucket,
 } from "../src/evolution/canary.js";
@@ -157,8 +158,24 @@ describe("disabled low-risk Canary", () => {
       policy,
       createdAt: "2026-07-15T00:05:00.000Z",
     });
-    expect(assignment).toMatchObject({ selected: "challenger", selectedVariantId: challenger.id });
+    expect(assignment).toMatchObject({
+      selected: "challenger",
+      selectedVariantId: challenger.id,
+      approvalId: approval.id,
+      expiresAt: approval.expiresAt,
+    });
+    expect(assignment.policyHash).toMatch(/^[a-f0-9]{64}$/u);
     expect(stableCanaryBucket("generic-node", taskKey, proposal.id, "stable-salt")).toBe(assignment.bucket);
+    expect(policyFromApproval(approval)).toEqual({
+      enabled: true,
+      basisPoints: approval.maximumBasisPoints,
+      hashSalt: "agent-loop-canary-v1",
+      projectAllowlist: [approval.projectScope],
+      maxTasks: approval.maximumTasks,
+      windowStartsAt: approval.createdAt,
+      windowEndsAt: approval.expiresAt,
+      extraBudgetTokens: approval.maximumExtraBudgetTokens,
+    });
     expect(assignCanary(store, {
       id: "assignment-normal", projectScope: "generic-node", taskKey, risk: "normal", proposal,
       champion, challenger, comparison, readiness, approval, policy,

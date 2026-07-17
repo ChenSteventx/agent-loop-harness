@@ -32,7 +32,8 @@ describe("read-only Runtime Config resolution", () => {
       schemaVersion: 1, id: "assignment", projectScope: "generic-node", taskKey: "TASK-1", risk: "low",
       proposalId: "proposal", championId: champion.id, challengerId: challenger.id,
       selectedVariantId: challenger.id, selected: "challenger", bucket: 1, basisPoints: 100,
-      extraBudgetTokens: 0, reason: "test", createdAt: "2026-07-16T00:00:00.000Z",
+      extraBudgetTokens: 0, approvalId: "assignment-approval", policyHash: "assignment-policy-hash",
+      expiresAt: "2027-01-01T00:00:00.000Z", reason: "test", createdAt: "2026-07-16T00:00:00.000Z",
     };
     let challengerStatus: ConfigurationVariant["status"] = "challenger";
     const repository: RuntimeConfigRepository = {
@@ -52,6 +53,38 @@ describe("read-only Runtime Config resolution", () => {
     expect(new RuntimeConfigResolver(repository).resolve({
       projectScope: "generic-node", taskKey: "TASK-1", effectiveRisk: "low",
     })).toMatchObject({ configSource: "champion", configurationVariantId: "champion" });
+  });
+
+  it("falls back to the Champion for stale, mismatched, or expired assignments", () => {
+    const champion = createInitialChampion({
+      id: "champion", projectScope: "generic-node", version: "1", configuration: championConfiguration,
+    });
+    const challenger: ConfigurationVariant = {
+      ...champion, id: "challenger", proposalId: "proposal", version: "2", status: "challenger",
+      configurationHash: "challenger-hash", activatedAt: null,
+    };
+    const base: CanaryAssignment = {
+      schemaVersion: 1, id: "assignment", projectScope: "generic-node", taskKey: "TASK-1", risk: "low",
+      proposalId: "proposal", championId: champion.id, challengerId: challenger.id,
+      selectedVariantId: challenger.id, selected: "challenger", bucket: 1, basisPoints: 100,
+      extraBudgetTokens: 0, approvalId: "approval", policyHash: "policy-hash",
+      expiresAt: "2027-01-01T00:00:00.000Z", reason: "test", createdAt: "2026-07-16T00:00:00.000Z",
+    };
+    const resolverFor = (assignment: CanaryAssignment) => new RuntimeConfigResolver({
+      activeChampion: () => champion,
+      getConfigurationVariant: () => challenger,
+      findCanaryAssignment: () => assignment,
+    }, true, () => "2026-07-17T00:00:00.000Z");
+    const query = { projectScope: "generic-node", taskKey: "TASK-1", effectiveRisk: "low" as const };
+    expect(resolverFor(base).resolve(query)).toMatchObject({ configSource: "canary" });
+    expect(resolverFor({ ...base, championId: "retired-champion" }).resolve(query))
+      .toMatchObject({ configSource: "champion", configurationVariantId: champion.id });
+    expect(resolverFor({ ...base, selectedVariantId: "someone-else" }).resolve(query))
+      .toMatchObject({ configSource: "champion" });
+    expect(resolverFor({ ...base, expiresAt: "2026-07-16T23:59:59.000Z" }).resolve(query))
+      .toMatchObject({ configSource: "champion" });
+    expect(resolverFor({ ...base, expiresAt: null }).resolve(query))
+      .toMatchObject({ configSource: "champion" });
   });
 
   it("resolves from a read-only evaluation store that mechanically rejects writes", () => {
