@@ -139,8 +139,15 @@ describe("production CLI loop", () => {
       "--provider-profile", "CODEX_PRIMARY",
       "status",
       "--run-id", runId,
-    ], environment) as { run: { status: string }; worktreePath: string };
+      "--derived",
+    ], environment) as {
+      run: { status: string }; worktreePath: string;
+      derived: { nextAction: { kind: string } | null; proofGaps: unknown; budget: { maximumDiffBytes: number } | null };
+    };
     expect(reloaded).toMatchObject({ run: { status: "ready" }, worktreePath: started.worktreePath });
+    expect(reloaded.derived.nextAction).toMatchObject({ kind: "advance-ready" });
+    expect(reloaded.derived.budget?.maximumDiffBytes).toBeGreaterThan(0);
+    expect(reloaded.derived.proofGaps).not.toBeNull();
   }, 180_000);
 
   it("runs a low-risk formal Fake Canary with the assigned Challenger configuration", () => {

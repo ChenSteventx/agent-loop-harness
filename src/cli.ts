@@ -107,11 +107,14 @@ program
 program
   .command("status")
   .option("--run-id <id>")
+  .option("--derived", "include the non-persisted derived view (phase, next action, proof gaps, budget, recovery)", false)
   .description("show durable run state after completion or interruption")
-  .action(async (options: { runId?: string }) => {
-    await withOrchestrator(async (orchestrator) =>
-      print(options.runId ? orchestrator.status(options.runId) : orchestrator.listRuns()),
-    );
+  .action(async (options: { runId?: string; derived: boolean }) => {
+    await withOrchestrator(async (orchestrator) => {
+      if (!options.runId) return print(orchestrator.listRuns());
+      const view = orchestrator.status(options.runId);
+      return print(options.derived ? { ...view, derived: orchestrator.derivedView(options.runId) } : view);
+    });
   });
 
 program

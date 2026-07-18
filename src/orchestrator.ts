@@ -84,6 +84,14 @@ export function defaultLoopHome(): string {
   return resolve(homedir(), ".agent-loop-harness");
 }
 
+export interface DerivedRunView {
+  status: Run["status"];
+  nextAction: NextAction | null;
+  proofGaps: ProofGapSnapshot | null;
+  budget: import("./budget.js").RunBudget | null;
+  recovery: import("./domain.js").RecoveryDisposition | null;
+}
+
 export interface OrchestratorOptions {
   loopHome?: string;
   provider?: ProviderAdapter;
@@ -252,6 +260,43 @@ export class Orchestrator {
     this.store.appendEvent(runId, "worktree.created", worktree);
 
     return this.runUntilStable(runId);
+  }
+
+  // Non-persisted view derived from the same snapshot/decision code the loop
+  // itself uses: no second source of truth, nothing new in the database.
+  derivedView(runId: string): DerivedRunView {
+    const run = this.store.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    if (run.status !== "open" && run.status !== "ready") {
+      return {
+        status: run.status,
+        nextAction: null,
+        proofGaps: null,
+        budget: run.binding?.budget ?? null,
+        recovery: run.blocked?.recovery ?? null,
+      };
+    }
+    try {
+      const snapshot = this.proofGapSnapshot(runId);
+      return {
+        status: run.status,
+        nextAction: decideNextAction(snapshot),
+        proofGaps: snapshot,
+        budget: run.binding?.budget ?? null,
+        recovery: null,
+      };
+    } catch (error) {
+      if (error instanceof BudgetExceededError) {
+        return {
+          status: run.status,
+          nextAction: { kind: "block", reason: error.message },
+          proofGaps: null,
+          budget: run.binding?.budget ?? null,
+          recovery: null,
+        };
+      }
+      throw error;
+    }
   }
 
   status(runId: string): RunView {
