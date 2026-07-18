@@ -167,4 +167,21 @@ describe("SqliteStore", () => {
     expect(store.listPendingOutbox()[0]).toMatchObject({ type: "needs-human" });
     store.close();
   });
+
+  it("opens read-only for sidecar consumers and mechanically rejects writes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-loop-store-readonly-"));
+    const path = join(directory, "state.sqlite");
+    try {
+      const writable = new SqliteStore(path);
+      writable.createRun("readonly-run", "task-1");
+      writable.close();
+      const readOnly = new SqliteStore(path, { readOnly: true });
+      expect(readOnly.getRun("readonly-run")?.id).toBe("readonly-run");
+      expect(() => readOnly.database.exec("DELETE FROM runs")).toThrow(/readonly/iu);
+      readOnly.close();
+      expect(() => new SqliteStore(join(directory, "missing.sqlite"), { readOnly: true })).toThrow();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });

@@ -92,10 +92,12 @@ export type EvidenceInstallInput = Omit<
 export class SqliteStore {
   readonly database: Sqlite;
 
-  constructor(path: string) {
-    this.database = new Database(path);
+  constructor(path: string, options: { readOnly?: boolean } = {}) {
+    this.database = options.readOnly
+      ? new Database(path, { readonly: true, fileMustExist: true })
+      : new Database(path);
     this.database.pragma("foreign_keys = ON");
-    this.migrate();
+    if (!options.readOnly) this.migrate();
   }
 
   close(): void {

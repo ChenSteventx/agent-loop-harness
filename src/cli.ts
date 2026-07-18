@@ -599,7 +599,7 @@ notify
       const formal = await new NotificationDispatcher(development, transport, options).dispatch();
       const evolution = await new NotificationDispatcher(evaluationStore, transport, options).dispatch();
       print({ formal, evolution });
-    });
+    }, { developmentWritable: true });
   });
 notify
   .command("status")
@@ -860,10 +860,24 @@ async function withOrchestrator(action: (orchestrator: Orchestrator) => Promise<
   }
 }
 
-function withEvaluationStores(action: (development: SqliteStore, evaluation: EvaluationStore) => void): void {
+function openDevelopmentStore(home: string, options: { writable?: boolean } = {}): SqliteStore {
+  // The evaluation sidecar must not create or migrate the formal store as a
+  // side effect; only commands that genuinely write formal state (the formal
+  // notification Outbox) open it writable.
+  if (options.writable) return new SqliteStore(resolve(home, "state.sqlite"));
+  if (!existsSync(resolve(home, "state.sqlite"))) {
+    throw new Error(`No formal development state at ${resolve(home, "state.sqlite")}`);
+  }
+  return new SqliteStore(resolve(home, "state.sqlite"), { readOnly: true });
+}
+
+function withEvaluationStores(
+  action: (development: SqliteStore, evaluation: EvaluationStore) => void,
+  options: { developmentWritable?: boolean } = {},
+): void {
   const home = resolve(program.opts<{ loopHome: string }>().loopHome);
   mkdirSync(home, { recursive: true });
-  const development = new SqliteStore(resolve(home, "state.sqlite"));
+  const development = openDevelopmentStore(home, { writable: options.developmentWritable });
   const evaluation = new EvaluationStore(resolve(home, "evaluation.sqlite"));
   try {
     action(development, evaluation);
@@ -875,10 +889,11 @@ function withEvaluationStores(action: (development: SqliteStore, evaluation: Eva
 
 async function withEvaluationStoresAsync(
   action: (development: SqliteStore, evaluation: EvaluationStore, home: string) => Promise<void>,
+  options: { developmentWritable?: boolean } = {},
 ): Promise<void> {
   const home = resolve(program.opts<{ loopHome: string }>().loopHome);
   mkdirSync(home, { recursive: true });
-  const development = new SqliteStore(resolve(home, "state.sqlite"));
+  const development = openDevelopmentStore(home, { writable: options.developmentWritable });
   const evaluationStore = new EvaluationStore(resolve(home, "evaluation.sqlite"));
   try {
     await action(development, evaluationStore, home);
