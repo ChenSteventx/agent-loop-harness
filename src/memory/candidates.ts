@@ -142,7 +142,12 @@ export function scanCandidateMemory(
   memory: CandidateMemory,
   options: { forbiddenIdentifiers?: readonly string[] } = {},
 ): MemoryScanReport {
-  const source = `${memory.summary}\n${memory.terms.join(" ")}`;
+  const source = [
+    memory.summary,
+    memory.terms.join(" "),
+    memory.preconditions.join(" "),
+    memory.counterexamples.join(" "),
+  ].join("\n");
   const lower = source.toLowerCase();
   const secretMarkers = ["authorization", "bearer ", "api_key", "api-key", "access_token", "refresh_token", "password="]
     .filter((marker) => lower.includes(marker));

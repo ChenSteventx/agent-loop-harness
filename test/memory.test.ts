@@ -155,6 +155,10 @@ describe("quarantined Candidate Memory", () => {
     expect(scanCandidateMemory({ ...overfit!, summary: "Bearer token at C:\\secret\\file" }, {
       forbiddenIdentifiers: ["secret"],
     })).toMatchObject({ passed: false, overfit: true });
+    expect(scanCandidateMemory({ ...overfit!, preconditions: ["policy /home/leaky/path"] }))
+      .toMatchObject({ absolutePaths: ["/home/leaky/path"] });
+    expect(scanCandidateMemory({ ...overfit!, counterexamples: ["run with access_token inside"] }))
+      .toMatchObject({ secretMarkers: ["access_token"] });
     expect(() => store.installCandidateMemory({ ...overfit!, id: `${overfit!.id}:duplicate` }))
       .toThrow("duplicates");
     expect(store.listPendingEvolutionOutbox().find((event) => event.type === "memory-conflict"))
