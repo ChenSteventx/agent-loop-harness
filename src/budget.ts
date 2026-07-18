@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // Immutable per-run resource boundaries for content whose size the model or
 // the target repository controls. Bound into RunBinding at run creation so a
 // resume can never pick up different limits than the run started with.
@@ -43,6 +44,30 @@ export function validateRunBudget(budget: RunBudget): RunBudget {
   }
   if (budget.version !== 1) throw new Error("Unsupported Run budget version");
   return budget;
+}
+
+// Deterministically bound a JSON payload: within the limit it serializes
+// as-is; beyond it, a truncation envelope preserves identity (sha256 of the
+// full serialization) and a leading excerpt so the full artifact stays
+// traceable without entering memory-sensitive paths.
+export function boundedJson(value: unknown, maximumBytes: number): string {
+  const serialized = JSON.stringify(value);
+  if (Buffer.byteLength(serialized) <= maximumBytes) return serialized;
+  const excerpt = Buffer.from(serialized).subarray(0, Math.max(0, maximumBytes - 256)).toString();
+  return JSON.stringify({
+    truncated: true,
+    originalBytes: Buffer.byteLength(serialized),
+    sha256: createHash("sha256").update(serialized).digest("hex"),
+    excerpt,
+  });
+}
+
+export function assertPromptWithinBudget(prompt: string, maximumBytes: number | undefined, role: string): void {
+  if (maximumBytes === undefined) return;
+  const observed = Buffer.byteLength(prompt);
+  if (observed > maximumBytes) {
+    throw new BudgetExceededError("maximumPromptBytes", observed, maximumBytes, `${role} prompt`);
+  }
 }
 
 export class BudgetExceededError extends Error {

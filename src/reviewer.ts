@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { assertPromptWithinBudget } from "./budget.js";
 import type { FindingVerificationRequest } from "./ports.js";
 import type { ProviderAdapter, ProviderIdentity, ProviderRunRequest, ProviderRunResult } from "./provider.js";
 import type { TaskSpec } from "./task-spec.js";
@@ -17,15 +18,15 @@ const findingVerificationRequestSchema: z.ZodType<FindingVerificationRequest> = 
 }).strict();
 
 export const reviewerFindingOutputSchema = z.object({
-  id: z.string().trim().min(1),
+  id: z.string().trim().min(1).max(256),
   category: z.enum(findingCategories),
   severity: z.enum(findingSeverities),
-  claim: z.string().trim().min(1),
-  location: z.string().trim().min(1),
+  claim: z.string().trim().min(1).max(4000),
+  location: z.string().trim().min(1).max(1024),
   verificationRequest: findingVerificationRequestSchema.nullable(),
-  evidenceIds: z.array(z.string().trim().min(1)),
+  evidenceIds: z.array(z.string().trim().min(1).max(256)).max(50),
   confidence: z.number().min(0).max(1),
-  proposedVerification: z.string().trim().min(1),
+  proposedVerification: z.string().trim().min(1).max(2000),
   status: z.literal("proposed"),
 }).strict();
 
@@ -36,7 +37,7 @@ const reviewerIdentitySchema = z.object({
   version: z.string().nullable(),
 }).strict();
 
-export const reviewerOutputSchema = z.object({ findings: z.array(reviewerFindingOutputSchema) }).strict();
+export const reviewerOutputSchema = z.object({ findings: z.array(reviewerFindingOutputSchema).max(100) }).strict();
 
 export const findingSchema = reviewerFindingOutputSchema.extend({
   status: z.enum(findingStatuses),
@@ -101,6 +102,7 @@ export async function runReviewer(
 ): Promise<ReviewerResult> {
   validateBinding(input, snapshot());
   const renderedPrompt = renderReviewerPrompt(input);
+  assertPromptWithinBudget(renderedPrompt, request.maximumPromptBytes, "reviewer");
   const providerResult = await provider.run({
     ...request,
     prompt: renderedPrompt,

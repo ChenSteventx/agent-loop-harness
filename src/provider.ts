@@ -51,6 +51,7 @@ export interface ProviderRunRequest {
   allowedRepositoryRoots?: readonly string[];
   contextBudget?: number;
   additionalWritableDirectories?: readonly string[];
+  maximumPromptBytes?: number;
 }
 
 export interface ProviderUsage {

@@ -3,7 +3,15 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { BudgetExceededError, defaultRunBudget, type RunBudget } from "../src/budget.js";
+import {
+  assertPromptWithinBudget,
+  boundedJson,
+  BudgetExceededError,
+  defaultRunBudget,
+  type RunBudget,
+} from "../src/budget.js";
+import { explorerReportSchema } from "../src/explorer.js";
+import { authorOutputSchema } from "../src/role-output-schemas.js";
 import { GitService } from "../src/execution.js";
 
 const temporaryDirectories: string[] = [];
@@ -75,6 +83,38 @@ describe("run budget boundaries in Git artifact collection", () => {
     git(root, ["-c", "user.email=budget@example.invalid", "-c", "user.name=Budget Test",
       "commit", "-m", "grow"]);
     expect(() => service.diffBetween(baseline)).toThrow(/maximumDiffBytes/u);
+  });
+
+  it("bounds oversized JSON payloads into a traceable truncation envelope", () => {
+    const report = {
+      relevantFiles: [{ path: "src/app.ts", symbols: ["main"] }],
+      likelyAffectedTests: ["test/app.test.ts"],
+      evidence: [{ path: "src/app.ts", observation: "x".repeat(5000) }],
+      importantUnknowns: [],
+    };
+    const full = JSON.stringify(report);
+    expect(boundedJson(report, full.length + 10)).toBe(full);
+    const bounded = JSON.parse(boundedJson(report, 512)) as {
+      truncated: boolean; originalBytes: number; sha256: string; excerpt: string;
+    };
+    expect(bounded.truncated).toBe(true);
+    expect(bounded.originalBytes).toBe(Buffer.byteLength(full));
+    expect(bounded.sha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(full.startsWith(bounded.excerpt)).toBe(true);
+  });
+
+  it("rejects oversized prompts and structurally unbounded role outputs", () => {
+    expect(() => assertPromptWithinBudget("x".repeat(100), 50, "author"))
+      .toThrow(/maximumPromptBytes.*author prompt/u);
+    expect(assertPromptWithinBudget("small", 50, "author")).toBeUndefined();
+    expect(explorerReportSchema.safeParse({
+      relevantFiles: [], likelyAffectedTests: [],
+      evidence: [{ path: "a.ts", observation: "y".repeat(3000) }],
+      importantUnknowns: [],
+    }).success).toBe(false);
+    expect(authorOutputSchema.safeParse({
+      summary: "z".repeat(5000), changedFiles: ["a.ts"],
+    }).success).toBe(false);
   });
 
   it("keeps normal-sized workspaces unaffected and hash-stable", () => {

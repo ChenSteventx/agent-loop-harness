@@ -32,7 +32,7 @@ import {
   type ExplorerReport,
 } from "./explorer.js";
 import { decideNextAction, type NextAction, type ProofGapSnapshot } from "./loop.js";
-import { BudgetExceededError } from "./budget.js";
+import { BudgetExceededError, assertPromptWithinBudget, boundedJson, type RunBudget } from "./budget.js";
 import { LoopController } from "./loop-controller.js";
 import {
   acceptanceHash,
@@ -628,6 +628,7 @@ export class Orchestrator {
       cwd: binding.worktreePath,
       artifactDirectory: resolve(this.loopHome, "runs", runId, "explorer"),
       outputSchemaPath: this.roleOutputSchemas.explorer,
+      maximumPromptBytes: binding.budget.maximumPromptBytes,
     });
     const selected = supervised?.outcome?.selectedAdapterIndex === null || supervised?.outcome?.selectedAdapterIndex === undefined
       ? null
@@ -751,11 +752,15 @@ export class Orchestrator {
     }
     if (!existingOperation) this.afterWriterOperationCreated?.(role);
     const explorerReport = this.savedExplorerReport(runId);
+    const writerPrompt = role === "author"
+      ? authorPrompt(binding.taskSpec, explorerReport
+        ? compactExplorerReport(explorerReport, binding.budget.maximumExplorerAdvisoryBytes)
+        : null)
+      : repairPrompt(binding.taskSpec, attempt, git.head(), failureEvidence, binding.budget);
+    assertPromptWithinBudget(writerPrompt, binding.budget.maximumPromptBytes, role);
     const request: ProviderRunRequest = {
       invocationId: operation.id,
-      prompt: role === "author"
-        ? authorPrompt(binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport) : null)
-        : repairPrompt(binding.taskSpec, attempt, git.head(), failureEvidence),
+      prompt: writerPrompt,
       cwd: binding.worktreePath,
       artifactDirectory: this.writerArtifactDirectory(runId, role, attempt),
       outputSchemaPath: this.roleOutputSchemas.author,
@@ -1080,6 +1085,7 @@ export class Orchestrator {
       }), {
         invocationId: operation.id,
         cwd: reviewerCwd,
+        maximumPromptBytes: binding.budget.maximumPromptBytes,
         artifactDirectory: resolve(reviewDirectory, "artifacts"),
         outputSchemaPath: this.roleOutputSchemas.reviewer,
       });
@@ -1228,8 +1234,8 @@ export class Orchestrator {
         operation,
         role: operation.kind as "author" | "repair",
         renderedPrompt: operation.kind === "author"
-          ? authorPrompt(run.binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport) : null)
-          : repairPrompt(run.binding.taskSpec, input.attempt, input.baseCommit, failureEvidence),
+          ? authorPrompt(run.binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport, run.binding.budget.maximumExplorerAdvisoryBytes) : null)
+          : repairPrompt(run.binding.taskSpec, input.attempt, input.baseCommit, failureEvidence, run.binding.budget),
         outputSchemaPath: this.roleOutputSchemas.author,
         actualProvider: completion.result.identity,
         configuredProvider: completion.configuredAuthor ?? null,
@@ -2500,14 +2506,20 @@ function repairPrompt(
   attempt: number,
   currentCommit: string,
   failureEvidence: readonly Evidence[],
+  budget: RunBudget,
 ): string {
+  // Evidence payloads are machine-observed but content-untrusted (the failing
+  // program controls them); each is excerpt-bounded with a hash reference to
+  // the full stored evidence instead of inlined without limit.
+  const boundedEvidence = failureEvidence.map((item) =>
+    `{"id":${JSON.stringify(item.id)},"kind":${JSON.stringify(item.kind)},"data":${boundedJson(item.data, budget.maximumEvidenceExcerptBytes)}}`);
   return [
     `Role: bounded Repair attempt ${attempt}.`,
     `Task: ${task.id}`,
     `Goal: ${task.goal}`,
     `Acceptance: ${JSON.stringify(task.acceptance)}`,
     `Current candidate commit: ${currentCommit}`,
-    `Deterministic proof-gap evidence: ${JSON.stringify(failureEvidence.map((item) => ({ id: item.id, kind: item.kind, data: item.data })))}`,
+    `Deterministic proof-gap evidence: [${boundedEvidence.join(",")}]`,
     "Fix only the demonstrated failure within the task scope.",
     "Edit files only; do not run git add, git commit, or change Git metadata.",
     "Leave a non-empty working diff for the Harness to inspect and commit deterministically.",

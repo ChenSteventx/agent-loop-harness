@@ -3,8 +3,8 @@ import { dirname, resolve } from "node:path";
 import { z } from "zod";
 
 export const authorOutputSchema = z.object({
-  summary: z.string().trim().min(1),
-  changedFiles: z.array(z.string().trim().min(1)),
+  summary: z.string().trim().min(1).max(4000),
+  changedFiles: z.array(z.string().trim().min(1).max(1024)).max(500),
 }).strict();
 
 export type AuthorOutput = z.infer<typeof authorOutputSchema>;

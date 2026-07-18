@@ -5,6 +5,7 @@ import type { VerificationCommand } from "./ports.js";
 import type { ProviderAdapter } from "./provider.js";
 import { authorOutputSchema, defaultRoleOutputSchemas } from "./role-output-schemas.js";
 import type { TaskSpec } from "./task-spec.js";
+import { assertPromptWithinBudget } from "./budget.js";
 import { authorPrompt } from "./roles.js";
 import { WriterExecutor, writerBoundaryViolation } from "./writer-executor.js";
 import { safeEnvironment, type FullTaskExecutor } from "./evaluation/evaluators.js";
@@ -28,6 +29,8 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
     const baseCommit = git.head();
     const controlHash = git.controlStateHash();
     const diagnostics: string[] = [];
+    const evaluationPrompt = authorPrompt(input.binding.taskSpec, null);
+    assertPromptWithinBudget(evaluationPrompt, input.binding.budget.maximumPromptBytes, "evaluation-author");
     const attempts = Math.min(Math.max(configuration.retryLimit, 0), 3) + 1;
     let providerOk = false;
     let finalOutput: unknown = null;
@@ -35,7 +38,8 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
       const execution = await new WriterExecutor().execute({
         request: {
           invocationId: `${input.facts.run.id}:evaluation-author:${attempt}`,
-          prompt: authorPrompt(input.binding.taskSpec, null),
+          prompt: evaluationPrompt,
+          maximumPromptBytes: input.binding.budget.maximumPromptBytes,
           cwd: input.worktreePath,
           artifactDirectory: resolve(input.artifactDirectory, `author-attempt-${attempt}`),
           outputSchemaPath: defaultRoleOutputSchemas().author,
