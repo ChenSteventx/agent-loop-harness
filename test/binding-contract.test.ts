@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRunBinding } from "../src/bindings.js";
+import { defaultRunBudget, validateRunBudget, BudgetExceededError } from "../src/budget.js";
 import type { RunBinding } from "../src/domain.js";
 import { GenericNodeProjectAdapter } from "../src/project.js";
 import type { TaskSpec } from "../src/task-spec.js";
@@ -25,6 +26,7 @@ const expectedBindingKeys = [
   "taskSpecHash",
   "acceptanceHash",
   "baselineCommit",
+  "budget",
   "sourceRepository",
   "worktreePath",
   "risk",
@@ -71,6 +73,18 @@ describe("RunBinding construction contract", () => {
       configSource: "default",
       configurationVariantId: null,
       runtimeConfiguration: null,
+      budget: defaultRunBudget(),
     });
+  });
+
+  it("validates budget boundaries and rejects non-positive limits", () => {
+    expect(validateRunBudget(defaultRunBudget())).toEqual(defaultRunBudget());
+    expect(() => validateRunBudget({ ...defaultRunBudget(), maximumDiffBytes: 0 }))
+      .toThrow("must be a positive integer");
+    expect(() => validateRunBudget({ ...defaultRunBudget(), maximumUntrackedFiles: -1 }))
+      .toThrow("must be a positive integer");
+    const error = new BudgetExceededError("maximumDiffBytes", 10, 5, "tracked diff");
+    expect(error.message).toContain("maximumDiffBytes");
+    expect(error.name).toBe("BudgetExceededError");
   });
 });

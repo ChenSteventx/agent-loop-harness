@@ -48,6 +48,7 @@ export interface RunBinding {
   canaryAssignmentId: string | null;
   configSource: import("./runtime-config.js").ConfigSource;
   runtimeConfiguration: import("./evolution/proposals.js").EvolutionConfiguration | null;
+  budget: import("./budget.js").RunBudget;
 }
 
 export type OperationStatus = "running" | "succeeded" | "failed";

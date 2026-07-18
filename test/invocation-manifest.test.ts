@@ -9,6 +9,7 @@ import {
   manifestContainsSensitiveMaterial,
 } from "../src/evaluation/manifests.js";
 import { SqliteStore } from "../src/store.js";
+import { defaultRunBudget } from "../src/budget.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -33,7 +34,7 @@ const binding: RunBinding = {
   projectAdapterName: "generic-node",
   policyVersion: "generic-node/v2",
   configurationVariantId: null, configurationHash: null, canaryAssignmentId: null,
-  configSource: "default", runtimeConfiguration: null,
+  configSource: "default", runtimeConfiguration: null, budget: defaultRunBudget(),
 };
 
 function manifest() {

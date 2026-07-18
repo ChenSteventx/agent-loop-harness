@@ -18,6 +18,7 @@ import { HistoricalReplay } from "../src/evaluation/replay.js";
 import { EvaluationStore } from "../src/evaluation/store.js";
 import { createInitialChampion } from "../src/evolution/proposals.js";
 import { SqliteStore } from "../src/store.js";
+import { defaultRunBudget } from "../src/budget.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -42,7 +43,7 @@ const binding: RunBinding = {
   projectAdapterName: "generic-node",
   policyVersion: "generic-node/v2",
   configurationVariantId: null, configurationHash: null, canaryAssignmentId: null,
-  configSource: "default", runtimeConfiguration: null,
+  configSource: "default", runtimeConfiguration: null, budget: defaultRunBudget(),
 };
 binding.taskSpecHash = taskSpecHash(binding.taskSpec);
 binding.acceptanceHash = acceptanceHash(binding.taskSpec.acceptance);
