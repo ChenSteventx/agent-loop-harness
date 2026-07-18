@@ -130,6 +130,11 @@ export async function compareVariants(
         .includes(input.proposal.target)) {
     throw new Error(`Verify-only evaluator cannot evaluate ${input.proposal.target}`);
   }
+  if (input.evaluatorKind === "full-task-replay" && input.proposal.evaluationPlan.primaryMetric === "doneRate") {
+    // Evaluation runs never merge, so done is unmeasured for both variants;
+    // a zero-versus-zero doneRate must not read as evidence.
+    throw new Error("Full-task replay cannot measure doneRate as the primary metric");
+  }
   const championResults: TaskEvaluationResult[] = [];
   const challengerResults: TaskEvaluationResult[] = [];
   for (const dataset of input.datasets) {
@@ -338,6 +343,14 @@ function validateComparisonBindings(input: {
   if (input.datasets.length === 0 || input.datasets.some((dataset) =>
     !input.proposal.evaluationPlan.datasetIds.includes(dataset.id) && dataset.kind !== "holdout")) {
     throw new Error("Offline Comparison Dataset is outside the Evaluation Plan");
+  }
+  // The plan freezes dataset content by hash at proposal time; a same-id
+  // dataset with different content must not reach the evaluators.
+  for (const dataset of input.datasets) {
+    const planned = input.proposal.evaluationPlan.datasetIds.indexOf(dataset.id);
+    if (planned >= 0 && input.proposal.evaluationPlan.datasetHashes[planned] !== dataset.contentHash) {
+      throw new Error(`Offline Comparison Dataset ${dataset.id} does not match the Evaluation Plan hash`);
+    }
   }
 }
 

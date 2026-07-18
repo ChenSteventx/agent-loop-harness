@@ -275,6 +275,9 @@ compare
       const catalog = DatasetCatalog.loadDirectory(resolve(options.datasetDir));
       const datasets = proposalValue.evaluationPlan.datasetIds.map((id) => catalog.get(id, "comparison"));
       const executor = createEvaluationFullTaskExecutor();
+      // Task ids are only unique within a dataset; an ordinal keeps every
+      // (variant, task) evaluation id distinct across datasets.
+      const taskOrdinals = new Map<string, number>();
       const evaluate: VariantEvaluator = async (variant, task) => {
         if (!task.sourceRunId || !task.sourceFactHash) {
           throw new Error(`Dataset task lacks source pointers and cannot be replayed: ${task.id}`);
@@ -291,8 +294,11 @@ compare
           executor,
           resolve(home, "evaluation"),
         );
+        const ordinalKey = `${variant.id}:${task.id}`;
+        const ordinal = (taskOrdinals.get(ordinalKey) ?? 0) + 1;
+        taskOrdinals.set(ordinalKey, ordinal);
         const run = await evaluator.evaluate({
-          id: `${options.id}:${variant.id}:${task.id}`,
+          id: `${options.id}:${variant.id}:${task.id}:${ordinal}`,
           facts,
           binding: sourceRun.binding,
           configurationVariant: variant,

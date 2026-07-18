@@ -211,6 +211,26 @@ describe("offline comparison and non-authoritative Shadow", () => {
     // wired), so exercise the compare-layer gate on a hand-built proposal: the
     // "memory-retrieval-proposal" defence must hold even if the factory gate
     // is bypassed.
+    const swappedDatasets = catalog.list("comparison").map((dataset) =>
+      dataset.kind === "holdout" ? dataset : { ...dataset, contentHash: "swapped-content-hash" });
+    await expect(compareVariants(evaluation, {
+      id: "hash-mismatch-comparison", proposal: approved, champion, challenger,
+      datasets: swappedDatasets, evaluatorKind: "full-task-replay", evaluatorVersion: "full-task-replay/v1",
+      evaluate: async () => ({
+        passed: true, ready: true, done: false, verificationFailures: 0, latencyMs: 1, resultHash: "unused",
+      }),
+    })).rejects.toThrow("does not match the Evaluation Plan hash");
+    const doneRateProposal = {
+      ...approved,
+      evaluationPlan: { ...approved.evaluationPlan, primaryMetric: "doneRate" as const },
+    };
+    await expect(compareVariants(evaluation, {
+      id: "done-rate-comparison", proposal: doneRateProposal, champion, challenger,
+      datasets: catalog.list("comparison"), evaluatorKind: "full-task-replay", evaluatorVersion: "full-task-replay/v1",
+      evaluate: async () => ({
+        passed: true, ready: true, done: false, verificationFailures: 0, latencyMs: 1, resultHash: "unused",
+      }),
+    })).rejects.toThrow("cannot measure doneRate");
     const memoryProposal = { ...approved, target: "memory-retrieval" as const };
     await expect(compareVariants(evaluation, {
       id: "forbidden-memory-comparison", proposal: memoryProposal, champion, challenger,
