@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
+import { operationInputHash } from "./bindings.js";
 import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { Risk } from "./routing.js";
 import type { TaskSpec } from "./task-spec.js";
@@ -12,8 +13,9 @@ const declarativeProjectConfigSchema = z.object({
   name: z.string().trim().min(1).max(128),
   policyVersion: z.string().trim().min(1).max(128),
   // Substring/segment patterns whose presence in the task scope or changed
-  // files raises the minimum risk to high.
-  sensitivePathSegments: z.array(z.string().trim().min(1).max(256)).max(200).default([]),
+  // files raises the minimum risk to high. Required: "nothing is sensitive"
+  // must be an explicit [] in the config, never an accidental omission.
+  sensitivePathSegments: z.array(z.string().trim().min(1).max(256)).max(200),
   // Rewrite a leading "node" argv entry to the current Node executable —
   // what the built-in generic-node adapter does. Off for non-Node projects.
   rewriteNodeCommands: z.boolean().default(false),
@@ -42,7 +44,12 @@ export class DeclarativeProjectAdapter implements ProjectAdapter {
 
   constructor(private readonly config: DeclarativeProjectConfig) {
     this.name = config.name;
-    this.policyVersion = config.policyVersion;
+    // The effective policy version is content-addressed: the run binding
+    // freezes it, and the resume-time drift gate compares it against the
+    // live adapter — so editing the config file between attempts (same
+    // declared version, different segments) blocks the run instead of
+    // silently reclassifying risk.
+    this.policyVersion = `${config.policyVersion}#${operationInputHash(config).slice(0, 12)}`;
   }
 
   minimumRisk(input: { task: TaskSpec; changedFiles?: readonly string[] }): Risk {
@@ -59,13 +66,19 @@ export class DeclarativeProjectAdapter implements ProjectAdapter {
   }
 
   private isSensitive(path: string): boolean {
-    const normalized = path.replace(/\\/gu, "/").toLowerCase();
+    const normalized = canonicalPathText(path);
     return this.config.sensitivePathSegments.some((segment) =>
-      normalized.includes(segment.replace(/\\/gu, "/").toLowerCase()));
+      normalized.includes(canonicalPathText(segment)));
   }
 
   private normalize(command: VerificationCommand): VerificationCommand {
     if (!this.config.rewriteNodeCommands || command.argv[0] !== "node") return command;
     return { ...command, argv: [process.execPath, ...command.argv.slice(1)] };
   }
+}
+
+// Unicode-normalized (NFC) so an NFD path from Git matches an NFC-typed
+// config segment; separator and case folding as in the generic adapter.
+function canonicalPathText(text: string): string {
+  return text.normalize("NFC").replace(/\\/gu, "/").toLowerCase();
 }

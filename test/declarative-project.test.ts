@@ -45,7 +45,8 @@ describe("declarative project entry", () => {
     }));
     const adapter = new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(path));
     expect(adapter.name).toBe("python-service");
-    expect(adapter.policyVersion).toBe("python-service/v1");
+    // Content-addressed: declared version plus a hash of the whole config.
+    expect(adapter.policyVersion).toMatch(/^python-service\/v1#[0-9a-f]{12}$/u);
     expect(adapter.minimumRisk({ task: { ...task, scope: ["src/payments/charge.py"] } })).toBe("high");
     expect(adapter.minimumRisk({ task: { ...task, scope: ["src/reports/render.py"] } })).toBe("low");
     // rewriteNodeCommands=false: argv passes through untouched for non-Node stacks.
@@ -62,13 +63,39 @@ describe("declarative project entry", () => {
     expect(argv[1]).toBe(process.execPath);
   });
 
+  it("binds the policy version to the config content, not just the declared string", () => {
+    const base = { name: "svc", policyVersion: "svc/v1", rewriteNodeCommands: false };
+    const strict = new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(
+      configFile(JSON.stringify({ ...base, sensitivePathSegments: ["deploy/"] }))));
+    const loosened = new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(
+      configFile(JSON.stringify({ ...base, sensitivePathSegments: [] }))));
+    const identical = new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(
+      configFile(JSON.stringify({ ...base, sensitivePathSegments: ["deploy/"] }))));
+    // Same declared version with weakened segments must not look like the
+    // same policy to the resume-time drift gate; identical content must.
+    expect(loosened.policyVersion).not.toBe(strict.policyVersion);
+    expect(identical.policyVersion).toBe(strict.policyVersion);
+  });
+
+  it("matches sensitive segments across Unicode normalization forms", () => {
+    const adapter = new DeclarativeProjectAdapter({
+      name: "svc", policyVersion: "svc/v1",
+      sensitivePathSegments: ["s\u00e9curit\u00e9/"], rewriteNodeCommands: false,
+    });
+    // Git often emits NFD; the config author typically types NFC.
+    expect(adapter.minimumRisk({ task: { ...task, scope: ["src/se\u0301curite\u0301/keys.py"] } })).toBe("high");
+  });
+
   it("fails closed on malformed, invalid, or over-permissive configs", () => {
     expect(() => loadDeclarativeProjectConfig(configFile("{not json")))
       .toThrow("unreadable or not JSON");
     expect(() => loadDeclarativeProjectConfig(configFile(JSON.stringify({ name: " ", policyVersion: "v1" }))))
       .toThrow("Project config is invalid");
+    // Omitting sensitivePathSegments is invalid — "nothing sensitive" must be an explicit [].
+    expect(() => loadDeclarativeProjectConfig(configFile(JSON.stringify({ name: "x", policyVersion: "v1" }))))
+      .toThrow("sensitivePathSegments");
     expect(() => loadDeclarativeProjectConfig(configFile(JSON.stringify({
-      name: "x", policyVersion: "v1", gitAuthority: "mine",
+      name: "x", policyVersion: "v1", sensitivePathSegments: [], gitAuthority: "mine",
     })))).toThrow("Project config is invalid");
   });
 });

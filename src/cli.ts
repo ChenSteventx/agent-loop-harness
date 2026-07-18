@@ -849,10 +849,19 @@ function createEvaluationFullTaskExecutor(): ReturnType<typeof createFullTaskExe
   });
 }
 
+// Resolved once per process: the orchestrator and the evaluation executor
+// must observe the same adapter instance — two reads of the config file
+// could disagree if it changes between constructions.
+let resolvedProjectAdapter: ProjectAdapter | undefined;
+
 function resolveProjectAdapter(): ProjectAdapter {
-  const configPath = program.opts<{ projectConfig?: string }>().projectConfig;
-  if (!configPath) return new GenericNodeProjectAdapter();
-  return new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(resolve(configPath)));
+  if (!resolvedProjectAdapter) {
+    const configPath = program.opts<{ projectConfig?: string }>().projectConfig;
+    resolvedProjectAdapter = configPath
+      ? new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(resolve(configPath)))
+      : new GenericNodeProjectAdapter();
+  }
+  return resolvedProjectAdapter;
 }
 
 function createOrchestrator(loopHome: string): Orchestrator {

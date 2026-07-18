@@ -73,7 +73,11 @@ npm run loop -- --project-config project.json run --task ... --repository ...
 Verification commands come from the task file, so any stack that can
 express its checks as argv commands works. The config cannot grant what
 the adapter port does not allow: no Git metadata authority, no verdicts,
-no promotion rights.
+no promotion rights. `sensitivePathSegments` is required — declaring
+"nothing is sensitive" takes an explicit `[]`. The validated config
+content is hashed into the effective policy version and frozen into the
+run binding, so editing the config between attempts blocks the run
+instead of silently reclassifying risk.
 
 ## Status
 

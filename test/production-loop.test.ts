@@ -391,8 +391,10 @@ describe("production CLI loop", () => {
     }) as { run: { status: string; binding: { projectAdapterName: string; policyVersion: string } } };
     expect(started.run).toMatchObject({
       status: "ready",
-      binding: { projectAdapterName: "shell-project", policyVersion: "shell-project/v1" },
+      binding: { projectAdapterName: "shell-project" },
     });
+    // Declared version + config-content hash, frozen into the binding.
+    expect(started.run.binding.policyVersion).toMatch(/^shell-project\/v1#[0-9a-f]{12}$/u);
   }, 180_000);
 
   it("fails closed when Canary is enabled without evaluation state", () => {
