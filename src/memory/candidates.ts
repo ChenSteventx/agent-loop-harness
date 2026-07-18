@@ -29,6 +29,9 @@ export interface CandidateMemory {
   sourceCommits: string[];
   evidenceRefs: string[];
   supportCount: number;
+  failureSignature: string[];
+  rootCause: string;
+  usefulTests: string[];
   status: CandidateMemoryStatus;
   createdAt: string;
   expiresAt: string;
@@ -73,27 +76,66 @@ export function deriveCandidateMemories(
 ): CandidateMemory[] {
   const now = options.now ?? new Date().toISOString();
   const expiresAt = addDays(now, options.ttlDays ?? 90);
+  const real = facts.filter((item) => item.source === "real" && item.run.binding);
   const groups = new Map<string, MemoryGroup>();
-  for (const fact of facts.filter((item) => item.source === "real" && item.run.binding)) {
-    const projectScope = fact.run.binding!.projectAdapterName;
+  for (const fact of real) {
+    const binding = fact.run.binding!;
     const failures = fact.evidence.filter((item) => item.kind === "verification_failure");
-    if (failures.length > 0) {
-      addGroup(groups, projectScope, "failure-pattern",
-        `Failure signature in ${projectScope}; affected area is the bound project; useful tests are the recorded verification steps; root cause requires evidence`,
-        fact, failures.map((item) => item.id));
-    }
+    const signature = [...new Set(failures.map((item) => item.stepId).filter(Boolean))].sort();
+    if (signature.length === 0) continue;
+    // Root cause stays "unknown" unless a machine- or human-confirmed reviewer
+    // finding backs it; the model never fills this in.
+    const confirmedCauses = fact.reviewerFindings
+      .filter((finding) => finding.outcome === "confirmed" && finding.authority !== "none")
+      .map((finding) => finding.category);
+    addGroup(groups, {
+      projectScope: binding.projectAdapterName,
+      kind: "failure-pattern",
+      operationType: "verification",
+      signature,
+      policyVersion: binding.policyVersion,
+      confirmedCauses,
+    }, fact, failures.map((item) => item.id));
   }
-  return [...groups.values()].map((group) => candidate({
-    projectScope: group.projectScope,
-    kind: group.kind,
-    summary: group.summary,
-    sourceFactHashes: [...group.facts].sort(),
-    sourceRunIds: [...group.runs].sort(),
-    sourceCommits: [...group.commits].sort(),
-    evidenceRefs: [...group.evidence].sort(),
-    now,
-    expiresAt,
-  })).sort((left, right) => left.id.localeCompare(right.id));
+  for (const group of groups.values()) {
+    group.counterexamples = real
+      .filter((fact) => fact.run.binding!.projectAdapterName === group.projectScope &&
+        ["ready", "merged", "done"].includes(fact.run.status) &&
+        group.signature.some((step) => fact.run.binding!.verificationStepIds.includes(step)) &&
+        !fact.evidence.some((item) => item.kind === "verification_failure" &&
+          group.signature.includes(item.stepId)))
+      .map((fact) => `run ${fact.run.id} passed matching verification steps`)
+      .sort()
+      .slice(0, 5);
+  }
+  return [...groups.values()].map((group) => {
+    const rootCause = group.confirmedCauses.size > 0
+      ? `confirmed(${[...group.confirmedCauses].sort().join(", ")})`
+      : "unknown";
+    return candidate({
+      projectScope: group.projectScope,
+      kind: group.kind,
+      operationType: group.operationType,
+      summary: `Verification failure signature [${group.signature.join(", ")}] in ${group.projectScope}; ` +
+        `root cause: ${rootCause}; useful tests: ${group.signature.join(", ")}`,
+      failureSignature: group.signature,
+      rootCause,
+      usefulTests: group.signature,
+      preconditions: [
+        `project ${group.projectScope}`,
+        `operation ${group.operationType}`,
+        `verification steps ${group.signature.join(", ")}`,
+        ...[...group.policyVersions].sort().map((version) => `policy ${version}`),
+      ],
+      counterexamples: group.counterexamples,
+      sourceFactHashes: [...group.facts].sort(),
+      sourceRunIds: [...group.runs].sort(),
+      sourceCommits: [...group.commits].sort(),
+      evidenceRefs: [...group.evidence].sort(),
+      now,
+      expiresAt,
+    });
+  }).sort((left, right) => left.id.localeCompare(right.id));
 }
 
 export function scanCandidateMemory(
@@ -204,7 +246,13 @@ export function retrieveApprovedMemory(
 function candidate(input: {
   projectScope: string;
   kind: CandidateMemoryKind;
+  operationType: string;
   summary: string;
+  failureSignature: string[];
+  rootCause: string;
+  usefulTests: string[];
+  preconditions: string[];
+  counterexamples: string[];
   sourceFactHashes: string[];
   sourceRunIds: string[];
   sourceCommits: string[];
@@ -216,9 +264,10 @@ function candidate(input: {
   const contentHash = operationInputHash({
     projectScope: input.projectScope,
     repositoryScope: input.projectScope,
-    operationType: "verification",
+    operationType: input.operationType,
     kind: input.kind,
     summary: input.summary,
+    failureSignature: input.failureSignature,
     terms,
   });
   return {
@@ -226,7 +275,7 @@ function candidate(input: {
     id: `memory:${input.projectScope}:${input.kind}:${contentHash.slice(0, 16)}`,
     projectScope: input.projectScope,
     repositoryScope: input.projectScope,
-    operationType: "verification",
+    operationType: input.operationType,
     kind: input.kind,
     summary: input.summary,
     terms,
@@ -236,13 +285,16 @@ function candidate(input: {
     sourceCommits: input.sourceCommits,
     evidenceRefs: input.evidenceRefs,
     supportCount: input.sourceRunIds.length,
+    failureSignature: input.failureSignature,
+    rootCause: input.rootCause,
+    usefulTests: input.usefulTests,
     status: "candidate",
     createdAt: input.now,
     expiresAt: input.expiresAt,
     validatedAt: null,
     invalidationReason: null,
-    preconditions: ["same repository scope", "matching operation type", "current evidence remains valid"],
-    counterexamples: [],
+    preconditions: input.preconditions,
+    counterexamples: input.counterexamples,
     decision: null,
   };
 }
@@ -250,7 +302,11 @@ function candidate(input: {
 interface MemoryGroup {
   projectScope: string;
   kind: CandidateMemoryKind;
-  summary: string;
+  operationType: string;
+  signature: string[];
+  policyVersions: Set<string>;
+  confirmedCauses: Set<string>;
+  counterexamples: string[];
   facts: Set<string>;
   runs: Set<string>;
   commits: Set<string>;
@@ -259,17 +315,27 @@ interface MemoryGroup {
 
 function addGroup(
   groups: Map<string, MemoryGroup>,
-  projectScope: string,
-  kind: CandidateMemoryKind,
-  summary: string,
+  shape: {
+    projectScope: string;
+    kind: CandidateMemoryKind;
+    operationType: string;
+    signature: string[];
+    policyVersion: string;
+    confirmedCauses: readonly string[];
+  },
   fact: SanitizedFactBundle,
   evidenceRefs: readonly string[],
 ): void {
-  const key = operationInputHash({ projectScope, kind, summary });
+  const { projectScope, kind, operationType, signature } = shape;
+  const key = operationInputHash({ projectScope, kind, operationType, signature });
   const group = groups.get(key) ?? {
-    projectScope, kind, summary, facts: new Set<string>(), runs: new Set<string>(),
+    projectScope, kind, operationType, signature,
+    policyVersions: new Set<string>(), confirmedCauses: new Set<string>(), counterexamples: [],
+    facts: new Set<string>(), runs: new Set<string>(),
     commits: new Set<string>(), evidence: new Set<string>(),
   };
+  group.policyVersions.add(shape.policyVersion);
+  for (const cause of shape.confirmedCauses) group.confirmedCauses.add(cause);
   group.facts.add(fact.factHash);
   group.runs.add(fact.run.id);
   for (const commit of fact.evidence.map((item) => item.commitSha).filter(Boolean)) group.commits.add(commit);

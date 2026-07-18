@@ -164,4 +164,44 @@ describe("quarantined Candidate Memory", () => {
     ]);
     store.close();
   });
+
+  it("derives repository-scoped failure-signature experience instead of platform boilerplate", () => {
+    const failing = [facts("run-1", "fact-1"), facts("run-2", "fact-2")];
+    const passing: SanitizedFactBundle = {
+      ...facts("run-pass", "fact-pass"),
+      evidence: [],
+    };
+    const [candidate] = deriveCandidateMemories([...failing, passing], { now: "2026-07-18T00:00:00.000Z" });
+    expect(candidate).toMatchObject({
+      kind: "failure-pattern",
+      operationType: "verification",
+      failureSignature: ["test"],
+      rootCause: "unknown",
+      usefulTests: ["test"],
+      supportCount: 2,
+    });
+    expect(candidate!.summary).toContain("failure signature [test]");
+    expect(candidate!.summary).toContain("root cause: unknown");
+    expect(candidate!.preconditions).toEqual(expect.arrayContaining([
+      "project generic-node",
+      "verification steps test",
+      "policy generic-node/v2",
+    ]));
+    expect(candidate!.counterexamples).toEqual(["run run-pass passed matching verification steps"]);
+    expect(candidate!.sourceRunIds).toEqual(["run-1", "run-2"]);
+    expect(candidate!.sourceCommits).toEqual(["commit-run-1", "commit-run-2"]);
+
+    const confirmed = deriveCandidateMemories([
+      {
+        ...facts("run-3", "fact-3"),
+        reviewerFindings: [{
+          id: "finding-1", category: "missing-null-check", severity: "high",
+          outcome: "confirmed", authority: "machine",
+        }],
+      },
+      facts("run-4", "fact-4"),
+    ], { now: "2026-07-18T00:00:00.000Z" });
+    expect(confirmed[0]).toMatchObject({ rootCause: "confirmed(missing-null-check)" });
+    expect(confirmed[0]!.summary).toContain("root cause: confirmed(missing-null-check)");
+  });
 });
