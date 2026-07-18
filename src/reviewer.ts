@@ -10,11 +10,11 @@ export const findingSeverities = ["low", "medium", "high", "critical"] as const;
 export const findingStatuses = ["proposed", "confirmed", "rejected", "fixed"] as const;
 
 const findingVerificationRequestSchema: z.ZodType<FindingVerificationRequest> = z.object({
-  verificationStepId: z.string().trim().min(1).optional(),
-  proposedArgv: z.tuple([z.string().trim().min(1)]).rest(z.string()).optional(),
+  verificationStepId: z.string().trim().min(1).max(256).optional(),
+  proposedArgv: z.tuple([z.string().trim().min(1).max(1024)]).rest(z.string().max(1024)).optional(),
   expectedExitCode: z.number().int().optional(),
-  stdoutIncludes: z.string().min(1).optional(),
-  stderrIncludes: z.string().min(1).optional(),
+  stdoutIncludes: z.string().min(1).max(2000).optional(),
+  stderrIncludes: z.string().min(1).max(2000).optional(),
 }).strict();
 
 export const reviewerFindingOutputSchema = z.object({

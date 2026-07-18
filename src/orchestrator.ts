@@ -310,7 +310,15 @@ export class Orchestrator {
       return this.status(runId);
     }
     if (run.status === "ready") {
-      if (this.nextAction(runId).kind === "advance-ready") return this.status(runId);
+      try {
+        if (this.nextAction(runId).kind === "advance-ready") return this.status(runId);
+      } catch (error) {
+        if (error instanceof BudgetExceededError) {
+          this.block(runId, error.message, "budget-exceeded");
+          return this.status(runId);
+        }
+        throw error;
+      }
       this.store.reopenRunForInvalidEvidence(runId);
     }
     return this.runUntilStable(runId);
@@ -320,7 +328,20 @@ export class Orchestrator {
     return new LoopController<RunView>(this.maxLoopSteps).run({
       isActive: () => this.store.getRun(runId)?.status === "open",
       status: () => this.status(runId),
-      nextAction: () => this.nextAction(runId),
+      // Snapshot construction reads workspace diffs, so budget hits can
+      // surface during action SELECTION as well as execution; both must
+      // resolve to a blocked run rather than a crashed entry point.
+      nextAction: () => {
+        try {
+          return this.nextAction(runId);
+        } catch (error) {
+          if (error instanceof BudgetExceededError) {
+            this.block(runId, error.message, "budget-exceeded");
+            return { kind: "block", reason: error.message };
+          }
+          throw error;
+        }
+      },
       recordAction: (step, action) => this.store.appendEvent(runId, "loop.action", { step, action }),
       execute: (action) => this.executeLoopAction(runId, action),
       exhausted: () => {

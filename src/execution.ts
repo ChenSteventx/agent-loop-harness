@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { BudgetExceededError, defaultRunBudget, type RunBudget } from "./budget.js";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
@@ -56,18 +56,31 @@ export class GitService {
     this.assertWithinBudget("maximumUntrackedFiles", paths.length, "untracked file count");
     // Sizes are checked before any content is read so an oversized workspace
     // fails closed instead of being loaded into memory and base64-amplified.
+    // lstat (not stat) so a symlink to an unbounded target cannot masquerade
+    // as a small file, and only regular files are snapshotted: a FIFO or
+    // device would block or stream without limit in a synchronous read.
     let untrackedTotal = 0;
     for (const path of paths) {
       const absolute = resolve(this.root, path);
-      const size = existsSync(absolute) ? statSync(absolute).size : 0;
+      const stats = existsSync(absolute) ? lstatSync(absolute) : null;
+      if (stats && !stats.isFile()) {
+        throw new BudgetExceededError("maximumUntrackedFileBytes", Number.MAX_SAFE_INTEGER,
+          this.budget.maximumUntrackedFileBytes, `untracked special file (not a regular file) ${path}`);
+      }
+      const size = stats?.size ?? 0;
       this.assertWithinBudget("maximumUntrackedFileBytes", size, `untracked file ${path}`);
       untrackedTotal += size;
       this.assertWithinBudget("maximumUntrackedTotalBytes", untrackedTotal, "untracked files total");
     }
+    let readTotal = 0;
     const untracked = paths
       .map((path) => {
         const absolute = resolve(this.root, path);
         const content = existsSync(absolute) ? readFileSync(absolute) : Buffer.alloc(0);
+        // Re-checked after the read: a file can grow between stat and read.
+        this.assertWithinBudget("maximumUntrackedFileBytes", content.length, `untracked file ${path}`);
+        readTotal += content.length;
+        this.assertWithinBudget("maximumUntrackedTotalBytes", readTotal, "untracked files total");
         return `\nUNTRACKED ${path}\n${content.toString("base64")}\n`;
       })
       .join("");

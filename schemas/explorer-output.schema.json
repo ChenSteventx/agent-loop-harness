@@ -4,33 +4,82 @@
   "title": "ExplorerOutput",
   "type": "object",
   "additionalProperties": false,
-  "required": ["relevantFiles", "likelyAffectedTests", "evidence", "importantUnknowns"],
+  "required": [
+    "relevantFiles",
+    "likelyAffectedTests",
+    "evidence",
+    "importantUnknowns"
+  ],
   "properties": {
     "relevantFiles": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["path", "symbols"],
+        "required": [
+          "path",
+          "symbols"
+        ],
         "properties": {
-          "path": { "type": "string", "minLength": 1 },
-          "symbols": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "symbols": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300
+            },
+            "maxItems": 100
+          }
         }
-      }
+      },
+      "maxItems": 200
     },
-    "likelyAffectedTests": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "likelyAffectedTests": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1024
+      },
+      "maxItems": 200
+    },
     "evidence": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["path", "observation"],
+        "required": [
+          "path",
+          "observation"
+        ],
         "properties": {
-          "path": { "type": "string", "minLength": 1 },
-          "observation": { "type": "string", "minLength": 1 }
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "observation": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
         }
-      }
+      },
+      "maxItems": 200
     },
-    "importantUnknowns": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+    "importantUnknowns": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000
+      },
+      "maxItems": 100
+    }
   }
 }

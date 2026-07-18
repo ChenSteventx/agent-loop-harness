@@ -53,13 +53,24 @@ export function validateRunBudget(budget: RunBudget): RunBudget {
 export function boundedJson(value: unknown, maximumBytes: number): string {
   const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized) <= maximumBytes) return serialized;
-  const excerpt = Buffer.from(serialized).subarray(0, Math.max(0, maximumBytes - 256)).toString();
-  return JSON.stringify({
-    truncated: true,
+  const identity = {
+    truncated: true as const,
     originalBytes: Buffer.byteLength(serialized),
     sha256: createHash("sha256").update(serialized).digest("hex"),
-    excerpt,
-  });
+  };
+  // The excerpt shrinks until the whole envelope fits: JSON escaping can
+  // inflate the excerpt well beyond its character count, so the envelope is
+  // measured after serialization, not estimated. Slicing by characters keeps
+  // the excerpt an exact prefix of the serialized payload.
+  let excerptLength = Math.min(serialized.length, maximumBytes);
+  while (excerptLength > 0) {
+    const envelope = JSON.stringify({ ...identity, excerpt: serialized.slice(0, excerptLength) });
+    if (Buffer.byteLength(envelope) <= maximumBytes) return envelope;
+    excerptLength = Math.floor(excerptLength / 2);
+  }
+  // Floor: even an empty excerpt cannot fit under a tiny limit; the bare
+  // envelope (~200 bytes) is the minimum honest representation.
+  return JSON.stringify({ ...identity, excerpt: "" });
 }
 
 export function assertPromptWithinBudget(prompt: string, maximumBytes: number | undefined, role: string): void {

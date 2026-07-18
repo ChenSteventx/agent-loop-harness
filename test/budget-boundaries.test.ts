@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -83,6 +83,46 @@ describe("run budget boundaries in Git artifact collection", () => {
     git(root, ["-c", "user.email=budget@example.invalid", "-c", "user.name=Budget Test",
       "commit", "-m", "grow"]);
     expect(() => service.diffBetween(baseline)).toThrow(/maximumDiffBytes/u);
+  });
+
+  it("refuses untracked symlinks instead of following them", () => {
+    // git ls-files --others lists symlinks (they are versionable); the old
+    // stat-based check followed them, so a link to an unbounded target (for
+    // example /dev/zero) reported a harmless size and then read without limit.
+    const root = repository();
+    symlinkSync("/dev/zero", join(root, "sneaky-link"));
+    const service = new GitService(root, defaultRunBudget());
+    expect(() => service.diff()).toThrow(/special file.*sneaky-link/u);
+  });
+
+  it("keeps the truncation envelope within its byte limit even for escape-heavy payloads", () => {
+    const hostile = { data: "\\\"".repeat(20_000) };
+    for (const limit of [512, 4096, 32_768]) {
+      const envelope = boundedJson(hostile, limit);
+      expect(Buffer.byteLength(envelope)).toBeLessThanOrEqual(limit);
+      const parsed = JSON.parse(envelope) as { truncated: boolean; sha256: string; excerpt: string };
+      expect(parsed.truncated).toBe(true);
+      expect(JSON.stringify(hostile).startsWith(parsed.excerpt)).toBe(true);
+    }
+    // Below the bare-envelope floor the result is the minimum honest form.
+    const floor = JSON.parse(boundedJson(hostile, 16)) as { excerpt: string };
+    expect(floor.excerpt).toBe("");
+  });
+
+  it("keeps provider-facing JSON schemas cap-consistent with the parse-side schemas", () => {
+    const author = JSON.parse(
+      execFileSync("cat", ["schemas/author-output.schema.json"], { encoding: "utf8" }),
+    ) as { properties: { summary: { maxLength?: number }; changedFiles: { maxItems?: number } } };
+    expect(author.properties.summary.maxLength).toBe(4000);
+    expect(author.properties.changedFiles.maxItems).toBe(500);
+    const explorer = JSON.parse(
+      execFileSync("cat", ["schemas/explorer-output.schema.json"], { encoding: "utf8" }),
+    ) as { properties: { evidence: { maxItems?: number } } };
+    expect(explorer.properties.evidence.maxItems).toBe(200);
+    const reviewer = JSON.parse(
+      execFileSync("cat", ["schemas/reviewer-output.schema.json"], { encoding: "utf8" }),
+    ) as { properties: { findings: { maxItems?: number } } };
+    expect(reviewer.properties.findings.maxItems).toBe(100);
   });
 
   it("bounds oversized JSON payloads into a traceable truncation envelope", () => {
