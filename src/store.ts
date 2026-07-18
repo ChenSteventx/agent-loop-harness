@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { defaultRunBudget } from "./budget.js";
 import {
   createRun as newRun,
   resumeBlockedRun,
@@ -987,6 +988,7 @@ function mapRun(row: RunRow): Run {
     canaryAssignmentId: storedBinding.canaryAssignmentId ?? null,
     configSource: storedBinding.configSource ?? "default",
     runtimeConfiguration: storedBinding.runtimeConfiguration ?? null,
+    budget: storedBinding.budget ?? defaultRunBudget(),
   } : null;
   return {
     id: row.id,

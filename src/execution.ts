@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { BudgetExceededError, defaultRunBudget, type RunBudget } from "./budget.js";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
@@ -25,7 +26,7 @@ export interface CandidateCommit {
 export class GitService {
   readonly root: string;
 
-  constructor(directory: string) {
+  constructor(directory: string, private readonly budget: RunBudget = defaultRunBudget()) {
     this.root = this.git(["rev-parse", "--show-toplevel"], directory).trim();
   }
 
@@ -47,10 +48,23 @@ export class GitService {
 
   diff(): string {
     const tracked = this.git(["diff", "--binary", "HEAD"]);
-    const untracked = this.git(["ls-files", "--others", "--exclude-standard"])
+    this.assertWithinBudget("maximumDiffBytes", Buffer.byteLength(tracked), "tracked diff");
+    const paths = this.git(["ls-files", "--others", "--exclude-standard"])
       .split(/\r?\n/u)
       .filter(Boolean)
-      .sort()
+      .sort();
+    this.assertWithinBudget("maximumUntrackedFiles", paths.length, "untracked file count");
+    // Sizes are checked before any content is read so an oversized workspace
+    // fails closed instead of being loaded into memory and base64-amplified.
+    let untrackedTotal = 0;
+    for (const path of paths) {
+      const absolute = resolve(this.root, path);
+      const size = existsSync(absolute) ? statSync(absolute).size : 0;
+      this.assertWithinBudget("maximumUntrackedFileBytes", size, `untracked file ${path}`);
+      untrackedTotal += size;
+      this.assertWithinBudget("maximumUntrackedTotalBytes", untrackedTotal, "untracked files total");
+    }
+    const untracked = paths
       .map((path) => {
         const absolute = resolve(this.root, path);
         const content = existsSync(absolute) ? readFileSync(absolute) : Buffer.alloc(0);
@@ -60,12 +74,23 @@ export class GitService {
     return tracked + untracked;
   }
 
+  private assertWithinBudget(
+    boundary: "maximumDiffBytes" | "maximumUntrackedFiles" | "maximumUntrackedFileBytes" | "maximumUntrackedTotalBytes",
+    observed: number,
+    detail: string,
+  ): void {
+    const limit = this.budget[boundary];
+    if (observed > limit) throw new BudgetExceededError(boundary, observed, limit, detail);
+  }
+
   diffHash(): string {
     return createHash("sha256").update(this.diff()).digest("hex");
   }
 
   stagedDiff(): string {
-    return this.git(["diff", "--cached", "--binary", "HEAD"]);
+    const staged = this.git(["diff", "--cached", "--binary", "HEAD"]);
+    this.assertWithinBudget("maximumDiffBytes", Buffer.byteLength(staged), "staged diff");
+    return staged;
   }
 
   hasStagedChanges(): boolean {
@@ -73,7 +98,9 @@ export class GitService {
   }
 
   diffBetween(baseCommit: string, commitSha = "HEAD"): string {
-    return this.git(["diff", "--binary", baseCommit, commitSha]);
+    const diff = this.git(["diff", "--binary", baseCommit, commitSha]);
+    this.assertWithinBudget("maximumDiffBytes", Buffer.byteLength(diff), `diff ${baseCommit}..${commitSha}`);
+    return diff;
   }
 
   diffHashBetween(baseCommit: string, commitSha = "HEAD"): string {

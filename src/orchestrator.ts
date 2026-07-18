@@ -32,6 +32,7 @@ import {
   type ExplorerReport,
 } from "./explorer.js";
 import { decideNextAction, type NextAction, type ProofGapSnapshot } from "./loop.js";
+import { BudgetExceededError } from "./budget.js";
 import { LoopController } from "./loop-controller.js";
 import {
   acceptanceHash,
@@ -330,6 +331,20 @@ export class Orchestrator {
   }
 
   private async executeLoopAction(runId: string, action: NextAction): Promise<RunView | null> {
+    try {
+      return await this.executeLoopActionInner(runId, action);
+    } catch (error) {
+      if (error instanceof BudgetExceededError) {
+        // A budget hit is a deterministic verdict about the workspace or the
+        // model output, not a transient fault: block instead of crashing.
+        this.block(runId, error.message, "budget-exceeded");
+        return this.status(runId);
+      }
+      throw error;
+    }
+  }
+
+  private async executeLoopActionInner(runId: string, action: NextAction): Promise<RunView | null> {
     const run = this.store.getRun(runId);
     if (!run) throw new Error(`Run not found: ${runId}`);
     if (action.kind === "resolve-risk") {
@@ -355,7 +370,7 @@ export class Orchestrator {
     else if (action.kind === "repair") await this.executeWriter(runId, "repair", action.attempt);
     else if (action.kind === "review") await this.executeReview(runId);
     else if (action.kind === "advance-ready") {
-      const commitSha = new GitService(this.requireBoundRun(runId).binding.worktreePath).head();
+      const commitSha = new GitService(this.requireBoundRun(runId).binding.worktreePath, this.requireBoundRun(runId).binding.budget).head();
       this.store.transitionRun(runId, "ready", {}, { commitSha });
       return this.status(runId);
     } else if (action.kind === "block") {
@@ -372,7 +387,7 @@ export class Orchestrator {
   private proofGapSnapshot(runId: string): ProofGapSnapshot {
     const run = this.requireBoundRun(runId);
     const binding = run.binding;
-    const git = new GitService(binding.worktreePath);
+    const git = new GitService(binding.worktreePath, binding.budget);
     this.reconcileCommitBoundEvidence(runId, git.head());
     const operations = this.store.listOperations(runId);
     const allEvidence = this.store.listEvidence(runId);
@@ -495,7 +510,7 @@ export class Orchestrator {
       );
       return;
     }
-    const git = new GitService(binding.worktreePath);
+    const git = new GitService(binding.worktreePath, binding.budget);
     const before = git.state();
     const beforeControlState = git.controlStateHash();
     const operation = this.store.createOperation({
@@ -695,7 +710,7 @@ export class Orchestrator {
       );
       return;
     }
-    const git = new GitService(binding.worktreePath);
+    const git = new GitService(binding.worktreePath, binding.budget);
     if (git.isDirty()) {
       this.block(runId, `${role} cannot start from a dirty worktree`, "worktree");
       return;
@@ -875,7 +890,7 @@ export class Orchestrator {
 
   private executeCheckpointCommit(runId: string): void {
     const run = this.requireBoundRun(runId);
-    const git = new GitService(run.binding.worktreePath);
+    const git = new GitService(run.binding.worktreePath, run.binding.budget);
     let writer = this.store.listOperations(runId)
       .filter((operation) => operation.kind === "author" || operation.kind === "repair")
       .at(-1);
@@ -897,7 +912,7 @@ export class Orchestrator {
 
   private executeAcceptanceBinding(runId: string): void {
     const run = this.requireBoundRun(runId);
-    const git = new GitService(run.binding.worktreePath);
+    const git = new GitService(run.binding.worktreePath, run.binding.budget);
     if (git.isDirty()) {
       this.block(runId, "Acceptance binding requires a clean Harness candidate", "acceptance-binding");
       return;
@@ -958,7 +973,7 @@ export class Orchestrator {
     }
 
     const binding = run.binding;
-    const git = new GitService(binding.worktreePath);
+    const git = new GitService(binding.worktreePath, binding.budget);
     if (git.isDirty()) {
       this.requireHumanReview(
         runId,
@@ -1163,7 +1178,7 @@ export class Orchestrator {
       this.block(runId, "No verification commands were configured", "verify");
       return;
     }
-    const git = new GitService(run.binding.worktreePath);
+    const git = new GitService(run.binding.worktreePath, run.binding.budget);
     if (git.isDirty()) {
       this.block(runId, "Verification requires a clean Harness candidate", "verify");
       return;
@@ -1487,7 +1502,7 @@ export class Orchestrator {
       runId,
       reviewedCommit,
       diffHash,
-      new GitService(run.binding.worktreePath).controlStateHash(),
+      new GitService(run.binding.worktreePath, run.binding.budget).controlStateHash(),
       candidates,
     );
     if (operationInputHash(operation.input) !== operationInputHash(expectedInput)) return null;
@@ -1673,7 +1688,7 @@ export class Orchestrator {
     const run = this.requireBoundRun(runId);
     const input = reviewOperationData(operation.input);
     const selected = candidates[completion.selectedAdapterIndex];
-    const git = new GitService(run.binding.worktreePath);
+    const git = new GitService(run.binding.worktreePath, run.binding.budget);
     const currentDiffHash = hashReviewDiff(git.diffBetween(run.binding.baselineCommit, git.head()));
     const boundaryViolation =
       completion.operationInputHash !== operation.inputHash ||

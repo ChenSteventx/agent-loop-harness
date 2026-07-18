@@ -24,7 +24,7 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
   return async (input) => {
     const configuration = input.configurationVariant.configuration;
     const adapter = selectAuthor(options, configuration.providerOrder);
-    const git = new GitService(input.worktreePath);
+    const git = new GitService(input.worktreePath, input.binding.budget);
     const baseCommit = git.head();
     const controlHash = git.controlStateHash();
     const diagnostics: string[] = [];
