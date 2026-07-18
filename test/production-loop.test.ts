@@ -148,6 +148,24 @@ describe("production CLI loop", () => {
     expect(reloaded.derived.nextAction).toMatchObject({ kind: "advance-ready" });
     expect(reloaded.derived.budget?.maximumDiffBytes).toBeGreaterThan(0);
     expect(reloaded.derived.proofGaps).not.toBeNull();
+
+    // The derived view must OBSERVE without mutating: even when the worktree
+    // HEAD has moved past the proven commit, status --derived must not
+    // invalidate the ready run's evidence.
+    writeFileSync(join(started.worktreePath, "drift.txt"), "post-ready drift\n");
+    git(started.worktreePath, ["add", "."]);
+    git(started.worktreePath, ["-c", "user.email=drift@example.invalid", "-c", "user.name=Drift",
+      "commit", "-m", "post-ready drift"]);
+    runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY",
+      "status", "--run-id", runId, "--derived",
+    ], environment);
+    const afterDerived = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY",
+      "status", "--run-id", runId,
+    ], environment) as { run: { status: string }; evidence: Array<{ status: string }> };
+    expect(afterDerived.run.status).toBe("ready");
+    expect(afterDerived.evidence.every((item) => item.status === "valid")).toBe(true);
   }, 180_000);
 
   it("runs a low-risk formal Fake Canary with the assigned Challenger configuration", () => {

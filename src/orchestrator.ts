@@ -277,7 +277,7 @@ export class Orchestrator {
       };
     }
     try {
-      const snapshot = this.proofGapSnapshot(runId);
+      const snapshot = this.proofGapSnapshot(runId, { reconcile: false });
       return {
         status: run.status,
         nextAction: decideNextAction(snapshot),
@@ -451,11 +451,13 @@ export class Orchestrator {
     return decideNextAction(this.proofGapSnapshot(runId));
   }
 
-  private proofGapSnapshot(runId: string): ProofGapSnapshot {
+  private proofGapSnapshot(runId: string, options: { reconcile?: boolean } = {}): ProofGapSnapshot {
     const run = this.requireBoundRun(runId);
     const binding = run.binding;
     const git = new GitService(binding.worktreePath, binding.budget);
-    this.reconcileCommitBoundEvidence(runId, git.head());
+    // Reconciliation invalidates stale commit-bound evidence — a write. The
+    // derived status view must observe without mutating, so it opts out.
+    if (options.reconcile !== false) this.reconcileCommitBoundEvidence(runId, git.head());
     const operations = this.store.listOperations(runId);
     const allEvidence = this.store.listEvidence(runId);
     const evidenceGate = new EvidenceGate(allEvidence);
@@ -722,7 +724,8 @@ export class Orchestrator {
         operationInputHash: operation.inputHash,
         ...providerBlock,
       });
-      this.requireHumanReview(runId, "Explorer is unavailable", providerBlock, "provider-recovery");
+      this.requireHumanReview(runId, "Explorer is unavailable", providerBlock, "provider-recovery",
+        providerRecoveryDisposition(supervised?.outcome ?? null));
       return;
     }
     this.store.recordAgentCall(runId, {
@@ -931,7 +934,8 @@ export class Orchestrator {
         role,
         ...providerBlock,
       });
-      this.requireHumanReview(runId, "Author is unavailable", providerBlock, "provider-recovery");
+      this.requireHumanReview(runId, "Author is unavailable", providerBlock, "provider-recovery",
+        providerRecoveryDisposition(execution.supervisor));
       return;
     }
     this.store.recordAgentCall(runId, {
@@ -1882,7 +1886,13 @@ export class Orchestrator {
     this.block(runId, reason, checkpointRef);
   }
 
-  private requireHumanReview(runId: string, reason: string, evidence: unknown, checkpointRef: string): void {
+  private requireHumanReview(
+    runId: string,
+    reason: string,
+    evidence: unknown,
+    checkpointRef: string,
+    recovery?: RecoveryDisposition,
+  ): void {
     const question = `${reason}. How should this Run proceed?`;
     if (!this.store.listHumanInbox(runId).some((item) => item.question === question)) {
       this.store.createHumanInbox(runId, {
@@ -1895,7 +1905,7 @@ export class Orchestrator {
         resumeCommand: `agent-loop resume --run-id ${runId}`,
       });
     }
-    this.block(runId, reason, checkpointRef);
+    this.block(runId, reason, checkpointRef, recovery);
   }
 
   private reconcileCommitBoundEvidence(runId: string, currentCommit: string): void {
@@ -2472,6 +2482,25 @@ export class Orchestrator {
 // Checkpoint-derived defaults keep every existing block site typed without
 // forcing each caller to restate the obvious; call sites with sharper
 // knowledge (provider failure classes) pass an explicit disposition.
+// Supervisor failures carry structured classes; a purely transient outage
+// (rate limit / transient across every attempted provider) is safely
+// retryable after cooldown, while auth/quota and everything else needs a
+// human. Unknown or absent outcomes stay conservative.
+export function providerRecoveryDisposition(
+  outcome: { failures: ReadonlyArray<{ failureClass: string | null; retryAfterMs?: number | null }> } | null,
+): RecoveryDisposition {
+  const classes = (outcome?.failures ?? []).map((failure) => failure.failureClass);
+  if (classes.length > 0 && classes.every((value) => value === "rate_limit" || value === "transient" || value === "timeout")) {
+    const retryAfterMs = Math.max(0, ...(outcome?.failures ?? []).map((failure) => failure.retryAfterMs ?? 0));
+    return {
+      kind: "retryable",
+      safeToRepeat: true,
+      retryAfter: retryAfterMs > 0 ? new Date(Date.now() + retryAfterMs).toISOString() : null,
+    };
+  }
+  return { kind: "human-action-required", actionType: "authenticate-or-configure-provider" };
+}
+
 export function defaultRecoveryDisposition(checkpointRef: string): RecoveryDisposition {
   if (checkpointRef === "worktree" || checkpointRef === "post-merge") {
     return { kind: "retryable", safeToRepeat: true, retryAfter: null };

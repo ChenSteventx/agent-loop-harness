@@ -15,9 +15,15 @@ export function normalizeFailureText(text: string): string {
     .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/gu, "<timestamp>")
     .replace(/\b1[5-9]\d{11}\b/gu, "<epoch-ms>")
     .replace(/\b\d+(?:\.\d+)?\s?(?:ms|milliseconds|s|sec|seconds)\b/gu, "<duration>")
-    .replace(/\b[0-9a-f]{8,64}\b/gu, "<hex>")
-    .replace(/(?:\/tmp|\/var\/folders|\/private\/var)\/[^\s"']+/gu, "<tmp-path>")
-    .replace(/\b[A-Z]:\\+(?:Users\\+[^\\\s]+\\+AppData\\+Local\\+Temp|Windows\\+Temp)\\+[^\s"']+/gu, "<tmp-path>")
+    // At least one a-f letter: a purely decimal value (order ids, amounts)
+    // is semantic content, not a hash-like identifier.
+    .replace(/\b(?=[0-9a-f]*[a-f])[0-9a-f]{8,64}\b/gu, "<hex>")
+    // Temp DIRECTORY segments are noise; the final path segment (the file
+    // that failed) is semantic and survives, so failures in different files
+    // under the same temp worktree do not collapse into one signature.
+    .replace(/(?:\/tmp|\/var\/folders|\/private\/var)\/[^\s"']*\/(?=[^/\s"'][^/\s"']*)/gu, "<tmp-path>/")
+    .replace(/(?:\/tmp|\/var\/folders|\/private\/var)\/[^\s"'/]+(?=[\s"']|$)/gu, "<tmp-path>")
+    .replace(/\b[A-Z]:\\+(?:Users\\+[^\\\s]+\\+AppData\\+Local\\+Temp|Windows\\+Temp)\\+(?:[^\s"'\\]+\\+)*(?=[^\s"'\\]+)/gu, "<tmp-path>\\")
     .replace(/\b(?:pid|process)[ =:]+\d+\b/giu, "<pid>")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b/gu, "<address>")
     .replace(/\blocalhost:\d{2,5}\b/giu, "<address>")

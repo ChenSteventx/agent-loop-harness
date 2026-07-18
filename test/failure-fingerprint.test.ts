@@ -27,6 +27,21 @@ describe("stable failure fingerprint normalization", () => {
     expect(normalizeFailureText(runOne)).toBe(normalizeFailureText(runTwo));
   });
 
+  it("preserves semantic values the noise rules must not eat", () => {
+    // Purely decimal identifiers are content, not hash noise.
+    const orderOne = normalizeFailureText("expected order 12345678 to equal 87654321");
+    const orderTwo = normalizeFailureText("expected order 11111111 to equal 22222222");
+    expect(orderOne).not.toBe(orderTwo);
+    expect(orderOne).toContain("12345678");
+    // The failing FILE under a temp worktree survives; only the directory
+    // segments normalize.
+    const authFailure = normalizeFailureText("FAIL /tmp/work-abc123/src/auth.test.ts:12");
+    const billingFailure = normalizeFailureText("FAIL /tmp/work-abc123/src/billing.test.ts:12");
+    expect(authFailure).not.toBe(billingFailure);
+    expect(authFailure).toContain("auth.test.ts");
+    expect(authFailure).toContain("<tmp-path>");
+  });
+
   it("still distinguishes genuinely different failures", () => {
     const missingModule = "Error: Cannot find module './billing'\n  at app.ts:3:1";
     const assertion = "AssertionError: expected 4 to be 5\n  at math.test.ts:12:3";
