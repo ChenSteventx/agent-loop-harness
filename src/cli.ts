@@ -411,6 +411,30 @@ proposal
   });
 
 proposal
+  .command("mark-evaluated")
+  .requiredOption("--id <id>")
+  .requiredOption("--comparison-id <id>")
+  .requiredOption("--decided-by <identity>")
+  .requiredOption("--reason <text>")
+  .description("record that a persisted completed Comparison evaluated this Proposal")
+  .action((options: { id: string; comparisonId: string; decidedBy: string; reason: string }) => {
+    withEvaluationStores((_development, store) => {
+      const comparison = store.getOfflineComparison(options.comparisonId);
+      if (!comparison || comparison.proposalId !== options.id || comparison.status !== "completed") {
+        throw new Error("Proposal evaluation requires a persisted completed Comparison for this Proposal");
+      }
+      print(store.decideChangeProposal({
+        id: options.id,
+        status: "evaluated",
+        authority: "human",
+        decidedBy: options.decidedBy,
+        reason: options.reason,
+        decidedAt: new Date().toISOString(),
+      }));
+    });
+  });
+
+proposal
   .command("challenger")
   .requiredOption("--proposal-id <id>")
   .requiredOption("--id <id>")

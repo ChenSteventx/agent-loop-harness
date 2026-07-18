@@ -39,6 +39,8 @@ const gates = [
   [30, "formal runtime reads evaluation state read-only", "src/cli.ts", "readOnly: true"],
   [31, "proposals are limited to runtime-wired targets", "test/evolution.test.ts", "unsupported-runtime-target"],
   [32, "the vertical slice runs compare, shadow, canary, and rollback through the CLI", "test/phase3-vertical-slice.test.ts", "slice-rollback"],
+  [33, "proposal evaluation requires persisted comparison evidence", "src/cli.ts", "requires a persisted completed Comparison"],
+  [34, "production readiness stays closed on fixture-scale data", "test/phase3-vertical-slice.test.ts", "canaryReady: false"],
 ] as const;
 
 describe("Phase 3 final gate traceability", () => {

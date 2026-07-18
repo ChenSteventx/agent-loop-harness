@@ -170,12 +170,11 @@ describe("Phase 3 vertical slice", () => {
     expect(shadow).toMatchObject({ dataSource: "real", authoritative: false });
     expect(shadow.differences.length).toBeGreaterThan(0);
 
-    const decide = new EvaluationStore(join(loopHome, "evaluation.sqlite"));
-    decide.decideChangeProposal({
-      id: proposalId, status: "evaluated", authority: "human", decidedBy: "slice-human",
-      reason: "comparison and shadow evidence recorded", decidedAt: new Date().toISOString(),
-    });
-    decide.close();
+    runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "proposal", "mark-evaluated",
+      "--id", proposalId, "--comparison-id", "slice-comparison",
+      "--decided-by", "slice-human", "--reason", "comparison and shadow evidence recorded",
+    ], canaryEnv);
 
     runCli([
       "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "canary", "approve",
@@ -184,6 +183,17 @@ describe("Phase 3 vertical slice", () => {
       "--expires-at", "2027-01-01T00:00:00.000Z", "--basis-points", String(approvedBasisPoints),
     ], canaryEnv);
 
+    // The production readiness gate must stay closed on fixture-scale data:
+    // coverage requires a real failure/repair/fallback/human spectrum that a
+    // fake-codex fixture cannot honestly produce.
+    const productionReadiness = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY", "eval", "readiness",
+    ], canaryEnv) as { canaryReady: boolean; mechanismReady: boolean };
+    expect(productionReadiness).toMatchObject({ mechanismReady: true, canaryReady: false });
+
+    // Mechanism-scale readiness for the slice: every input below is derived
+    // from the stores; only the thresholds are scoped down, and the recorded
+    // report keeps those thresholds visible for audit.
     const readinessStore = new EvaluationStore(join(loopHome, "evaluation.sqlite"));
     const development = new SqliteStore(join(loopHome, "state.sqlite"));
     const factBundles = development.listRuns().map((run) => exportRunFacts(development, run.id));
