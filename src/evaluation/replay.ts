@@ -1,4 +1,4 @@
-import { operationInputHash } from "../bindings.js";
+import { acceptanceHash, operationInputHash, taskSpecHash } from "../bindings.js";
 import type { RunBinding } from "../domain.js";
 import type { DatasetKind } from "./datasets.js";
 import type { SanitizedFactBundle } from "./facts.js";
@@ -138,8 +138,13 @@ function fullTaskReplayIsBound(facts: SanitizedFactBundle, binding: RunBinding):
   // Unlike verify-only, full replay re-executes the task from the Baseline Commit,
   // so no historical candidate/command evidence (pinned commit) is required —
   // failed, blocked, and no-candidate runs must remain fully replayable.
+  // The hashes are recomputed from the task spec that will actually execute:
+  // a binding whose stored hashes no longer match its own content (for example
+  // a swapped verification argv) must not reach the executor.
   const stored = facts.run.binding;
   return stored !== null &&
+    taskSpecHash(binding.taskSpec) === binding.taskSpecHash &&
+    acceptanceHash(binding.taskSpec.acceptance) === binding.acceptanceHash &&
     stored.baselineCommit === binding.baselineCommit &&
     stored.taskSpecHash === binding.taskSpecHash &&
     stored.acceptanceHash === binding.acceptanceHash &&

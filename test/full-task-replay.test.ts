@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { acceptanceHash, taskSpecHash } from "../src/bindings.js";
 import type { RunBinding } from "../src/domain.js";
 import { createInvocationManifest } from "../src/evaluation/manifests.js";
 import { exportRunFacts } from "../src/evaluation/facts.js";
@@ -59,8 +60,8 @@ function boundFacts(directory: string, repository: { root: string; baseline: str
       risk: "low",
       verification: [{ id: "replay-check", argv: ["node", "check.mjs"] }],
     },
-    taskSpecHash: "task-hash",
-    acceptanceHash: "acceptance-hash",
+    taskSpecHash: "",
+    acceptanceHash: "",
     baselineCommit: repository.baseline,
     sourceRepository: repository.root,
     worktreePath: join(repository.root, "unused-worktree"),
@@ -72,6 +73,8 @@ function boundFacts(directory: string, repository: { root: string; baseline: str
     configurationVariantId: null, configurationHash: null, canaryAssignmentId: null,
     configSource: "default", runtimeConfiguration: null,
   };
+  binding.taskSpecHash = taskSpecHash(binding.taskSpec);
+  binding.acceptanceHash = acceptanceHash(binding.taskSpec.acceptance);
   const development = new SqliteStore(join(directory, "state.sqlite"));
   development.createBoundRun("source-run", binding.taskSpec.id, binding);
   development.createOperation({

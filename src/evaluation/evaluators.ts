@@ -116,6 +116,12 @@ export class FullTaskReplayEvaluator {
         facts: input.facts,
         binding: evaluationBinding,
         mode: "full",
+        // Required manifests are derived from the fact bundle itself so a run
+        // whose repair or reviewer operations lack manifests cannot grade
+        // manifest-complete just because the caller forgot to list them.
+        requiredOperationIds: input.facts.operations
+          .filter((operation) => ["explorer", "author", "repair", "reviewer"].includes(operation.kind))
+          .map((operation) => operation.id),
         championVersion: input.configurationVariant.status === "champion" ? input.configurationVariant.version : "baseline",
         challengerVersion: input.configurationVariant.status === "challenger" ? input.configurationVariant.version : null,
         evaluatorKind: this.kind,

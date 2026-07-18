@@ -2,7 +2,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { evidenceDependencies, evidenceDependencyHash, operationInputHash } from "../src/bindings.js";
+import {
+  acceptanceHash,
+  evidenceDependencies,
+  evidenceDependencyHash,
+  operationInputHash,
+  taskSpecHash,
+} from "../src/bindings.js";
 import type { RunBinding } from "../src/domain.js";
 import { DatasetCatalog, historicalDataset } from "../src/evaluation/datasets.js";
 import { exportRunFacts } from "../src/evaluation/facts.js";
@@ -25,8 +31,8 @@ const binding: RunBinding = {
     risk: "low",
     verification: [{ id: "test", argv: ["npm", "test"] }],
   },
-  taskSpecHash: "task-hash",
-  acceptanceHash: "acceptance-hash",
+  taskSpecHash: "",
+  acceptanceHash: "",
   baselineCommit: "baseline",
   sourceRepository: "/project",
   worktreePath: "/project-worktree",
@@ -38,6 +44,8 @@ const binding: RunBinding = {
   configurationVariantId: null, configurationHash: null, canaryAssignmentId: null,
   configSource: "default", runtimeConfiguration: null,
 };
+binding.taskSpecHash = taskSpecHash(binding.taskSpec);
+binding.acceptanceHash = acceptanceHash(binding.taskSpec.acceptance);
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0).reverse()) {
@@ -268,6 +276,86 @@ describe("Evaluation Datasets and Historical Replay", () => {
     expect(verifyOnly.status).toBe("not-replayable");
     expect(verifyOnly.missingInputs).toContain("pinned_verification_binding");
     expect(full.missingInputs).not.toContain("pinned_verification_binding");
+
+    // A binding whose stored hashes do not match its own task spec (for
+    // example a swapped verification argv) must never reach the executor.
+    const tampered: RunBinding = {
+      ...binding,
+      taskSpec: {
+        ...binding.taskSpec,
+        verification: [{ id: "test", argv: ["node", "attacker-controlled.mjs"] }],
+      },
+    };
+    const forged = await replay.run({
+      id: "evaluation-tampered-full", facts, binding: tampered, mode: "full",
+      requiredOperationIds: ["run-3:author"], createdAt: "2026-07-15T00:04:00.000Z",
+    });
+    expect(forged.status).toBe("not-replayable");
+    expect(forged.missingInputs).toContain("full_task_replay_binding");
+    evaluation.close();
+    development.close();
+  });
+
+  it("never grades a run manifest-complete while any of its agent operations lacks a manifest", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-loop-partial-manifest-"));
+    temporaryDirectories.push(directory);
+    const development = new SqliteStore(join(directory, "state.sqlite"));
+    development.createBoundRun("run-5", binding.taskSpec.id, binding);
+    development.createOperation({
+      id: "run-5:author", runId: "run-5", kind: "author", idempotencyKey: "run-5:author",
+      now: "2026-07-15T00:00:01.000Z",
+    });
+    development.installInvocationManifest(createInvocationManifest({
+      id: "run-5:author:manifest:v1",
+      runId: "run-5",
+      operationId: "run-5:author",
+      role: "author",
+      binding,
+      renderedPrompt: "bounded author prompt",
+      outputSchemaPath: resolve("schemas/author-output.schema.json"),
+      configuredProvider: { provider: "Codex CLI", model: "configured-model" },
+      actualProvider: {
+        provider: "openai-codex", model: "actual-model", modelFamily: "gpt",
+        executable: "codex", version: "1.0.0",
+      },
+      currentCommit: binding.baselineCommit,
+      verificationPlan: binding.taskSpec.verification,
+      context: [{ kind: "task", reference: "task.yaml", content: binding.taskSpec, trust: "project" }],
+      createdAt: "2026-07-15T00:00:01.000Z",
+    }));
+    development.finishOperation("run-5:author", "succeeded", {}, "2026-07-15T00:00:02.000Z");
+    development.createOperation({
+      id: "run-5:repair", runId: "run-5", kind: "repair", idempotencyKey: "run-5:repair",
+      now: "2026-07-15T00:00:03.000Z",
+    });
+    development.finishOperation("run-5:repair", "failed", {}, "2026-07-15T00:00:04.000Z");
+    const facts = exportRunFacts(development, "run-5");
+    const evaluation = new EvaluationStore(join(directory, "evaluation.sqlite"));
+    evaluation.installFactBundle(facts);
+    const variant = createInitialChampion({
+      id: "partial-manifest-champion",
+      projectScope: binding.projectAdapterName,
+      version: "1",
+      configuration: {
+        providerOrder: ["codex"], roleModels: {}, retryLimit: 1, timeoutMs: 60_000,
+        contextRanking: ["task", "acceptance", "repository"],
+        riskThresholds: { assisted: 1, reviewed: 2 }, memoryRetrievalEnabled: false,
+      },
+    });
+    const evaluator = new FullTaskReplayEvaluator(
+      evaluation,
+      {
+        create: (path, branch, baseRef) => ({ path, branch, head: baseRef ?? binding.baselineCommit }),
+        remove: () => {},
+      },
+      async () => ({ passed: true, evidenceHash: "must-not-run", diagnostics: [] }),
+      join(directory, "evaluation"),
+    );
+    const run = await evaluator.evaluate({
+      id: "evaluation-partial-manifest", facts, binding, configurationVariant: variant,
+    });
+    expect(run.status).toBe("not-replayable");
+    expect(run.missingInputs).toContain("invocation_manifest:run-5:repair");
     evaluation.close();
     development.close();
   });
