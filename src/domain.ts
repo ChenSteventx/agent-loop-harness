@@ -11,11 +11,21 @@ export const runStatuses = [
 export type RunStatus = (typeof runStatuses)[number];
 export type ActiveRunStatus = "open" | "ready" | "merged";
 
+// Typed recovery semantics for a blocked run: what a caller may safely do
+// next is decided by this union, not inferred from free-text reasons or the
+// rendered resume command.
+export type RecoveryDisposition =
+  | { kind: "retryable"; safeToRepeat: boolean; retryAfter: string | null }
+  | { kind: "already-committed"; receiptRef: string }
+  | { kind: "human-action-required"; actionType: string }
+  | { kind: "terminal"; failureClass: string };
+
 export interface BlockedRunMetadata {
   previousStatus: ActiveRunStatus;
   reason: string;
   checkpointRef: string;
   resumeCommand: string;
+  recovery: RecoveryDisposition;
 }
 
 export interface Run {

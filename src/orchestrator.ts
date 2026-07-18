@@ -21,7 +21,7 @@ import type { ProviderAdapter, ProviderRunRequest, ProviderRunResult } from "./p
 import { loadTaskSpec } from "./project.js";
 import { authorPrompt } from "./roles.js";
 import { SqliteStore } from "./store.js";
-import type { Evidence, Operation, Run, RunBinding } from "./domain.js";
+import type { Evidence, Operation, RecoveryDisposition, Run, RunBinding } from "./domain.js";
 import { EvidenceGate } from "./evidence-gate.js";
 import { applyRiskEscalation, executionTemplates } from "./routing.js";
 import {
@@ -33,6 +33,7 @@ import {
 } from "./explorer.js";
 import { decideNextAction, type NextAction, type ProofGapSnapshot } from "./loop.js";
 import { BudgetExceededError, assertPromptWithinBudget, boundedJson, type RunBudget } from "./budget.js";
+import { normalizeFailureText } from "./failure-fingerprint.js";
 import { LoopController } from "./loop-controller.js";
 import {
   acceptanceHash,
@@ -2102,13 +2103,16 @@ export class Orchestrator {
     const result = suppliedResult ?? operation.result;
     const stderr = commandArtifactText(result, "stderrPath");
     const stdout = commandArtifactText(result, "stdoutPath");
+    // The signature normalizes declared noise classes (timestamps, PIDs,
+    // temp paths, hex ids, durations) so the same root cause is recognized
+    // across reruns; the raw stderr/stdout stay untouched in the evidence.
     const signature = operationInputHash({
       commandId: command.id,
       exitCode: isRecord(result) ? result.exitCode : null,
       signal: isRecord(result) ? result.signal : null,
       timedOut: isRecord(result) ? result.timedOut : null,
-      stderr,
-      stdout,
+      stderr: normalizeFailureText(stderr),
+      stdout: normalizeFailureText(stdout),
     });
     const stepId = `verification-failure:${command.id}`;
     const dependencies = evidenceDependencies({
@@ -2397,7 +2401,7 @@ export class Orchestrator {
     return run as Run & { binding: NonNullable<Run["binding"]> };
   }
 
-  private block(runId: string, reason: string, checkpointRef: string): void {
+  private block(runId: string, reason: string, checkpointRef: string, recovery?: RecoveryDisposition): void {
     const current = this.store.getRun(runId);
     if (!current || current.status === "blocked") return;
     this.store.transitionRun(
@@ -2408,6 +2412,7 @@ export class Orchestrator {
           reason,
           checkpointRef,
           resumeCommand: `agent-loop resume --run-id ${runId}`,
+          recovery: recovery ?? defaultRecoveryDisposition(checkpointRef),
         },
       },
       { reason, checkpointRef },
@@ -2417,6 +2422,31 @@ export class Orchestrator {
   private worktreePath(runId: string): string {
     return resolve(this.loopHome, "worktrees", runId);
   }
+}
+
+// Checkpoint-derived defaults keep every existing block site typed without
+// forcing each caller to restate the obvious; call sites with sharper
+// knowledge (provider failure classes) pass an explicit disposition.
+export function defaultRecoveryDisposition(checkpointRef: string): RecoveryDisposition {
+  if (checkpointRef === "worktree" || checkpointRef === "post-merge") {
+    return { kind: "retryable", safeToRepeat: true, retryAfter: null };
+  }
+  if (checkpointRef === "budget-exceeded") {
+    return { kind: "human-action-required", actionType: "reduce-scope-or-raise-budget" };
+  }
+  if (checkpointRef === "risk-classification") {
+    return { kind: "human-action-required", actionType: "classify-risk" };
+  }
+  if (checkpointRef === "provider-recovery") {
+    return { kind: "human-action-required", actionType: "authenticate-or-configure-provider" };
+  }
+  if (checkpointRef === "loop-budget") {
+    return { kind: "human-action-required", actionType: "inspect-run" };
+  }
+  if (checkpointRef === "run-binding") {
+    return { kind: "terminal", failureClass: "binding-mismatch" };
+  }
+  return { kind: "human-action-required", actionType: `inspect-${checkpointRef}` };
 }
 
 export { evidenceDependencyHash };

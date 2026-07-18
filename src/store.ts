@@ -979,6 +979,16 @@ interface OutboxRow {
 interface HumanInboxRow { id: number; run_id: string; question: string; options_json: string; recommendation: string; evidence_json: string; risk: string; consequence: string; resume_command: string; created_at: string; resolved_at: string | null; resolution_json: string | null }
 interface AgentCallRow { id: number; run_id: string; role: string; provider: string; latency_ms: number; input_tokens: number | null; cached_input_tokens: number | null; output_tokens: number | null; created_at: string }
 
+function normalizeBlocked(blocked: Run["blocked"]): Run["blocked"] {
+  if (!blocked) return blocked;
+  // Rows written before typed recovery existed default to the conservative
+  // human-action form derived from their checkpoint reference.
+  return {
+    ...blocked,
+    recovery: blocked.recovery ?? { kind: "human-action-required", actionType: `inspect-${blocked.checkpointRef}` },
+  };
+}
+
 function mapRun(row: RunRow): Run {
   const storedBinding = row.binding_json ? parseJson(row.binding_json) as Run["binding"] : null;
   const binding = storedBinding ? {
@@ -995,7 +1005,7 @@ function mapRun(row: RunRow): Run {
     taskId: row.task_id,
     binding,
     status: row.status,
-    blocked: row.blocked_json ? parseJson(row.blocked_json) as Run["blocked"] : null,
+    blocked: row.blocked_json ? normalizeBlocked(parseJson(row.blocked_json) as Run["blocked"]) : null,
     mergeSha: row.merge_sha,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

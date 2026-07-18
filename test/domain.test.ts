@@ -32,12 +32,14 @@ describe("run lifecycle", () => {
         reason: "verification unavailable",
         checkpointRef: "op-7",
         resumeCommand: "loop resume run-1",
+        recovery: { kind: "human-action-required", actionType: "inspect-op-7" },
       },
     });
     expect(blocked.blocked).toEqual({
       previousStatus: "open",
       reason: "verification unavailable",
       checkpointRef: "op-7",
+      recovery: { kind: "human-action-required", actionType: "inspect-op-7" },
       resumeCommand: "loop resume run-1",
     });
     expect(resumeBlockedRun(blocked).status).toBe("open");
