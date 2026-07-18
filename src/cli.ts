@@ -544,11 +544,31 @@ canary.command("observe")
     withEvaluationStores((development, store) => {
       const assignment = store.getCanaryAssignment(options.assignmentId);
       if (!assignment) throw new Error("Canary Assignment not found");
+      const selectedVariant = store.getConfigurationVariant(assignment.selectedVariantId);
+      if (assignment.selected === "challenger" && selectedVariant?.status !== "challenger") {
+        throw new Error("Challenger was already rolled back; no further observation is required");
+      }
       const run = development.getRun(options.runId);
       if (!run?.binding) throw new Error(`Formal Run not found or unbound: ${options.runId}`);
       if (run.binding.canaryAssignmentId !== assignment.id ||
           run.binding.configurationVariantId !== assignment.selectedVariantId) {
         throw new Error("Formal Run binding does not match the Canary Assignment");
+      }
+      // Selective observation must not dodge a rollback: while another run
+      // bound to this assignment has degraded facts and no observation yet,
+      // it has to be observed first.
+      const observedRunIds = new Set(store.listCanaryObservations(assignment.id)
+        .map((observation) => observation.formalRunId));
+      const unobservedDegraded = development.listRuns()
+        .filter((other) => other.id !== options.runId && other.binding?.canaryAssignmentId === assignment.id &&
+          !observedRunIds.has(other.id))
+        .filter((other) => {
+          const otherMetrics = projectRunMetrics(exportRunFacts(development, other.id));
+          return !otherMetrics.readySuccess || otherMetrics.verificationFailures > 0;
+        })
+        .map((other) => other.id);
+      if (unobservedDegraded.length > 0) {
+        throw new Error(`Degraded runs bound to this assignment must be observed first: ${unobservedDegraded.join(", ")}`);
       }
       const facts = store.installFactBundle(exportRunFacts(development, options.runId));
       const runMetrics = projectRunMetrics(facts);

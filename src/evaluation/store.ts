@@ -525,6 +525,15 @@ export class EvaluationStore {
       return existing;
     }
     const transaction = this.database.transaction(() => {
+      if (assignment.selected === "challenger" && assignment.approvalId !== null) {
+        // The cap check and the insert must be one transaction, or two
+        // concurrent assignments could both take the last approved slot.
+        const approval = this.getCanaryApproval(assignment.approvalId);
+        if (!approval) throw new Error(`Canary Approval not found: ${assignment.approvalId}`);
+        if (this.countCanaryAssignments(assignment.projectScope, assignment.proposalId) >= approval.maximumTasks) {
+          throw new Error("Canary task limit is exhausted for this approval");
+        }
+      }
       this.database.prepare(
         `INSERT INTO canary_assignments
          (id, project_scope, task_key, proposal_id, selected, assignment_json, created_at)
@@ -577,6 +586,13 @@ export class EvaluationStore {
     const row = this.database.prepare("SELECT observation_json FROM canary_observations WHERE id = ?")
       .get(id) as { observation_json: string } | undefined;
     return row ? JSON.parse(row.observation_json) as CanaryObservation : null;
+  }
+
+  listCanaryObservations(assignmentId: string): CanaryObservation[] {
+    const rows = this.database.prepare(
+      "SELECT observation_json FROM canary_observations WHERE assignment_id = ? ORDER BY created_at, id",
+    ).all(assignmentId) as Array<{ observation_json: string }>;
+    return rows.map((row) => JSON.parse(row.observation_json) as CanaryObservation);
   }
 
   applyCanaryObservation(
@@ -879,6 +895,12 @@ export class EvaluationStore {
     this.migrateReplayabilityName();
     this.migrateCandidateMemoryStatusConstraint();
     this.migrateEvolutionOutbox();
+    // One observation per (assignment, formal run): repeated observation of
+    // the same healthy run under fresh ids must not pad the history.
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS one_observation_per_assignment_run
+        ON canary_observations(assignment_id, formal_run_id);
+    `);
   }
 
   findCanaryAssignment(projectScope: string, taskKey: string): CanaryAssignment | null {

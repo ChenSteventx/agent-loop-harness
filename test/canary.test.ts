@@ -208,6 +208,29 @@ describe("disabled low-risk Canary", () => {
       .toMatchObject({ payload: expect.objectContaining({ formalRunId: "formal-run" }) });
     expect(JSON.stringify({ run: development.getRun("formal-run"), events: development.listEvents("formal-run") }))
       .toBe(formalBefore);
+
+    // One observation per (assignment, formal run): a fresh id for the same
+    // run must not pad the observation history.
+    expect(() => recordCanaryObservation(store, {
+      id: "observation-duplicate", assignment, formalRunId: "formal-run", factHash: "formal-fact-hash",
+      ready: true, done: true, verificationFailures: 0,
+      createdAt: "2026-07-15T00:07:00.000Z",
+    })).toThrow(/UNIQUE|constraint/iu);
+    expect(store.listCanaryObservations(assignment.id)).toHaveLength(1);
+
+    // The approved task cap is enforced inside the insert transaction.
+    const capApproval = store.getCanaryApproval(approval.id)!;
+    expect(capApproval.maximumTasks).toBe(5);
+    for (let index = 0; index < 4; index += 1) {
+      store.installCanaryAssignment({
+        ...assignment, id: `cap-assignment-${index}`, taskKey: `cap-task-${index}`,
+        approvalId: approval.id,
+      });
+    }
+    expect(() => store.installCanaryAssignment({
+      ...assignment, id: "cap-assignment-overflow", taskKey: "cap-task-overflow",
+      approvalId: approval.id,
+    })).toThrow("task limit is exhausted");
     store.close();
     development.close();
   });

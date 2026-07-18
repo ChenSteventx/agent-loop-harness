@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { DatasetCatalog } from "../src/evaluation/datasets.js";
 import { EvaluationStore } from "../src/evaluation/store.js";
-import type { CanaryAssignment } from "../src/evolution/canary.js";
+import { createCanaryApproval, type CanaryAssignment } from "../src/evolution/canary.js";
 import {
   approveChangeProposal,
   createChangeProposal,
@@ -176,6 +176,17 @@ describe("production CLI loop", () => {
     });
     const challenger = evaluation.installConfigurationVariant(createChallenger({
       id: "formal-challenger", version: "2", proposal: approved, champion,
+    }));
+    evaluation.decideChangeProposal({
+      id: approved.id, status: "evaluated", authority: "human", decidedBy: "test-human",
+      reason: "fixture comparison evidence", decidedAt: "2026-07-16T00:00:00.000Z",
+    });
+    evaluation.installCanaryApproval(createCanaryApproval({
+      id: "formal-approval", projectScope: "generic-node",
+      proposal: evaluation.getChangeProposal(approved.id)!, challenger,
+      maximumBasisPoints: 1000, maximumTasks: 10, maximumExtraBudgetTokens: 0,
+      approvedBy: "test-human", reason: "fixture canary window",
+      createdAt: "2026-07-16T00:00:00.000Z", expiresAt: "2027-01-01T00:00:00.000Z",
     }));
     const assignment: CanaryAssignment = {
       schemaVersion: 1, id: "formal-assignment", projectScope: "generic-node",
