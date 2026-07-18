@@ -12,7 +12,9 @@ import {
   type ProviderRunRequest,
   type ProviderRunResult,
 } from "./provider.js";
+import { DeclarativeProjectAdapter, loadDeclarativeProjectConfig } from "./declarative-project.js";
 import { GenericNodeProjectAdapter } from "./project.js";
+import type { ProjectAdapter } from "./ports.js";
 import { defaultRoleOutputSchemas } from "./role-output-schemas.js";
 import { SqliteStore } from "./store.js";
 import { exportRunFacts } from "./evaluation/facts.js";
@@ -73,6 +75,11 @@ const program = new Command()
     "--provider-profile <name>",
     "fixed Provider profile: CODEX_PRIMARY or CLAUDE_PRIMARY",
     process.env.AGENT_LOOP_PROVIDER_PROFILE ?? "CODEX_PRIMARY",
+  )
+  .option(
+    "--project-config <path>",
+    "declarative project config JSON; defaults to the built-in generic-node adapter",
+    process.env.AGENT_LOOP_PROJECT_CONFIG,
   );
 
 program
@@ -827,7 +834,7 @@ async function runReplayCommand(options: {
 }
 
 function createEvaluationFullTaskExecutor(): ReturnType<typeof createFullTaskExecutor> {
-  const projectAdapter = new GenericNodeProjectAdapter();
+  const projectAdapter = resolveProjectAdapter();
   return createFullTaskExecutor({
     adapters: {
       codex: new CodexCliAdapter({
@@ -840,6 +847,12 @@ function createEvaluationFullTaskExecutor(): ReturnType<typeof createFullTaskExe
     defaultFamily: "codex",
     verificationCommands: (task) => projectAdapter.verificationCommands(task),
   });
+}
+
+function resolveProjectAdapter(): ProjectAdapter {
+  const configPath = program.opts<{ projectConfig?: string }>().projectConfig;
+  if (!configPath) return new GenericNodeProjectAdapter();
+  return new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(resolve(configPath)));
 }
 
 function createOrchestrator(loopHome: string): Orchestrator {
@@ -872,7 +885,7 @@ function createOrchestrator(loopHome: string): Orchestrator {
       claude: { adapter: claude, family: "claude", name: "Claude Code" },
       deepseek: { adapter: deepseek, family: "deepseek", name: "Pi / configured DeepSeek" },
     }),
-    projectAdapter: new GenericNodeProjectAdapter(),
+    projectAdapter: resolveProjectAdapter(),
     roleOutputSchemas: defaultRoleOutputSchemas(),
     runtimeConfigResolver,
   });

@@ -349,6 +349,52 @@ describe("production CLI loop", () => {
     });
   }, 240_000);
 
+  it("runs a non-Node project to ready through a declarative project config", () => {
+    if (process.platform === "win32") return;
+    const root = mkdtempSync(join(tmpdir(), "agent-loop-non-node-target-"));
+    temporaryDirectories.push(root);
+    git(root, ["init", "-b", "main"]);
+    git(root, ["config", "user.email", "shell@example.invalid"]);
+    git(root, ["config", "user.name", "Shell Test"]);
+    writeFileSync(join(root, "check.sh"), "#!/bin/sh\ngrep -q 'production CLI' changed.txt\n");
+    writeFileSync(join(root, "task.yaml"), [
+      "id: NON-NODE-1",
+      "goal: Prove a non-Node project runs through the declarative entry",
+      "acceptance:",
+      "  - changed.txt is created by the Author and verified by a shell command",
+      "risk: low",
+      "verification:",
+      "  - id: shell-check",
+      "    argv: [sh, check.sh]",
+      "",
+    ].join("\n"));
+    git(root, ["add", "."]);
+    git(root, ["commit", "-m", "baseline"]);
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-non-node-home-"));
+    temporaryDirectories.push(loopHome);
+    const projectConfig = join(loopHome, "project.json");
+    writeFileSync(projectConfig, JSON.stringify({
+      name: "shell-project",
+      policyVersion: "shell-project/v1",
+      sensitivePathSegments: ["deploy/"],
+      rewriteNodeCommands: false,
+    }));
+    const started = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY",
+      "--project-config", projectConfig, "run",
+      "--run-id", "non-node-run", "--task", join(root, "task.yaml"), "--repository", root,
+    ], {
+      ...process.env,
+      CODEX_BIN: fakeCodex,
+      FAKE_CODEX_MODE: "production-author",
+      AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY",
+    }) as { run: { status: string; binding: { projectAdapterName: string; policyVersion: string } } };
+    expect(started.run).toMatchObject({
+      status: "ready",
+      binding: { projectAdapterName: "shell-project", policyVersion: "shell-project/v1" },
+    });
+  }, 180_000);
+
   it("fails closed when Canary is enabled without evaluation state", () => {
     const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-production-no-evaluation-"));
     temporaryDirectories.push(loopHome);
