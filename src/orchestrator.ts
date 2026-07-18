@@ -19,6 +19,7 @@ import {
 import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { ProviderAdapter, ProviderRunRequest, ProviderRunResult } from "./provider.js";
 import { loadTaskSpec } from "./project.js";
+import { authorPrompt } from "./roles.js";
 import { SqliteStore } from "./store.js";
 import type { Evidence, Operation, Run, RunBinding } from "./domain.js";
 import { EvidenceGate } from "./evidence-gate.js";
@@ -738,7 +739,7 @@ export class Orchestrator {
     const request: ProviderRunRequest = {
       invocationId: operation.id,
       prompt: role === "author"
-        ? authorPrompt(binding.taskSpec, explorerReport)
+        ? authorPrompt(binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport) : null)
         : repairPrompt(binding.taskSpec, attempt, git.head(), failureEvidence),
       cwd: binding.worktreePath,
       artifactDirectory: this.writerArtifactDirectory(runId, role, attempt),
@@ -1212,7 +1213,7 @@ export class Orchestrator {
         operation,
         role: operation.kind as "author" | "repair",
         renderedPrompt: operation.kind === "author"
-          ? authorPrompt(run.binding.taskSpec, explorerReport)
+          ? authorPrompt(run.binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport) : null)
           : repairPrompt(run.binding.taskSpec, input.attempt, input.baseCommit, failureEvidence),
         outputSchemaPath: this.roleOutputSchemas.author,
         actualProvider: completion.result.identity,
@@ -2377,19 +2378,6 @@ export class Orchestrator {
 }
 
 export { evidenceDependencyHash };
-
-function authorPrompt(task: ReturnType<typeof loadTaskSpec>, explorerReport: ExplorerReport | null): string {
-  return [
-    `Task: ${task.id}`,
-    `Goal: ${task.goal}`,
-    "Acceptance:",
-    ...task.acceptance.map((item) => `- ${item}`),
-    ...(explorerReport ? [`Explorer advisory report: ${compactExplorerReport(explorerReport)}`] : []),
-    "Work only in the current worktree. Edit files only; do not run git add, git commit, or change Git metadata.",
-    "Leave a non-empty working diff for the Harness to inspect and commit deterministically.",
-    "Return only a concise summary and the changedFiles array required by the Author output schema.",
-  ].join("\n");
-}
 
 function assertCommit(repository: string, sha: string): void {
   if (!/^[0-9a-f]{7,64}$/iu.test(sha)) throw new Error("Merge SHA must be a hexadecimal commit id");

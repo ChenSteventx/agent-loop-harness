@@ -5,6 +5,7 @@ import type { VerificationCommand } from "./ports.js";
 import type { ProviderAdapter } from "./provider.js";
 import { authorOutputSchema, defaultRoleOutputSchemas } from "./role-output-schemas.js";
 import type { TaskSpec } from "./task-spec.js";
+import { authorPrompt } from "./roles.js";
 import { WriterExecutor, writerBoundaryViolation } from "./writer-executor.js";
 import { safeEnvironment, type FullTaskExecutor } from "./evaluation/evaluators.js";
 
@@ -34,7 +35,7 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
       const execution = await new WriterExecutor().execute({
         request: {
           invocationId: `${input.facts.run.id}:evaluation-author:${attempt}`,
-          prompt: evaluationAuthorPrompt(input.binding.taskSpec),
+          prompt: authorPrompt(input.binding.taskSpec, null),
           cwd: input.worktreePath,
           artifactDirectory: resolve(input.artifactDirectory, `author-attempt-${attempt}`),
           outputSchemaPath: defaultRoleOutputSchemas().author,
@@ -114,16 +115,4 @@ function selectAuthor(options: FullTaskExecutorOptions, providerOrder: readonly 
     if (match) return options.adapters[match]!;
   }
   return options.adapters[options.defaultFamily]!;
-}
-
-function evaluationAuthorPrompt(task: TaskSpec): string {
-  return [
-    `Task: ${task.id}`,
-    `Goal: ${task.goal}`,
-    "Acceptance:",
-    ...task.acceptance.map((item) => `- ${item}`),
-    "Work only in the current worktree. Edit files only; do not run git add, git commit, or change Git metadata.",
-    "Leave a non-empty working diff for the Harness to inspect and commit deterministically.",
-    "Return only a concise summary and the changedFiles array required by the Author output schema.",
-  ].join("\n");
 }
