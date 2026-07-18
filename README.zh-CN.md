@@ -133,9 +133,51 @@ Candidate Memory、Champion/Challenger、Offline Compare、Shadow 和低风险 C
 npm run loop -- metrics summary
 npm run loop -- eval readiness
 npm run loop -- replay --run-id <RUN_ID> --mode verify-only
+npm run loop -- eval compare list --project <PROJECT_SCOPE>
 npm run loop -- memory list
 npm run loop -- config champion --project <PROJECT_SCOPE>
 npm run loop -- canary status
+```
+
+## Full-task Replay 与可执行 Offline Compare
+
+Verify-only Replay 只重验历史 Commit；Full-task Replay 会在钉住 Baseline Commit 的隔离
+Evaluation Worktree 里重新执行整个任务（Author 产出 → Harness 提交 → 真实验证命令），
+全程不写 `state.sqlite`。变体配置中的 `providerOrder`、`retryLimit`、`timeoutMs`
+会真实生效，因此比较测量的是配置差异而不是提示词漂移。
+
+```bash
+# 从真实 Run 导出带 source 指针的 Historical Dataset（不改动检入的 eval/ 目录）
+npm run loop -- eval dataset export --run-id <RUN_ID> --id <DATASET_ID> --out <FILE>
+
+# Full-task Replay：默认使用当前 Active Champion，或用 --variant-id 显式指定
+npm run loop -- replay --run-id <RUN_ID> --mode full [--variant-id <VARIANT_ID>]
+
+# 对 Champion 与 Challenger 各跑 Full-task Replay，落库真实 Offline Comparison；
+# 数据集任务缺 source 指针或不可完整重放时立即中止（fail-closed）
+npm run loop -- eval compare run --id <COMPARISON_ID> --proposal-id <PROPOSAL_ID> [--dataset-dir <DIR>]
+```
+
+Change Proposal 只允许已真实接线的 Target（`provider-routing`、`retry-policy`、
+`timeout-policy`）；其余词汇表条目在对应 Runtime 接线与契约测试落地前会被
+`unsupported-runtime-target` 拒绝，杜绝「晋升一个从不生效的配置」。
+
+## Canary 分配与观测的事实来源
+
+`canary assign` 的 Policy 完全由人工批准记录推导（流量比例、允许项目、任务上限、
+时间窗、额外预算），环境变量不控制任何范围；Assignment 落库 `approvalId`、
+`policyHash` 与 `expiresAt`。`canary observe` 只接受标识符：它校验正式 Run Binding
+与 Assignment 的绑定关系，导出该 Run 的脱敏事实，再确定性投影
+ready/done/verificationFailures/postMergeFailures/humanEscalation/latency/tokens——
+操作者无法口述运行结果。
+
+```bash
+npm run loop -- canary approve --id <APPROVAL_ID> --proposal-id <PROPOSAL_ID> \
+  --challenger-id <VARIANT_ID> --approved-by <WHO> --reason <WHY> \
+  --expires-at <ISO_TIMESTAMP> [--basis-points N] [--maximum-tasks N]
+npm run loop -- canary assign --id <ASSIGNMENT_ID> --comparison-id <COMPARISON_ID> \
+  --task-key <TASK_ID> --risk low --approval-id <APPROVAL_ID>
+npm run loop -- canary observe --id <OBSERVATION_ID> --assignment-id <ASSIGNMENT_ID> --run-id <RUN_ID>
 ```
 
 ## Outbox 邮件通知与 Metrics Digest
