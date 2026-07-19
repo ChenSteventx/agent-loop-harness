@@ -97,11 +97,11 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     return signalled;
   }
 
-  private identity(): ProviderIdentity {
+  private identity(model: string | null = this.model): ProviderIdentity {
     return {
       provider: "anthropic-claude-code",
-      model: this.model,
-      modelFamily: this.modelFamily,
+      model,
+      modelFamily: model === this.model ? this.modelFamily : inferClaudeModelFamily(model),
       executable: this.executable,
       version: this.version,
     };
@@ -115,9 +115,10 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
     const finalOutputPath = resolve(artifactDirectory, "final.json");
     const stderrPath = resolve(artifactDirectory, "stderr.log");
     const schema = readFileSync(resolve(request.outputSchemaPath), "utf8");
+    const model = request.model ?? this.model;
     const args = buildClaudeCodeArgs(
       this.baseArgs,
-      this.model,
+      model,
       schema,
       resumeSessionId,
       request.workspaceAccess ?? "workspace-write",
@@ -190,7 +191,7 @@ export class ClaudeCodeAdapter implements ProviderAdapter {
       invocationId: request.invocationId,
       ok,
       cancelled,
-      identity: this.identity(),
+      identity: this.identity(model),
       threadId: sessionId,
       events: envelope ? [envelope] : [],
       finalOutput,

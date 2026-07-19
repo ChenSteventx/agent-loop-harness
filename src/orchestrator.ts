@@ -698,6 +698,7 @@ export class Orchestrator {
       artifactDirectory: resolve(this.loopHome, "runs", runId, "explorer"),
       outputSchemaPath: this.roleOutputSchemas.explorer,
       maximumPromptBytes: binding.budget.maximumPromptBytes,
+      model: binding.runtimeConfiguration?.roleModels["explorer"] ?? null,
     });
     const selected = supervised?.outcome?.selectedAdapterIndex === null || supervised?.outcome?.selectedAdapterIndex === undefined
       ? null
@@ -836,6 +837,8 @@ export class Orchestrator {
       outputSchemaPath: this.roleOutputSchemas.author,
       workspaceAccess: "workspace-write",
       allowedRepositoryRoots: [binding.worktreePath],
+      // Repair is the same writer seat, so it uses the author's model.
+      model: binding.runtimeConfiguration?.roleModels["author"] ?? null,
     };
     const persistence = this.providerProfile
       ? withFallbackOutbox({
@@ -1159,6 +1162,7 @@ export class Orchestrator {
         maximumPromptBytes: binding.budget.maximumPromptBytes,
         artifactDirectory: resolve(reviewDirectory, "artifacts"),
         outputSchemaPath: this.roleOutputSchemas.reviewer,
+        model: binding.runtimeConfiguration?.roleModels["reviewer"] ?? null,
       });
       const outcome = supervised.outcome;
       const selected = outcome?.selectedAdapterIndex === null || outcome?.selectedAdapterIndex === undefined

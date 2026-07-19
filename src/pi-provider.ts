@@ -73,8 +73,11 @@ export class PiAdapter implements ProviderAdapter {
     return signalled;
   }
 
-  private identity(): ProviderIdentity {
+  private identity(overrideModelId?: string): ProviderIdentity {
     const model = this.probedModel ?? this.config.routes[this.config.route];
+    if (overrideModelId !== undefined && overrideModelId !== model.id) {
+      return { provider: this.config.provider, model: overrideModelId, modelDisplayName: null, executable: this.executable, version: this.version };
+    }
     return { provider: this.config.provider, model: model.id, modelDisplayName: model.displayName ?? null, executable: this.executable, version: this.version };
   }
 
@@ -86,7 +89,7 @@ export class PiAdapter implements ProviderAdapter {
     const finalOutputPath = resolve(artifactDirectory, "final.json");
     const stderrPath = resolve(artifactDirectory, "stderr.log");
     const schema = readFileSync(resolve(request.outputSchemaPath), "utf8");
-    const model = this.config.routes[this.config.route].id;
+    const model = request.model ?? this.config.routes[this.config.route].id;
     const args = [...this.baseArgs, ...(this.rpc ? ["--mode", "rpc"] : ["--json"]), "--provider", this.config.provider, "--model", model];
     const started = Date.now();
     let stderr = "";
@@ -124,7 +127,7 @@ export class PiAdapter implements ProviderAdapter {
     if (finalOutput !== null) writeFileSync(finalOutputPath, JSON.stringify(finalOutput));
     const ok = completion.exitCode === 0 && !timedOut && !cancelled && !malformed && finalOutput !== null;
     const failureClass: ProviderFailureClass | null = ok ? null : timedOut ? "timeout" : completion.exitCode === 0 && (malformed || finalOutput === null) ? "invalid_output" : classifyProviderFailure(`${stderr}\n${eventText}`);
-    return { invocationId: request.invocationId, ok, cancelled, identity: this.identity(), threadId: null, events, finalOutput, stderr, exitCode: completion.exitCode, signal: completion.signal, durationMs: Date.now() - started, usage, failureClass, eventsPath, finalOutputPath, stderrPath };
+    return { invocationId: request.invocationId, ok, cancelled, identity: this.identity(model), threadId: null, events, finalOutput, stderr, exitCode: completion.exitCode, signal: completion.signal, durationMs: Date.now() - started, usage, failureClass, eventsPath, finalOutputPath, stderrPath };
   }
 }
 

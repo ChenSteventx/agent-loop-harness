@@ -192,6 +192,19 @@ describe("controlled Champion and Challenger evolution", () => {
       patch: { promptVariant: "acceptance-first" },
       datasets: catalog.list("proposal"),
     }).patch.promptVariant).toBe("acceptance-first");
+    // role-model-selection is wired, but only known agent roles may be keyed.
+    expect(() => createChangeProposal({
+      ...base,
+      target: "role-model-selection",
+      patch: { roleModels: { janitor: "some-model" } },
+      datasets: catalog.list("proposal"),
+    })).toThrow("unknown role");
+    expect(createChangeProposal({
+      ...base,
+      target: "role-model-selection",
+      patch: { roleModels: { author: "challenger-model" } },
+      datasets: catalog.list("proposal"),
+    }).patch.roleModels).toEqual({ author: "challenger-model" });
     expect(() => createChangeProposal({
       ...base,
       target: "retry-policy",

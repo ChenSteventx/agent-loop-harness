@@ -47,6 +47,7 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
           outputSchemaPath: defaultRoleOutputSchemas().author,
           workspaceAccess: "workspace-write",
           allowedRepositoryRoots: [input.worktreePath],
+          model: configuration.roleModels["author"] ?? null,
         },
         legacyProvider: adapter,
         candidates: [],

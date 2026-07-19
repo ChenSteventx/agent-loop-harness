@@ -1,7 +1,7 @@
 import { operationInputHash } from "../bindings.js";
 import type { OfflineComparison } from "../evaluation/compare.js";
 import type { EvaluationDataset } from "../evaluation/datasets.js";
-import { authorPromptVariants } from "../roles.js";
+import { agentRoles, authorPromptVariants } from "../roles.js";
 import type { Risk } from "../routing.js";
 
 export const evolutionTargets = [
@@ -23,6 +23,7 @@ export type EvolutionTarget = (typeof evolutionTargets)[number];
 export const runtimeWiredTargets: readonly EvolutionTarget[] = [
   "prompt-variant",
   "provider-routing",
+  "role-model-selection",
   "retry-policy",
   "timeout-policy",
 ];
@@ -386,6 +387,14 @@ function validateConfiguration(configuration: EvolutionConfiguration): void {
   if (configuration.promptVariant !== undefined &&
       !authorPromptVariants.includes(configuration.promptVariant)) {
     throw new Error(`Author prompt variant is not registered: ${configuration.promptVariant}`);
+  }
+  for (const [role, model] of Object.entries(configuration.roleModels)) {
+    if (!(agentRoles as readonly string[]).includes(role)) {
+      throw new Error(`Role model selection names an unknown role: ${role}`);
+    }
+    if (!model.trim() || model.length > 128) {
+      throw new Error(`Role model for ${role} must be non-empty and at most 128 characters`);
+    }
   }
   if ((configuration.promptVariant !== undefined && !configuration.promptVariant.trim()) ||
       (configuration.contextRanking !== undefined &&

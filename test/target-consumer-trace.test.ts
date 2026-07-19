@@ -16,6 +16,12 @@ const consumerTraces: Record<string, Array<[string, string]>> = {
     ["src/orchestrator.ts", "orderProviderCandidates(binding, workspaceRoleCandidates"],
     ["src/full-task-executor.ts", "selectAuthor(options, configuration.providerOrder)"],
   ],
+  "role-model-selection": [
+    ["src/orchestrator.ts", 'model: binding.runtimeConfiguration?.roleModels["author"] ?? null'],
+    ["src/orchestrator.ts", 'model: binding.runtimeConfiguration?.roleModels["reviewer"] ?? null'],
+    ["src/orchestrator.ts", 'model: binding.runtimeConfiguration?.roleModels["explorer"] ?? null'],
+    ["src/full-task-executor.ts", 'model: configuration.roleModels["author"] ?? null'],
+  ],
   "retry-policy": [
     ["src/orchestrator.ts", "maxAttempts: (binding.runtimeConfiguration?.retryLimit ?? 1) + 1"],
     ["src/full-task-executor.ts", "configuration.retryLimit"],

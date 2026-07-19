@@ -52,6 +52,11 @@ export interface ProviderRunRequest {
   contextBudget?: number;
   additionalWritableDirectories?: readonly string[];
   maximumPromptBytes?: number;
+  // Per-invocation model override from the run's frozen configuration
+  // (role-model-selection). Adapters must honor it in the spawned arguments
+  // AND report it in the result identity, or evidence would record the
+  // constructor model while a different one produced the output.
+  model?: string | null;
 }
 
 export interface ProviderUsage {
@@ -207,10 +212,10 @@ export class CodexCliAdapter implements ProviderAdapter {
     return signalled;
   }
 
-  private identity(): ProviderIdentity {
+  private identity(model: string | null = this.model): ProviderIdentity {
     return {
       provider: this.provider,
-      model: this.model,
+      model,
       executable: this.executable,
       version: this.version,
     };
@@ -225,6 +230,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     const eventsPath = resolve(artifactDirectory, "events.jsonl");
     const finalOutputPath = resolve(artifactDirectory, "final.json");
     const stderrPath = resolve(artifactDirectory, "stderr.log");
+    const model = request.model ?? this.model;
     const args = [
       ...this.baseArgs,
       "exec",
@@ -233,7 +239,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       "--json",
       "--sandbox",
       request.workspaceAccess ?? this.sandbox,
-      ...(this.model ? ["--model", this.model] : []),
+      ...(model ? ["--model", model] : []),
       ...additionalWritableDirectoryArgs(
         request.workspaceAccess === "read-only" ? undefined : request.additionalWritableDirectories,
       ),
@@ -355,7 +361,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       invocationId: request.invocationId,
       ok,
       cancelled,
-      identity: this.identity(),
+      identity: this.identity(model),
       threadId,
       events,
       finalOutput,
