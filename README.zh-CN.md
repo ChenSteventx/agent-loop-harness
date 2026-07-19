@@ -23,6 +23,14 @@ node automation/continue.mjs phase-1
 node automation/status.mjs
 ```
 
+## 安装为命令与 Skill
+
+`npm i -g .` 把 harness 装成 `agent-loop` 命令（本仓仍保持 private，不发布 npm）；
+不装则用 `npm run loop --` 从检出目录跑。`skills/agent-loop/` 是一个 Claude Code
+skill，驱动单次受限运行并如实汇报 harness 裁定（确定性权威：提交与裁定归 harness）；
+`ln -s "$(pwd)/skills/agent-loop" ~/.claude/skills/agent-loop` 激活后用 `/agent-loop`
+调用，详见 `skills/README.md`。
+
 也可使用 npm 别名：
 
 ```bash
@@ -156,6 +164,16 @@ npm run loop -- replay --run-id <RUN_ID> --mode full [--variant-id <VARIANT_ID>]
 # 对 Champion 与 Challenger 各跑 Full-task Replay，落库真实 Offline Comparison；
 # 数据集任务缺 source 指针或不可完整重放时立即中止（fail-closed）
 npm run loop -- eval compare run --id <COMPARISON_ID> --proposal-id <PROPOSAL_ID> [--dataset-dir <DIR>]
+```
+
+整套演进周期可纯 CLI 驱动，无需 seed 脚本：`config champion-init` 建初始
+Champion（在任何正式 Run 之前就能建，只开 Evaluation 库、拒绝覆盖已有
+Champion），`proposal create --dataset-dir` 让提案引用自定义数据集目录。之后
+`proposal approve` / `proposal challenger` / `eval compare run` 即可跑完
+Champion→提案→Challenger→比较。
+
+```bash
+npm run loop -- config champion-init --project <PROJECT_SCOPE> [--version <V>] [--config <JSON>]
 ```
 
 Change Proposal 只允许已真实接线的 Target（`provider-routing`、`retry-policy`、

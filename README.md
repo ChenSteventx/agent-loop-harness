@@ -23,6 +23,9 @@ cd agent-loop-harness
 npm ci
 npm run typecheck && npm test   # optional but recommended
 
+# Optional: install as a command (agent-loop). Otherwise use `npm run loop --`.
+npm i -g .
+
 # A task is a small YAML file inside the target repository:
 cat > /path/to/your-repo/task.yaml <<'YAML'
 id: HELLO-1
@@ -38,12 +41,22 @@ YAML
 # Run the bounded loop: explore -> author -> harness-owned commit ->
 # real verification -> (review when risk demands it) -> ready
 # (--template reviewed escalates above the risk floor; downgrades are rejected)
-npm run loop -- run --task /path/to/your-repo/task.yaml --repository /path/to/your-repo
+agent-loop run --run-id r1 --task /path/to/your-repo/task.yaml --repository /path/to/your-repo
 
 # Inspect durable state, plus the derived view (next action, proof gaps,
 # budget usage, typed recovery):
-npm run loop -- status --run-id <RUN_ID> --derived
+agent-loop status --run-id r1 --derived
 ```
+
+Commands are shown as `agent-loop <...>`; from a checkout without the global
+install, use `npm run loop -- <...>` instead.
+
+## Claude Code skill
+
+`skills/agent-loop/` is a Claude Code skill that drives a single bounded run
+and reports the harness verdict faithfully. Activate it with
+`ln -s "$(pwd)/skills/agent-loop" ~/.claude/skills/agent-loop`, then invoke
+`/agent-loop` (see `skills/README.md`).
 
 The harness never merges. After you merge the ready candidate yourself:
 
