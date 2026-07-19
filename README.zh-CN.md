@@ -180,6 +180,42 @@ npm run loop -- canary assign --id <ASSIGNMENT_ID> --comparison-id <COMPARISON_I
 npm run loop -- canary observe --id <OBSERVATION_ID> --assignment-id <ASSIGNMENT_ID> --run-id <RUN_ID>
 ```
 
+## 派生视图与类型化恢复处置
+
+`status --derived` 在持久状态之外输出一份只读派生视图：下一步动作、证据缺口
+快照（不触发任何写回或对账）、预算使用情况，以及阻塞 Run 的类型化恢复处置。
+恢复处置是四选一的封闭联合：`retryable`（含建议等待时间）、`already-committed`、
+`human-action-required`（含具体动作）、`terminal`——消费方按类型分支，不再解析
+自由文本。
+
+```bash
+npm run loop -- status --run-id <RUN_ID> --derived
+```
+
+## 声明式项目接入（非 Node 项目）
+
+多数项目不需要写 TypeScript Adapter，一份 JSON 配置即可接入：
+
+```bash
+cat > project.json <<'JSON'
+{
+  "name": "python-service",
+  "policyVersion": "python-service/v1",
+  "sensitivePathSegments": ["payments/", "auth/"],
+  "rewriteNodeCommands": false
+}
+JSON
+
+npm run loop -- --project-config project.json run --task ... --repository ...
+```
+
+验证命令来自任务文件本身，任何能把检查表达为 argv 命令的技术栈都能接入
+（也可用环境变量 `AGENT_LOOP_PROJECT_CONFIG` 指定路径）。边界与既有 Adapter
+完全一致：配置表达不了 Adapter 端口之外的任何权力——没有 Git 元数据权、
+没有裁定权、没有晋升权。`sensitivePathSegments` 必填，「没有敏感路径」必须
+显式写 `[]`；校验通过的配置内容会哈希进生效的 Policy 版本并冻结进 Run
+Binding，恢复时改配置文件会直接阻塞 Run，而不是悄悄改判风险。
+
 ## Outbox 邮件通知与 Metrics Digest
 
 通知由两个彼此独立的 SQLite Transactional Outbox 保存：正式 Run 通知写入
