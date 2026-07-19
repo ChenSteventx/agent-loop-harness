@@ -176,6 +176,13 @@ Champion→提案→Challenger→比较。
 npm run loop -- config champion-init --project <PROJECT_SCOPE> [--version <V>] [--config <JSON>]
 ```
 
+两点边界要清楚：`champion-init` 是引导步，不带审批记录——不传 `--config` 时装的是
+基线配置（安全）；`--config` 会安装一份自定义运行时配置且不走演进评审，请谨慎使用。
+`proposal create --dataset-dir` 目录里的数据集 `kind` 须诚实（同 sqlite 完整性由操作者负责）；
+`kind: holdout` 会被过滤，而随包 Holdout 任务被改标混入会按任务身份被交叉核验拦下。
+另外纯 CLI 的比较目前只支持 `requireHoldout: false`（演示/夹具规模）；把可信 Holdout
+注入比较以满足默认 `requireHoldout: true` 做生产级晋升，仍是已知待补项。
+
 Change Proposal 只允许已真实接线的 Target（`provider-routing`、`retry-policy`、
 `timeout-policy`）；其余词汇表条目在对应 Runtime 接线与契约测试落地前会被
 `unsupported-runtime-target` 拒绝，杜绝「晋升一个从不生效的配置」。

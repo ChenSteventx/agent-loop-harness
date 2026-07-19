@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -70,5 +70,30 @@ describe("evolution cycle CLI completeness", () => {
       "--rationale", "empty dir must fail", "--source-facts", "fact-a", "--minimum-samples", "1",
       "--dataset-dir", emptyDir]);
     expect(fromEmpty.status).not.toBe(0);
+  });
+
+  it("rejects a proposal whose dataset relabels a trusted Holdout Task", () => {
+    const loopHome = temporaryDirectory("agent-loop-relabel-holdout-");
+    expect(cli(loopHome, ["init"]).status).toBe(0);
+    expect(cli(loopHome, ["config", "champion-init", "--project", "generic-node"]).status).toBe(0);
+
+    // Take a real task identity from the shipped Holdout set and relabel its
+    // dataset kind to a proposal-usable one — the kind filter alone would let
+    // it through, so the identity cross-check must catch it.
+    const holdout = JSON.parse(readFileSync(resolve("eval/holdout-tasks.json"), "utf8")) as {
+      tasks: Array<{ id: string; projectScope: string; inputHash: string; expected: unknown }>;
+    };
+    const smuggler = temporaryDirectory("agent-loop-smuggled-datasets-");
+    writeFileSync(join(smuggler, "relabeled.json"), JSON.stringify({
+      schemaVersion: 1, id: "relabeled-holdout", kind: "golden", version: "1",
+      dataSource: "fixture", tasks: holdout.tasks,
+    }));
+
+    const result = cli(loopHome, ["proposal", "create", "--id", "smuggled-proposal", "--project", "generic-node",
+      "--target", "retry-policy", "--patch", JSON.stringify({ retryLimit: 2 }),
+      "--rationale", "must be rejected", "--source-facts", "fact-a", "--minimum-samples", "1",
+      "--dataset-dir", smuggler]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("Holdout Task");
   });
 });

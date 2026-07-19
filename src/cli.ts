@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { Orchestrator, defaultLoopHome } from "./orchestrator.js";
 import {
@@ -21,7 +22,7 @@ import { exportRunFacts } from "./evaluation/facts.js";
 import { projectRunMetrics, summarizeMetrics } from "./evaluation/metrics.js";
 import { evaluateReadiness } from "./evaluation/readiness.js";
 import { EvaluationStore } from "./evaluation/store.js";
-import { DatasetCatalog, historicalDataset } from "./evaluation/datasets.js";
+import { DatasetCatalog, historicalDataset, type EvaluationDataset } from "./evaluation/datasets.js";
 import {
   compareVariants,
   runShadowEvaluation,
@@ -404,6 +405,8 @@ proposal
       const champion = store.activeChampion(options.project);
       if (!champion) throw new Error(`No active Champion for project ${options.project}`);
       const target = parseEvolutionTarget(options.target);
+      const datasets = DatasetCatalog.loadDirectory(resolve(options.datasetDir)).list("proposal");
+      assertNoHoldoutTasks(datasets);
       print(store.installChangeProposal(createChangeProposal({
         id: options.id,
         projectScope: options.project,
@@ -412,7 +415,7 @@ proposal
         patch: parseObject(options.patch),
         rationale: options.rationale,
         sourceFactHashes: csv(options.sourceFacts),
-        datasets: DatasetCatalog.loadDirectory(resolve(options.datasetDir)).list("proposal"),
+        datasets,
         metrics: ["readySuccessRate", "doneSuccessRate", "verificationFailures"],
         minimumSamples: positiveInteger(options.minimumSamples, "minimum samples"),
       })));
@@ -1024,6 +1027,41 @@ function print(value: unknown): void {
 function parseProviderProfileName(value: string): ProviderProfileName {
   if (providerProfileNames.includes(value as ProviderProfileName)) return value as ProviderProfileName;
   throw new Error(`Unknown Provider profile: ${value}`);
+}
+
+// Defence in depth for the holdout-isolation invariant once proposal datasets
+// can come from an arbitrary --dataset-dir: DatasetCatalog already drops
+// self-declared kind:"holdout", but a shipped Holdout Task relabeled to
+// another kind would slip through. Reject any proposal task whose content
+// identity matches the packaged trusted Holdout set (resolved relative to this
+// module, never the CWD). Operator-supplied datasets must still carry honest
+// kinds; this only re-anchors the invariant the built-in Holdouts assert.
+function trustedHoldoutTaskKeys(): Set<string> {
+  const evalDirectory = fileURLToPath(new URL("../eval", import.meta.url));
+  if (!existsSync(evalDirectory)) return new Set();
+  const keys = new Set<string>();
+  for (const dataset of DatasetCatalog.loadDirectory(evalDirectory).list("comparison")) {
+    if (dataset.kind !== "holdout") continue;
+    for (const task of dataset.tasks) {
+      if (task.inputHash) keys.add(`hash:${task.inputHash}`);
+      keys.add(`id:${task.id}`);
+    }
+  }
+  return keys;
+}
+
+function assertNoHoldoutTasks(datasets: readonly EvaluationDataset[]): void {
+  const holdoutKeys = trustedHoldoutTaskKeys();
+  if (holdoutKeys.size === 0) return;
+  for (const dataset of datasets) {
+    for (const task of dataset.tasks) {
+      if ((task.inputHash && holdoutKeys.has(`hash:${task.inputHash}`)) || holdoutKeys.has(`id:${task.id}`)) {
+        throw new Error(
+          `Dataset ${dataset.id} contains a Holdout Task (${task.id}); Holdout Tasks are inaccessible to proposal generation`,
+        );
+      }
+    }
+  }
 }
 
 function parseExecutionTemplate(value: string | undefined): ExecutionTemplateName | undefined {

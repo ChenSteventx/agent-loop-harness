@@ -89,7 +89,11 @@ function canonicalValue(value: unknown): unknown {
   }
   if (Array.isArray(value)) return value.map(canonicalValue);
   if (typeof value === "object") {
-    const result: Record<string, unknown> = {};
+    // Null-prototype accumulator so a key named "__proto__" (a real own
+    // property after JSON.parse) is assigned as data and serialized, instead
+    // of being swallowed by Object.prototype's __proto__ setter — which would
+    // silently drop it and let two distinct values collide to one hash.
+    const result: Record<string, unknown> = Object.create(null);
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       const child = (value as Record<string, unknown>)[key];
       if (child !== undefined) result[key] = canonicalValue(child);

@@ -38,6 +38,18 @@ afterEach(() => {
 });
 
 describe("canonical run and evidence bindings", () => {
+  it("preserves an own __proto__ key so distinct values cannot collide to one hash", () => {
+    // JSON.parse makes __proto__ a real own property; a naive accumulator would
+    // route it through Object.prototype's setter and drop it from the output.
+    const withProto = JSON.parse('{"__proto__": "danger", "a": 1}') as unknown;
+    expect(canonicalJson(withProto)).toBe('{"__proto__":"danger","a":1}');
+    expect(operationInputHash(withProto)).not.toBe(operationInputHash({ a: 1 }));
+    expect(operationInputHash(JSON.parse('{"__proto__":"x"}')))
+      .not.toBe(operationInputHash(JSON.parse('{"__proto__":"y"}')));
+    // A plain object without __proto__ still hashes exactly as before.
+    expect(canonicalJson({ z: 1, a: { y: 2, x: 3 } })).toBe('{"a":{"x":3,"y":2},"z":1}');
+  });
+
   it("hashes semantic objects deterministically and changes for every authoritative dependency", () => {
     expect(canonicalJson({ z: 1, a: { y: 2, x: 3 } })).toBe('{"a":{"x":3,"y":2},"z":1}');
     const base = evidenceDependencies({
