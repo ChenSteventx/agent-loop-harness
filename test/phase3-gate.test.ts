@@ -41,6 +41,11 @@ const gates = [
   [32, "the vertical slice runs compare, shadow, canary, and rollback through the CLI", "test/phase3-vertical-slice.test.ts", "slice-rollback"],
   [33, "proposal evaluation requires persisted comparison evidence", "src/cli.ts", "requires a persisted completed Comparison"],
   [34, "production readiness stays closed on fixture-scale data", "test/phase3-vertical-slice.test.ts", "canaryReady: false"],
+  [35, "prompt variants come from a bounded registry and keep the safety boundary", "test/runtime-wired-targets.test.ts", "Unregistered author prompt variant"],
+  [36, "role model overrides are honored in arguments and reported identity", "test/runtime-wired-targets.test.ts", "reports the overridden model in the Codex result identity"],
+  [37, "template escalation cannot downgrade below the risk floor", "test/runtime-wired-targets.test.ts", "No valid execution template"],
+  [38, "memory advisories are frozen into the binding and byte-bounded", "test/runtime-wired-targets.test.ts", "freezes a byte-bounded advisory into the run binding"],
+  [39, "every runtime-wired target traces to consumers in both runtimes", "test/target-consumer-trace.test.ts", "locks a source-level consumer for every runtime-wired target"],
 ] as const;
 
 describe("Phase 3 final gate traceability", () => {
