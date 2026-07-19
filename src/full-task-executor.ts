@@ -9,6 +9,7 @@ import { assertPromptWithinBudget, boundAdvisoryText } from "./budget.js";
 import { authorPrompt } from "./roles.js";
 import { WriterExecutor, writerBoundaryViolation } from "./writer-executor.js";
 import { safeEnvironment, type FullTaskExecutor } from "./evaluation/evaluators.js";
+import { repositoryScopeOf } from "./evaluation/facts.js";
 
 export interface FullTaskExecutorOptions {
   adapters: Readonly<Record<string, ProviderAdapter>>;
@@ -17,8 +18,9 @@ export interface FullTaskExecutorOptions {
   commandRunner?: CommandRunner;
   // memory-retrieval target: evaluated per variant configuration so an
   // offline comparison can measure retrieval on versus off for the same
-  // historical task.
-  memoryRetriever?: (input: { projectScope: string; task: TaskSpec }) => string | null;
+  // historical task. repositoryScope confines matches to memory derived
+  // from the same repository.
+  memoryRetriever?: (input: { projectScope: string; repositoryScope: string; task: TaskSpec }) => string | null;
 }
 
 export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTaskExecutor {
@@ -37,6 +39,7 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
       ? boundAdvisoryText(
         options.memoryRetriever?.({
           projectScope: input.binding.projectAdapterName,
+          repositoryScope: repositoryScopeOf(input.binding.sourceRepository),
           task: input.binding.taskSpec,
         }) ?? null,
         input.binding.budget.maximumExplorerAdvisoryBytes,

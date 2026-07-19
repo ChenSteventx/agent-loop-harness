@@ -50,6 +50,13 @@ describe("prompt-variant runtime wiring", () => {
     expect(authorPrompt(task, null, {})).toBe(authorPrompt(task, null));
     expect(() => authorPrompt(task, null, { variant: "concise-v2" }))
       .toThrow("Unregistered author prompt variant");
+    // Inherited object-prototype names must not resolve to builders: a
+    // persisted "toString" variant would otherwise render a boundary-free
+    // prompt instead of failing closed.
+    for (const inherited of ["toString", "valueOf", "constructor", "hasOwnProperty"]) {
+      expect(() => authorPrompt(task, null, { variant: inherited }))
+        .toThrow("Unregistered author prompt variant");
+    }
   });
 
   it("keeps advisories in every variant", () => {
@@ -227,5 +234,30 @@ describe("memory-retrieval runtime wiring", () => {
     expect(binding.memoryAdvisory).toBe("01234567");
     expect(boundAdvisoryText(null, 8)).toBeNull();
     expect(boundAdvisoryText("short", 8)).toBe("short");
+  });
+
+  it("honors the byte bound even when the cut tears a multibyte character", () => {
+    // 4 ASCII bytes + é (2 bytes): a cut at 5 tears é into a replacement
+    // character (3 bytes encoded) — the result must still fit the bound.
+    for (const [text, limit] of [["abcdé", 5], ["ééééé", 7], ["a🙂b", 3]] as const) {
+      const bounded = boundAdvisoryText(text, limit);
+      expect(Buffer.byteLength(bounded ?? "", "utf8")).toBeLessThanOrEqual(limit);
+    }
+  });
+
+  it("retrieves only memory derived from the same repository", () => {
+    const scoped = {
+      listCandidateMemories: () => [
+        approvedMemory({ id: "repo-a", repositoryScope: "scope-a" }),
+        approvedMemory({ id: "repo-b", repositoryScope: "scope-b", summary: "greeting punctuation from another repository" }),
+      ],
+    } as never;
+    const results = retrieveApprovedMemory(scoped, {
+      projectScope: "generic-node",
+      repositoryScope: "scope-a",
+      query: "prove wired greeting punctuation",
+      enabled: true,
+    });
+    expect(results.map((result) => result.memory.id)).toEqual(["repo-a"]);
   });
 });

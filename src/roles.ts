@@ -57,8 +57,12 @@ export function authorPrompt(
   options: AuthorPromptOptions = {},
 ): string {
   const variant = options.variant ?? "baseline";
-  const builder = authorPromptBuilders[variant];
-  if (!builder) throw new Error(`Unregistered author prompt variant: ${variant}`);
+  // Own-property check: inherited names like "toString" must not resolve to
+  // Object.prototype functions and silently produce a boundary-free prompt.
+  if (!Object.hasOwn(authorPromptBuilders, variant)) {
+    throw new Error(`Unregistered author prompt variant: ${variant}`);
+  }
+  const builder = authorPromptBuilders[variant]!;
   return builder(task, [
     ...(explorerAdvisory ? [`Explorer advisory report: ${explorerAdvisory}`] : []),
     ...(options.memoryAdvisory ? [`Approved memory advisory: ${options.memoryAdvisory}`] : []),

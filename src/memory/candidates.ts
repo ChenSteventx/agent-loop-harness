@@ -76,7 +76,10 @@ export function deriveCandidateMemories(
 ): CandidateMemory[] {
   const now = options.now ?? new Date().toISOString();
   const expiresAt = addDays(now, options.ttlDays ?? 90);
-  const real = facts.filter((item) => item.source === "real" && item.run.binding);
+  // Fact bundles stored before repository scoping lack the identifier; they
+  // are excluded rather than grouped under a shared scope (fail-closed).
+  const real = facts.filter((item) => item.source === "real" && item.run.binding &&
+    typeof item.run.binding.repositoryScope === "string");
   const groups = new Map<string, MemoryGroup>();
   for (const fact of real) {
     const binding = fact.run.binding!;
@@ -90,6 +93,7 @@ export function deriveCandidateMemories(
       .map((finding) => finding.category);
     addGroup(groups, {
       projectScope: binding.projectAdapterName,
+      repositoryScope: binding.repositoryScope,
       kind: "failure-pattern",
       operationType: "verification",
       signature,
@@ -100,6 +104,7 @@ export function deriveCandidateMemories(
   for (const group of groups.values()) {
     group.counterexamples = real
       .filter((fact) => fact.run.binding!.projectAdapterName === group.projectScope &&
+        fact.run.binding!.repositoryScope === group.repositoryScope &&
         ["ready", "merged", "done"].includes(fact.run.status) &&
         group.signature.some((step) => fact.run.binding!.verificationStepIds.includes(step)) &&
         !fact.evidence.some((item) => item.kind === "verification_failure" &&
@@ -114,6 +119,7 @@ export function deriveCandidateMemories(
       : "unknown";
     return candidate({
       projectScope: group.projectScope,
+      repositoryScope: group.repositoryScope,
       kind: group.kind,
       operationType: group.operationType,
       summary: `Verification failure signature [${group.signature.join(", ")}] in ${group.projectScope}; ` +
@@ -241,7 +247,7 @@ export function renderMemoryAdvisory(
 
 export function retrieveApprovedMemory(
   repository: MemoryRepository,
-  input: { projectScope: string; query: string; enabled?: boolean; now?: string; limit?: number },
+  input: { projectScope: string; repositoryScope?: string; query: string; enabled?: boolean; now?: string; limit?: number },
 ): Array<{ memory: CandidateMemory; score: number; matchedTerms: string[] }> {
   if (input.enabled !== true) return [];
   const now = input.now ?? new Date().toISOString();
@@ -251,6 +257,11 @@ export function retrieveApprovedMemory(
   if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 20) throw new Error("Memory retrieval limit must be between 1 and 20");
   return repository.listCandidateMemories(input.projectScope)
     .filter((memory) => memory.status === "approved" && memory.expiresAt > now && memory.projectScope === input.projectScope)
+    // Repository isolation: when a scope is supplied (all runtime callers
+    // supply one), only memory derived from that exact repository may flow
+    // into its prompts. Legacy rows whose repositoryScope still mirrors the
+    // adapter name never match a hash — fail-closed for pre-scope memory.
+    .filter((memory) => input.repositoryScope === undefined || memory.repositoryScope === input.repositoryScope)
     .map((memory) => {
       const matchedTerms = memory.terms.filter((term) => queryTerms.includes(term));
       return { memory, score: matchedTerms.length / Math.max(memory.terms.length, 1), matchedTerms };
@@ -262,6 +273,7 @@ export function retrieveApprovedMemory(
 
 function candidate(input: {
   projectScope: string;
+  repositoryScope: string;
   kind: CandidateMemoryKind;
   operationType: string;
   summary: string;
@@ -280,7 +292,7 @@ function candidate(input: {
   const terms = tokenize(input.summary);
   const contentHash = operationInputHash({
     projectScope: input.projectScope,
-    repositoryScope: input.projectScope,
+    repositoryScope: input.repositoryScope,
     operationType: input.operationType,
     kind: input.kind,
     summary: input.summary,
@@ -291,7 +303,7 @@ function candidate(input: {
     schemaVersion: 1,
     id: `memory:${input.projectScope}:${input.kind}:${contentHash.slice(0, 16)}`,
     projectScope: input.projectScope,
-    repositoryScope: input.projectScope,
+    repositoryScope: input.repositoryScope,
     operationType: input.operationType,
     kind: input.kind,
     summary: input.summary,
@@ -318,6 +330,7 @@ function candidate(input: {
 
 interface MemoryGroup {
   projectScope: string;
+  repositoryScope: string;
   kind: CandidateMemoryKind;
   operationType: string;
   signature: string[];
@@ -334,6 +347,7 @@ function addGroup(
   groups: Map<string, MemoryGroup>,
   shape: {
     projectScope: string;
+    repositoryScope: string;
     kind: CandidateMemoryKind;
     operationType: string;
     signature: string[];
@@ -343,10 +357,10 @@ function addGroup(
   fact: SanitizedFactBundle,
   evidenceRefs: readonly string[],
 ): void {
-  const { projectScope, kind, operationType, signature } = shape;
-  const key = operationInputHash({ projectScope, kind, operationType, signature });
+  const { projectScope, repositoryScope, kind, operationType, signature } = shape;
+  const key = operationInputHash({ projectScope, repositoryScope, kind, operationType, signature });
   const group = groups.get(key) ?? {
-    projectScope, kind, operationType, signature,
+    projectScope, repositoryScope, kind, operationType, signature,
     policyVersions: new Set<string>(), confirmedCauses: new Set<string>(), counterexamples: [],
     facts: new Set<string>(), runs: new Set<string>(),
     commits: new Set<string>(), evidence: new Set<string>(),

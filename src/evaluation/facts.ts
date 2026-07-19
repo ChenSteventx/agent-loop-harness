@@ -2,6 +2,13 @@ import { operationInputHash } from "../bindings.js";
 import type { Event, Evidence, Operation, Run } from "../domain.js";
 import type { InvocationManifest } from "./manifests.js";
 
+// Repository identity for sanitized contexts: a hash of the (normalized)
+// source repository path, safe to store and to match against, never the
+// path itself. Memory retrieval requires an exact match on this value.
+export function repositoryScopeOf(sourceRepository: string): string {
+  return operationInputHash(sourceRepository);
+}
+
 export type FactSourceKind = "real" | "fixture";
 
 export interface FactHumanResolution {
@@ -95,6 +102,11 @@ export interface SanitizedFactBundle {
       providerProfile: string;
       projectAdapterName: string;
       policyVersion: string;
+      // Hash of the source repository path: identifies the repository for
+      // scoping (memory retrieval) without leaking the raw path into the
+      // sanitized bundle. Same clone → same scope; a re-clone at another
+      // path is a different scope by design (fail-closed).
+      repositoryScope: string;
       verificationStepIds: string[];
     };
   };
@@ -170,6 +182,7 @@ export function exportRunFacts(
         providerProfile: run.binding.providerProfile,
         projectAdapterName: run.binding.projectAdapterName,
         policyVersion: run.binding.policyVersion,
+        repositoryScope: repositoryScopeOf(run.binding.sourceRepository),
         verificationStepIds: run.binding.taskSpec.verification.map((step) => step.id),
       } : null,
     },

@@ -912,9 +912,10 @@ function createOrchestrator(loopHome: string): Orchestrator {
 // rendered as an explainable advisory. Query text is derived from the task
 // alone so the same task yields the same advisory for a given store state.
 function approvedMemoryRetriever(store: EvaluationStore) {
-  return (input: { projectScope: string; task: TaskSpec }): string | null =>
+  return (input: { projectScope: string; repositoryScope: string; task: TaskSpec }): string | null =>
     renderMemoryAdvisory(retrieveApprovedMemory(store, {
       projectScope: input.projectScope,
+      repositoryScope: input.repositoryScope,
       query: `${input.task.goal} ${input.task.acceptance.join(" ")}`,
       enabled: true,
       limit: 3,

@@ -18,6 +18,7 @@ import {
 } from "./finding-validator.js";
 import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { ProviderAdapter, ProviderRunRequest, ProviderRunResult } from "./provider.js";
+import { repositoryScopeOf } from "./evaluation/facts.js";
 import { loadTaskSpec } from "./project.js";
 import type { TaskSpec } from "./task-spec.js";
 import { authorPrompt } from "./roles.js";
@@ -109,8 +110,9 @@ export interface OrchestratorOptions {
   // memory-retrieval target: returns a rendered approved-memory advisory for
   // the task, or null. Consulted once at run creation and frozen into the
   // binding; absence of a retriever simply yields no advisory (fail-quiet
-  // for model input, never for evidence).
-  memoryRetriever?: (input: { projectScope: string; task: TaskSpec }) => string | null;
+  // for model input, never for evidence). repositoryScope confines matches
+  // to memory derived from the same repository.
+  memoryRetriever?: (input: { projectScope: string; repositoryScope: string; task: TaskSpec }) => string | null;
   faults?: {
     afterProviderCompletion?: () => void;
     afterHarnessCommit?: () => void;
@@ -196,7 +198,7 @@ export class Orchestrator {
   private readonly maxLoopSteps: number;
   private readonly runtimeConfigResolver: (Pick<RuntimeConfigResolver, "resolve"> &
     Partial<Pick<RuntimeConfigResolver, "close">>) | null;
-  private readonly memoryRetriever: ((input: { projectScope: string; task: TaskSpec }) => string | null) | null;
+  private readonly memoryRetriever: ((input: { projectScope: string; repositoryScope: string; task: TaskSpec }) => string | null) | null;
 
   constructor(options: OrchestratorOptions) {
     this.loopHome = resolve(options.loopHome ?? process.env.LOOP_HOME ?? defaultLoopHome());
@@ -249,7 +251,11 @@ export class Orchestrator {
       effectiveRisk,
     });
     const memoryAdvisory = runtimeConfiguration?.configuration?.memoryRetrievalEnabled
-      ? this.memoryRetriever?.({ projectScope: this.projectAdapter.name, task }) ?? null
+      ? this.memoryRetriever?.({
+        projectScope: this.projectAdapter.name,
+        repositoryScope: repositoryScopeOf(sourceGit.root),
+        task,
+      }) ?? null
       : null;
     const worktreePath = this.worktreePath(runId);
     const binding = createRunBinding({

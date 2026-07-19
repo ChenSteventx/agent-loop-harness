@@ -192,19 +192,39 @@ describe("controlled Champion and Challenger evolution", () => {
       patch: { promptVariant: "acceptance-first" },
       datasets: catalog.list("proposal"),
     }).patch.promptVariant).toBe("acceptance-first");
-    // role-model-selection is wired, but only known agent roles may be keyed.
+    // role-model-selection is wired, but proposals may only re-model the
+    // author seat — the only seat the offline evaluator can measure.
     expect(() => createChangeProposal({
       ...base,
       target: "role-model-selection",
       patch: { roleModels: { janitor: "some-model" } },
       datasets: catalog.list("proposal"),
-    })).toThrow("unknown role");
+    })).toThrow("only target the author role");
+    expect(() => createChangeProposal({
+      ...base,
+      target: "role-model-selection",
+      patch: { roleModels: { reviewer: "some-model" } },
+      datasets: catalog.list("proposal"),
+    })).toThrow("only target the author role");
+    expect(() => createChangeProposal({
+      ...base,
+      target: "role-model-selection",
+      patch: { roleModels: { author: "--config=evil" } },
+      datasets: catalog.list("proposal"),
+    })).toThrow("model-identifier grammar");
     expect(createChangeProposal({
       ...base,
       target: "role-model-selection",
       patch: { roleModels: { author: "challenger-model" } },
       datasets: catalog.list("proposal"),
     }).patch.roleModels).toEqual({ author: "challenger-model" });
+    // Runtime-wired but not offline-measurable: rubric proposals stay closed.
+    expect(() => createChangeProposal({
+      ...base,
+      target: "low-risk-review-rubric",
+      patch: { lowRiskReviewRubric: "check acceptance evidence" },
+      datasets: catalog.list("proposal"),
+    })).toThrow("unsupported-runtime-target");
     expect(() => createChangeProposal({
       ...base,
       target: "retry-policy",

@@ -43,6 +43,7 @@ function facts(id: string, factHash: string, projectScope = "generic-node"): San
         risk: "low",
         executionTemplate: "solo",
         providerProfile: "CODEX_PRIMARY",
+        repositoryScope: "repository-scope-1",
         projectAdapterName: projectScope,
         policyVersion: "generic-node/v2",
         verificationStepIds: ["test"],

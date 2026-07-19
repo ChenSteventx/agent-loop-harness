@@ -30,13 +30,6 @@ const consumerTraces: Record<string, Array<[string, string]>> = {
     ["src/orchestrator.ts", "runtimeConfiguration?.timeoutMs ?? 10 * 60_000"],
     ["src/full-task-executor.ts", "timeoutMs: configuration.timeoutMs"],
   ],
-  // Review only exists in the formal loop, so both consumers live there:
-  // the live reviewer input and the manifest re-render must stay identical.
-  "low-risk-review-rubric": [
-    ["src/orchestrator.ts", "lowRiskRubric: this.lowRiskRubric(binding)"],
-    ["src/orchestrator.ts", "lowRiskRubric: this.lowRiskRubric(run.binding)"],
-    ["src/reviewer.ts", "Low-risk review rubric: ${input.lowRiskRubric}"],
-  ],
   "memory-retrieval": [
     ["src/orchestrator.ts", "runtimeConfiguration?.configuration?.memoryRetrievalEnabled"],
     ["src/full-task-executor.ts", "configuration.memoryRetrievalEnabled"],
@@ -57,5 +50,17 @@ describe("promotion target to runtime consumer traceability", () => {
   it("keeps contextRanking wired even though it is not yet proposable", () => {
     const source = readFileSync(resolve("src/orchestrator.ts"), "utf8");
     expect(source).toContain("runtimeConfiguration?.contextRanking");
+  });
+
+  // Runtime-wired but not proposable: the offline evaluator runs no
+  // reviewer, so rubric proposals are rejected until it grows that seat.
+  // The wiring itself (live review + manifest re-render sharing one helper)
+  // must not silently disappear in the meantime.
+  it("keeps the low-risk rubric wired even though it is not yet proposable", () => {
+    const orchestrator = readFileSync(resolve("src/orchestrator.ts"), "utf8");
+    const reviewer = readFileSync(resolve("src/reviewer.ts"), "utf8");
+    expect(orchestrator).toContain("lowRiskRubric: this.lowRiskRubric(binding)");
+    expect(orchestrator).toContain("lowRiskRubric: this.lowRiskRubric(run.binding)");
+    expect(reviewer).toContain("Low-risk review rubric: ${input.lowRiskRubric}");
   });
 });

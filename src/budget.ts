@@ -78,9 +78,15 @@ export function boundedJson(value: unknown, maximumBytes: number): string {
 // character, which is harmless in a prompt) rather than failing the run.
 export function boundAdvisoryText(text: string | null, maximumBytes: number): string | null {
   if (text === null) return null;
-  const encoded = Buffer.from(text, "utf8");
-  if (encoded.byteLength <= maximumBytes) return text;
-  return encoded.subarray(0, Math.max(maximumBytes, 0)).toString("utf8");
+  if (Buffer.byteLength(text, "utf8") <= maximumBytes) return text;
+  // A byte-level cut can tear a multibyte code point; the replacement
+  // character it decodes to is wider than the torn bytes, so re-check and
+  // trim code points until the re-encoded result honors the bound.
+  let bounded = Buffer.from(text, "utf8").subarray(0, Math.max(maximumBytes, 0)).toString("utf8");
+  while (bounded.length > 0 && Buffer.byteLength(bounded, "utf8") > maximumBytes) {
+    bounded = bounded.slice(0, -1);
+  }
+  return bounded;
 }
 
 export function assertPromptWithinBudget(prompt: string, maximumBytes: number | undefined, role: string): void {

@@ -16,17 +16,20 @@ export const evolutionTargets = [
 ] as const;
 export type EvolutionTarget = (typeof evolutionTargets)[number];
 
-// The only targets whose configuration genuinely changes formal execution
-// today. Proposals for the other vocabulary entries are rejected until their
-// runtime wiring exists — otherwise a Challenger could be promoted on a
-// configuration that never takes effect, an empty evolution.
+// Targets that are BOTH wired into formal execution AND observable by the
+// full-task offline evaluator. low-risk-review-rubric is runtime-wired (the
+// reviewer prompt consumes it) but the evaluator runs no reviewer, so an
+// offline comparison could never measure it — promoting it on such a
+// comparison would be evidence-free. It becomes proposable when the
+// evaluator grows a reviewer seat; until then it is configured only through
+// a human-installed Champion configuration. The remaining vocabulary
+// entries are rejected because their runtime wiring does not exist at all.
 export const runtimeWiredTargets: readonly EvolutionTarget[] = [
   "prompt-variant",
   "provider-routing",
   "role-model-selection",
   "retry-policy",
   "timeout-policy",
-  "low-risk-review-rubric",
   "memory-retrieval",
 ];
 
@@ -382,6 +385,13 @@ function validatePatch(target: EvolutionTarget, patch: Partial<EvolutionConfigur
   };
   const keys = Object.keys(patch) as Array<keyof EvolutionConfiguration>;
   if (keys.length !== 1 || keys[0] !== allowed[target]) throw new Error(`Patch exceeds allowed target ${target}`);
+  if (target === "role-model-selection" && patch.roleModels &&
+      Object.keys(patch.roleModels).some((role) => role !== "author")) {
+    // The offline evaluator only seats an author; reviewer/explorer
+    // overrides are runtime-wired but not offline-measurable, so proposing
+    // them would promote on evidence that cannot exist.
+    throw new Error("Role model proposals may only target the author role");
+  }
   validateConfiguration({ ...defaultConfiguration(), ...patch });
 }
 
@@ -394,12 +404,17 @@ function validateConfiguration(configuration: EvolutionConfiguration): void {
     if (!(agentRoles as readonly string[]).includes(role)) {
       throw new Error(`Role model selection names an unknown role: ${role}`);
     }
-    if (!model.trim() || model.length > 128) {
-      throw new Error(`Role model for ${role} must be non-empty and at most 128 characters`);
+    // Conservative model-identifier grammar: no leading dash, whitespace, or
+    // control characters, so the value cannot masquerade as a provider CLI
+    // flag (argv arrays already prevent shell splitting).
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/u.test(model)) {
+      throw new Error(`Role model for ${role} must match a conservative model-identifier grammar`);
     }
   }
-  if (configuration.lowRiskReviewRubric !== undefined && configuration.lowRiskReviewRubric.length > 500) {
-    throw new Error("Low-risk review rubric must be at most 500 characters");
+  if (configuration.lowRiskReviewRubric !== undefined &&
+      (configuration.lowRiskReviewRubric.length > 500 ||
+        /[\r\n\u0000-\u001f]/u.test(configuration.lowRiskReviewRubric))) {
+    throw new Error("Low-risk review rubric must be a single line of at most 500 characters");
   }
   if ((configuration.promptVariant !== undefined && !configuration.promptVariant.trim()) ||
       (configuration.contextRanking !== undefined &&
