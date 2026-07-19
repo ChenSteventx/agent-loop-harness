@@ -435,7 +435,7 @@ function validateConfiguration(configuration: EvolutionConfiguration): void {
   }
 }
 
-function defaultConfiguration(): EvolutionConfiguration {
+export function defaultConfiguration(): EvolutionConfiguration {
   return {
     promptVariant: "baseline",
     contextRanking: ["task", "acceptance", "repository"],

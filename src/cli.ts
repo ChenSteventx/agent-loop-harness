@@ -46,9 +46,12 @@ import {
   approveChangeProposal,
   createChangeProposal,
   createChallenger,
+  createInitialChampion,
+  defaultConfiguration,
   evolutionTargets,
   promoteChallenger,
   rollbackChampion,
+  type EvolutionConfiguration,
   type EvolutionTarget,
 } from "./evolution/proposals.js";
 import {
@@ -391,10 +394,11 @@ proposal
   .requiredOption("--rationale <text>")
   .requiredOption("--source-facts <hashes>")
   .option("--minimum-samples <count>", "minimum comparison samples", "5")
+  .option("--dataset-dir <path>", "proposal dataset directory", "eval")
   .description("create a bounded proposal; Holdout Tasks remain inaccessible")
   .action((options: {
     id: string; project: string; target: string; patch: string; rationale: string;
-    sourceFacts: string; minimumSamples: string;
+    sourceFacts: string; minimumSamples: string; datasetDir: string;
   }) => {
     withEvaluationStores((_development, store) => {
       const champion = store.activeChampion(options.project);
@@ -408,7 +412,7 @@ proposal
         patch: parseObject(options.patch),
         rationale: options.rationale,
         sourceFactHashes: csv(options.sourceFacts),
-        datasets: DatasetCatalog.loadDirectory(resolve("eval")).list("proposal"),
+        datasets: DatasetCatalog.loadDirectory(resolve(options.datasetDir)).list("proposal"),
         metrics: ["readySuccessRate", "doneSuccessRate", "verificationFailures"],
         minimumSamples: positiveInteger(options.minimumSamples, "minimum samples"),
       })));
@@ -468,6 +472,31 @@ const config = program.command("config").description("Champion activation and ro
 config.command("champion").requiredOption("--project <scope>").action((options: { project: string }) => {
   withEvaluationStores((_development, store) => print(store.activeChampion(options.project)));
 });
+config
+  .command("champion-init")
+  .requiredOption("--project <scope>")
+  .option("--version <version>", "champion configuration version", "1")
+  .option("--config <json>", "full EvolutionConfiguration JSON; defaults to the baseline configuration")
+  .option("--id <id>", "champion variant id; defaults to champion:<project>:<version>")
+  .description("install the initial Champion for a project so the evolution cycle can be driven from the CLI")
+  .action((options: { project: string; version: string; config?: string; id?: string }) => {
+    withEvaluationStore((store) => {
+      if (store.activeChampion(options.project)) {
+        throw new Error(`Project ${options.project} already has an active Champion; use proposal/config to evolve it`);
+      }
+      // createInitialChampion validates the configuration, so an unknown-shaped
+      // JSON payload is rejected there rather than trusted here.
+      const configuration = options.config
+        ? (parseObject(options.config) as unknown as EvolutionConfiguration)
+        : defaultConfiguration();
+      print(store.installConfigurationVariant(createInitialChampion({
+        id: options.id ?? `champion:${options.project}:${options.version}`,
+        projectScope: options.project,
+        version: options.version,
+        configuration,
+      })));
+    });
+  });
 config
   .command("activate")
   .requiredOption("--comparison-id <id>")
@@ -940,6 +969,20 @@ function openDevelopmentStore(home: string, options: { writable?: boolean } = {}
     throw new Error(`No formal development state at ${resolve(home, "state.sqlite")}`);
   }
   return new SqliteStore(resolve(home, "state.sqlite"), { readOnly: true });
+}
+
+// For commands that touch only the evaluation sidecar (e.g. seeding the
+// initial Champion, which must run before any formal development state
+// exists). Never opens or requires state.sqlite.
+function withEvaluationStore(action: (evaluation: EvaluationStore) => void): void {
+  const home = resolve(program.opts<{ loopHome: string }>().loopHome);
+  mkdirSync(home, { recursive: true });
+  const evaluation = new EvaluationStore(resolve(home, "evaluation.sqlite"));
+  try {
+    action(evaluation);
+  } finally {
+    evaluation.close();
+  }
 }
 
 function withEvaluationStores(
