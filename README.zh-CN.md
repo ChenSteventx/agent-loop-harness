@@ -25,7 +25,8 @@ node automation/status.mjs
 
 ## 安装为命令与 Skill
 
-`npm i -g .` 把 harness 装成 `agent-loop` 命令（本仓仍保持 private，不发布 npm）；
+实操上手走查见 `USAGE.md`（英文一页版，含单次运行四步、skill、非 Node 项目、
+演进周期）。`npm i -g .` 把 harness 装成 `agent-loop` 命令（本仓仍保持 private，不发布 npm）；
 不装则用 `npm run loop --` 从检出目录跑。`skills/agent-loop/` 是一个 Claude Code
 skill，驱动单次受限运行并如实汇报 harness 裁定（确定性权威：提交与裁定归 harness）；
 `ln -s "$(pwd)/skills/agent-loop" ~/.claude/skills/agent-loop` 激活后用 `/agent-loop`

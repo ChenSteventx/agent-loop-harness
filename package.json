@@ -14,7 +14,8 @@
     "eval",
     "skills",
     "README.md",
-    "README.zh-CN.md"
+    "README.zh-CN.md",
+    "USAGE.md"
   ],
   "engines": {
     "node": ">=20"

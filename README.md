@@ -5,8 +5,9 @@ A small, generic, evidence-driven development harness for coding agents.
 The model proposes; deterministic code decides. Run state, Git commits,
 command exit codes, verification evidence, review validation, and promotion
 of learned configuration are all owned by the harness — a model saying
-"tests pass" is never proof. See `README.zh-CN.md` for the full
-documentation (Chinese) and `AGENTS.md` for the hard boundaries.
+"tests pass" is never proof. See `USAGE.md` for a full practical
+walkthrough, `README.zh-CN.md` for the full documentation (Chinese), and
+`AGENTS.md` for the hard boundaries.
 
 ## Requirements
 
