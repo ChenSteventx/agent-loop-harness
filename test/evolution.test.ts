@@ -174,16 +174,24 @@ describe("controlled Champion and Challenger evolution", () => {
     })).toThrow("Forbidden evolution target");
     expect(() => createChangeProposal({
       ...base,
+      target: "context-ranking",
+      patch: { contextRanking: ["acceptance", "task"] },
+      datasets: catalog.list("proposal"),
+    })).toThrow("unsupported-runtime-target");
+    // prompt-variant is runtime-wired, but only registered templates may be
+    // proposed — an unregistered name must fail at creation, not at runtime.
+    expect(() => createChangeProposal({
+      ...base,
       target: "prompt-variant",
       patch: { promptVariant: "concise-v2" },
       datasets: catalog.list("proposal"),
-    })).toThrow("unsupported-runtime-target");
-    expect(() => createChangeProposal({
+    })).toThrow("not registered");
+    expect(createChangeProposal({
       ...base,
-      target: "memory-retrieval",
-      patch: { memoryRetrievalEnabled: true },
+      target: "prompt-variant",
+      patch: { promptVariant: "acceptance-first" },
       datasets: catalog.list("proposal"),
-    })).toThrow("unsupported-runtime-target");
+    }).patch.promptVariant).toBe("acceptance-first");
     expect(() => createChangeProposal({
       ...base,
       target: "retry-policy",

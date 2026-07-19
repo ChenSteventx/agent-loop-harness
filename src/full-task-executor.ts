@@ -29,7 +29,9 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
     const baseCommit = git.head();
     const controlHash = git.controlStateHash();
     const diagnostics: string[] = [];
-    const evaluationPrompt = authorPrompt(input.binding.taskSpec, null);
+    const evaluationPrompt = authorPrompt(input.binding.taskSpec, null, {
+      variant: configuration.promptVariant,
+    });
     assertPromptWithinBudget(evaluationPrompt, input.binding.budget.maximumPromptBytes, "evaluation-author");
     const attempts = Math.min(Math.max(configuration.retryLimit, 0), 3) + 1;
     let providerOk = false;

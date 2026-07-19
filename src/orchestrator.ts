@@ -825,7 +825,7 @@ export class Orchestrator {
     const writerPrompt = role === "author"
       ? authorPrompt(binding.taskSpec, explorerReport
         ? compactExplorerReport(explorerReport, binding.budget.maximumExplorerAdvisoryBytes)
-        : null)
+        : null, { variant: binding.runtimeConfiguration?.promptVariant })
       : repairPrompt(binding.taskSpec, attempt, git.head(), failureEvidence, binding.budget);
     assertPromptWithinBudget(writerPrompt, binding.budget.maximumPromptBytes, role);
     const request: ProviderRunRequest = {
@@ -1305,7 +1305,7 @@ export class Orchestrator {
         operation,
         role: operation.kind as "author" | "repair",
         renderedPrompt: operation.kind === "author"
-          ? authorPrompt(run.binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport, run.binding.budget.maximumExplorerAdvisoryBytes) : null)
+          ? authorPrompt(run.binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport, run.binding.budget.maximumExplorerAdvisoryBytes) : null, { variant: run.binding.runtimeConfiguration?.promptVariant })
           : repairPrompt(run.binding.taskSpec, input.attempt, input.baseCommit, failureEvidence, run.binding.budget),
         outputSchemaPath: this.roleOutputSchemas.author,
         actualProvider: completion.result.identity,

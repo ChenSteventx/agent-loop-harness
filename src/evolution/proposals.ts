@@ -1,6 +1,7 @@
 import { operationInputHash } from "../bindings.js";
 import type { OfflineComparison } from "../evaluation/compare.js";
 import type { EvaluationDataset } from "../evaluation/datasets.js";
+import { authorPromptVariants } from "../roles.js";
 import type { Risk } from "../routing.js";
 
 export const evolutionTargets = [
@@ -15,12 +16,12 @@ export const evolutionTargets = [
 ] as const;
 export type EvolutionTarget = (typeof evolutionTargets)[number];
 
-// The only targets whose configuration genuinely changes formal execution today
-// (provider selection, author retries, command timeouts). Proposals for the
-// other vocabulary entries are rejected until their runtime wiring exists —
-// otherwise a Challenger could be promoted on a configuration that never takes
-// effect, an empty evolution.
+// The only targets whose configuration genuinely changes formal execution
+// today. Proposals for the other vocabulary entries are rejected until their
+// runtime wiring exists — otherwise a Challenger could be promoted on a
+// configuration that never takes effect, an empty evolution.
 export const runtimeWiredTargets: readonly EvolutionTarget[] = [
+  "prompt-variant",
   "provider-routing",
   "retry-policy",
   "timeout-policy",
@@ -382,6 +383,10 @@ function validatePatch(target: EvolutionTarget, patch: Partial<EvolutionConfigur
 }
 
 function validateConfiguration(configuration: EvolutionConfiguration): void {
+  if (configuration.promptVariant !== undefined &&
+      !authorPromptVariants.includes(configuration.promptVariant)) {
+    throw new Error(`Author prompt variant is not registered: ${configuration.promptVariant}`);
+  }
   if ((configuration.promptVariant !== undefined && !configuration.promptVariant.trim()) ||
       (configuration.contextRanking !== undefined &&
         (!Array.isArray(configuration.contextRanking) || configuration.contextRanking.length === 0 ||

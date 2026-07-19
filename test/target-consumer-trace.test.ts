@@ -8,6 +8,10 @@ import { runtimeWiredTargets } from "../src/evolution/proposals.js";
 // the full-task-replay and production-loop tests); a target whose consumer
 // disappears fails here instead of silently becoming an empty evolution.
 const consumerTraces: Record<string, Array<[string, string]>> = {
+  "prompt-variant": [
+    ["src/orchestrator.ts", "variant: binding.runtimeConfiguration?.promptVariant"],
+    ["src/full-task-executor.ts", "variant: configuration.promptVariant"],
+  ],
   "provider-routing": [
     ["src/orchestrator.ts", "orderProviderCandidates(binding, workspaceRoleCandidates"],
     ["src/full-task-executor.ts", "selectAuthor(options, configuration.providerOrder)"],
