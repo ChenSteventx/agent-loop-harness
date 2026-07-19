@@ -71,6 +71,10 @@ export interface ReviewerInput {
   verificationEvidence: readonly VerificationEvidence[];
   allowedRepositoryRoots: readonly string[];
   contextBudget: number;
+  // Configuration-supplied rubric injected only for low-risk reviews
+  // (low-risk-review-rubric target); null when the run is not low risk or
+  // the configuration carries none.
+  lowRiskRubric?: string | null;
 }
 
 export interface ReviewSnapshot {
@@ -175,6 +179,7 @@ function validateBinding(input: ReviewerInput, current: ReviewSnapshot): void {
 export function renderReviewerPrompt(input: ReviewerInput): string {
   return [
     "Role: independent read-only Reviewer. Do not write files or change run state.",
+    ...(input.lowRiskRubric ? [`Low-risk review rubric: ${input.lowRiskRubric}`] : []),
     `Task spec and acceptance: ${JSON.stringify(input.task)}`,
     `Reviewed commit: ${input.reviewedCommit}`,
     `Diff SHA-256: ${input.diffHash}`,

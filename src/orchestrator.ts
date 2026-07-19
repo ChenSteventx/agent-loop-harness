@@ -23,7 +23,7 @@ import { authorPrompt } from "./roles.js";
 import { SqliteStore } from "./store.js";
 import type { Evidence, Operation, RecoveryDisposition, Run, RunBinding } from "./domain.js";
 import { EvidenceGate } from "./evidence-gate.js";
-import { applyRiskEscalation, executionTemplates } from "./routing.js";
+import { applyRiskEscalation, executionTemplates, type ExecutionTemplateName } from "./routing.js";
 import {
   compactExplorerReport,
   explorerReportSchema,
@@ -120,6 +120,10 @@ export interface StartRunRequest {
   runId?: string;
   taskPath: string;
   targetRepository: string;
+  // Optional escalation: run a stronger template than the risk routing
+  // floor (e.g. independent review on a low-risk task). Downgrades are
+  // rejected by createRunBinding.
+  executionTemplate?: ExecutionTemplateName;
 }
 
 export interface RunView {
@@ -246,6 +250,7 @@ export class Orchestrator {
       providerProfile: this.providerProfileName,
       projectAdapter: this.projectAdapter,
       effectiveRisk,
+      executionTemplate: request.executionTemplate,
       runtimeConfiguration,
     });
     this.store.createBoundRun(runId, task.id, binding);
@@ -1151,6 +1156,7 @@ export class Orchestrator {
         verificationEvidence,
         allowedRepositoryRoots: [reviewerCwd],
         contextBudget: this.explorerContextBudget,
+        lowRiskRubric: this.lowRiskRubric(binding),
       }, () => ({
         commit: git.head(),
         diffHash: hashReviewDiff(git.diffBetween(binding.baselineCommit, git.head())),
@@ -1807,6 +1813,7 @@ export class Orchestrator {
         verificationEvidence,
         allowedRepositoryRoots: [run.binding.worktreePath],
         contextBudget: this.explorerContextBudget,
+        lowRiskRubric: this.lowRiskRubric(run.binding),
       }),
       outputSchemaPath: this.roleOutputSchemas.reviewer,
       actualProvider: completion.result.identity,
@@ -1945,6 +1952,14 @@ export class Orchestrator {
     return role === "author"
       ? resolve(this.loopHome, "runs", runId, "author")
       : resolve(this.loopHome, "runs", runId, "repair", String(attempt));
+  }
+
+  // low-risk-review-rubric target: the rubric only shapes reviews of runs
+  // whose frozen effective risk is low (reachable via --template escalation);
+  // normal/high reviews keep the unmodified reviewer contract.
+  private lowRiskRubric(binding: RunBinding): string | null {
+    if (binding.risk !== "low") return null;
+    return binding.runtimeConfiguration?.lowRiskReviewRubric ?? null;
   }
 
   private installRoleInvocationManifest(input: {

@@ -30,6 +30,13 @@ const consumerTraces: Record<string, Array<[string, string]>> = {
     ["src/orchestrator.ts", "runtimeConfiguration?.timeoutMs ?? 10 * 60_000"],
     ["src/full-task-executor.ts", "timeoutMs: configuration.timeoutMs"],
   ],
+  // Review only exists in the formal loop, so both consumers live there:
+  // the live reviewer input and the manifest re-render must stay identical.
+  "low-risk-review-rubric": [
+    ["src/orchestrator.ts", "lowRiskRubric: this.lowRiskRubric(binding)"],
+    ["src/orchestrator.ts", "lowRiskRubric: this.lowRiskRubric(run.binding)"],
+    ["src/reviewer.ts", "Low-risk review rubric: ${input.lowRiskRubric}"],
+  ],
 };
 
 describe("promotion target to runtime consumer traceability", () => {

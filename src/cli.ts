@@ -64,7 +64,7 @@ import {
   providerProfileNames,
   type ProviderProfileName,
 } from "./profiles.js";
-import { riskValues, type Risk } from "./routing.js";
+import { executionTemplateNames, riskValues, type ExecutionTemplateName, type Risk } from "./routing.js";
 import { RuntimeConfigResolver } from "./runtime-config.js";
 
 const program = new Command()
@@ -98,14 +98,16 @@ program
   .requiredOption("--task <path>")
   .requiredOption("--repository <path>")
   .option("--run-id <id>")
+  .option("--template <name>", "escalate the execution template above the risk floor (solo|assisted|reviewed)")
   .description("create a worktree and execute the fixed risk-routed proof loop")
-  .action(async (options: { task: string; repository: string; runId?: string }) => {
+  .action(async (options: { task: string; repository: string; runId?: string; template?: string }) => {
     await withOrchestrator(async (orchestrator) =>
       print(
         await orchestrator.start({
           runId: options.runId ?? randomUUID(),
           taskPath: resolve(options.task),
           targetRepository: resolve(options.repository),
+          executionTemplate: parseExecutionTemplate(options.template),
         }),
       ),
     );
@@ -959,6 +961,12 @@ function print(value: unknown): void {
 function parseProviderProfileName(value: string): ProviderProfileName {
   if (providerProfileNames.includes(value as ProviderProfileName)) return value as ProviderProfileName;
   throw new Error(`Unknown Provider profile: ${value}`);
+}
+
+function parseExecutionTemplate(value: string | undefined): ExecutionTemplateName | undefined {
+  if (value === undefined) return undefined;
+  if (executionTemplateNames.includes(value as ExecutionTemplateName)) return value as ExecutionTemplateName;
+  throw new Error(`Unknown execution template: ${value}`);
 }
 
 function parseEvolutionTarget(value: string): EvolutionTarget {

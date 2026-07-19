@@ -35,7 +35,13 @@ export function createRunBinding(input: CreateRunBindingInput): RunBinding {
     sourceRepository: normalizeExistingPath(input.sourceRepository),
     worktreePath: resolve(input.worktreePath),
     risk: effectiveRisk,
-    executionTemplate: input.executionTemplate ?? routeRisk(effectiveRisk),
+    // A requested template must still cover the effective risk: routeRisk
+    // throws when the single candidate sits below the risk's minimum, so an
+    // explicit template can escalate (e.g. review a low-risk run) but never
+    // downgrade the routed floor.
+    executionTemplate: input.executionTemplate
+      ? routeRisk(effectiveRisk, [input.executionTemplate])
+      : routeRisk(effectiveRisk),
     providerProfile: requiredText(input.providerProfile, "providerProfile"),
     projectAdapterName: requiredText(input.projectAdapter.name, "projectAdapter.name"),
     policyVersion: requiredText(input.projectAdapter.policyVersion, "projectAdapter.policyVersion"),

@@ -26,6 +26,7 @@ export const runtimeWiredTargets: readonly EvolutionTarget[] = [
   "role-model-selection",
   "retry-policy",
   "timeout-policy",
+  "low-risk-review-rubric",
 ];
 
 export interface EvolutionConfiguration {
@@ -395,6 +396,9 @@ function validateConfiguration(configuration: EvolutionConfiguration): void {
     if (!model.trim() || model.length > 128) {
       throw new Error(`Role model for ${role} must be non-empty and at most 128 characters`);
     }
+  }
+  if (configuration.lowRiskReviewRubric !== undefined && configuration.lowRiskReviewRubric.length > 500) {
+    throw new Error("Low-risk review rubric must be at most 500 characters");
   }
   if ((configuration.promptVariant !== undefined && !configuration.promptVariant.trim()) ||
       (configuration.contextRanking !== undefined &&

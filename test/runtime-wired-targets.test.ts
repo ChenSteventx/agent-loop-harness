@@ -2,8 +2,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createRunBinding } from "../src/bindings.js";
 import { buildClaudeCodeArgs } from "../src/claude-provider.js";
+import { defaultRunBudget } from "../src/budget.js";
 import { CodexCliAdapter } from "../src/provider.js";
+import { renderReviewerPrompt } from "../src/reviewer.js";
 import { authorPrompt, authorPromptVariants } from "../src/roles.js";
 import type { TaskSpec } from "../src/task-spec.js";
 
@@ -101,5 +104,44 @@ describe("role-model-selection runtime wiring", () => {
       outputSchemaPath: schema,
     });
     expect(baseline.identity.model).toBe("fixture-model");
+  });
+});
+
+describe("low-risk-review-rubric runtime wiring", () => {
+  const reviewerInput = {
+    task,
+    diff: "diff --git a/x b/x",
+    reviewedCommit: "c".repeat(40),
+    diffHash: "d".repeat(64),
+    controlStateHash: "e".repeat(64),
+    verificationEvidence: [],
+    allowedRepositoryRoots: ["/tmp/worktree"],
+    contextBudget: 100_000,
+  };
+
+  it("injects the rubric line only when one is supplied", () => {
+    const withRubric = renderReviewerPrompt({ ...reviewerInput, lowRiskRubric: "verify acceptance evidence" });
+    expect(withRubric).toContain("Low-risk review rubric: verify acceptance evidence");
+    expect(renderReviewerPrompt(reviewerInput)).not.toContain("Low-risk review rubric");
+    expect(renderReviewerPrompt({ ...reviewerInput, lowRiskRubric: null })).not.toContain("Low-risk review rubric");
+  });
+
+  it("allows explicit template escalation but never a downgrade", () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-loop-template-"));
+    temporaryDirectories.push(root);
+    const bindingInput = {
+      taskSpecPath: (() => { const p = join(root, "task.yaml"); writeFileSync(p, "id: WIRE-1"); return p; })(),
+      taskSpec: task,
+      baselineCommit: "a".repeat(40),
+      sourceRepository: root,
+      worktreePath: join(root, "worktree"),
+      providerProfile: "CODEX_PRIMARY",
+      projectAdapter: { name: "generic-node", policyVersion: "generic-node/v2" } as never,
+      budget: defaultRunBudget(),
+    };
+    const escalated = createRunBinding({ ...bindingInput, effectiveRisk: "low", executionTemplate: "reviewed" });
+    expect(escalated.executionTemplate).toBe("reviewed");
+    expect(() => createRunBinding({ ...bindingInput, effectiveRisk: "high", executionTemplate: "solo" }))
+      .toThrow("No valid execution template");
   });
 });
