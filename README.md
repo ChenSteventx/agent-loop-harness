@@ -48,10 +48,11 @@ The harness never merges. After you merge the ready candidate yourself:
 
 ```bash
 npm run loop -- mark-merged --run-id <RUN_ID> --repository /path/to/your-repo --merge-sha <SHA>
+npm run loop -- resume --run-id <RUN_ID>
 ```
 
-Post-merge verification on the merged commit is what moves the run to
-`done`.
+`resume` then runs post-merge verification on the merged commit; passing
+is what moves the run to `done`.
 
 ## Non-Node projects
 
