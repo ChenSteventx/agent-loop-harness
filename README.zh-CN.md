@@ -180,6 +180,17 @@ npm run loop -- canary assign --id <ASSIGNMENT_ID> --comparison-id <COMPARISON_I
 npm run loop -- canary observe --id <OBSERVATION_ID> --assignment-id <ASSIGNMENT_ID> --run-id <RUN_ID>
 ```
 
+## 运行时演进配置
+
+演进 target 中真正接线到正式执行的有：`prompt-variant`（有界模板注册表选
+author 提示词）、`provider-routing`、`role-model-selection`（逐次调用的模型
+覆盖，参数与身份记录同步生效；提案仅限 author 席位）、`retry-policy`、
+`timeout-policy`、`memory-retrieval`（人工审批过的记忆按仓库标识精确匹配后，
+以有界 advisory 冻进 Run Binding）。`low-risk-review-rubric` 已接线（低风险
+评审提示词消费）但暂不可提案——离线评价器没有 reviewer 席位、量不出它的
+效果；先由人工安装的 Champion 配置直接设置。`run --template reviewed` 可把
+执行模板升到风险下限之上（只许升不许降），让低风险 Run 也能走独立评审。
+
 ## 派生视图与类型化恢复处置
 
 `status --derived` 在持久状态之外输出一份只读派生视图：下一步动作、证据缺口

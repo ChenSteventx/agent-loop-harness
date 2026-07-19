@@ -37,6 +37,7 @@ YAML
 
 # Run the bounded loop: explore -> author -> harness-owned commit ->
 # real verification -> (review when risk demands it) -> ready
+# (--template reviewed escalates above the risk floor; downgrades are rejected)
 npm run loop -- run --task /path/to/your-repo/task.yaml --repository /path/to/your-repo
 
 # Inspect durable state, plus the derived view (next action, proof gaps,
