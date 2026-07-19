@@ -43,7 +43,7 @@ const binding: RunBinding = {
   projectAdapterName: "generic-node",
   policyVersion: "generic-node/v2",
   configurationVariantId: null, configurationHash: null, canaryAssignmentId: null,
-  configSource: "default", runtimeConfiguration: null, budget: defaultRunBudget(),
+  configSource: "default", runtimeConfiguration: null, budget: defaultRunBudget(), memoryAdvisory: null,
 };
 binding.taskSpecHash = taskSpecHash(binding.taskSpec);
 binding.acceptanceHash = acceptanceHash(binding.taskSpec.acceptance);

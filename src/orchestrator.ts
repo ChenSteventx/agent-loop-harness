@@ -19,6 +19,7 @@ import {
 import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { ProviderAdapter, ProviderRunRequest, ProviderRunResult } from "./provider.js";
 import { loadTaskSpec } from "./project.js";
+import type { TaskSpec } from "./task-spec.js";
 import { authorPrompt } from "./roles.js";
 import { SqliteStore } from "./store.js";
 import type { Evidence, Operation, RecoveryDisposition, Run, RunBinding } from "./domain.js";
@@ -105,6 +106,11 @@ export interface OrchestratorOptions {
   explorerContextBudget?: number;
   maxLoopSteps?: number;
   runtimeConfigResolver?: Pick<RuntimeConfigResolver, "resolve"> & Partial<Pick<RuntimeConfigResolver, "close">>;
+  // memory-retrieval target: returns a rendered approved-memory advisory for
+  // the task, or null. Consulted once at run creation and frozen into the
+  // binding; absence of a retriever simply yields no advisory (fail-quiet
+  // for model input, never for evidence).
+  memoryRetriever?: (input: { projectScope: string; task: TaskSpec }) => string | null;
   faults?: {
     afterProviderCompletion?: () => void;
     afterHarnessCommit?: () => void;
@@ -190,6 +196,7 @@ export class Orchestrator {
   private readonly maxLoopSteps: number;
   private readonly runtimeConfigResolver: (Pick<RuntimeConfigResolver, "resolve"> &
     Partial<Pick<RuntimeConfigResolver, "close">>) | null;
+  private readonly memoryRetriever: ((input: { projectScope: string; task: TaskSpec }) => string | null) | null;
 
   constructor(options: OrchestratorOptions) {
     this.loopHome = resolve(options.loopHome ?? process.env.LOOP_HOME ?? defaultLoopHome());
@@ -217,6 +224,7 @@ export class Orchestrator {
     this.providerProfileName = this.providerProfile?.name ?? options.providerProfileName ?? "LEGACY_SINGLE_PROVIDER";
     this.maxLoopSteps = options.maxLoopSteps ?? 32;
     this.runtimeConfigResolver = options.runtimeConfigResolver ?? null;
+    this.memoryRetriever = options.memoryRetriever ?? null;
     if (!Number.isSafeInteger(this.maxLoopSteps) || this.maxLoopSteps <= 0) {
       throw new Error("maxLoopSteps must be a positive integer");
     }
@@ -240,6 +248,9 @@ export class Orchestrator {
       taskKey: task.id,
       effectiveRisk,
     });
+    const memoryAdvisory = runtimeConfiguration?.configuration?.memoryRetrievalEnabled
+      ? this.memoryRetriever?.({ projectScope: this.projectAdapter.name, task }) ?? null
+      : null;
     const worktreePath = this.worktreePath(runId);
     const binding = createRunBinding({
       taskSpecPath: taskPath,
@@ -252,6 +263,7 @@ export class Orchestrator {
       effectiveRisk,
       executionTemplate: request.executionTemplate,
       runtimeConfiguration,
+      memoryAdvisory,
     });
     this.store.createBoundRun(runId, task.id, binding);
     this.store.appendEvent(runId, "worktree.planned", {
@@ -831,7 +843,7 @@ export class Orchestrator {
     const writerPrompt = role === "author"
       ? authorPrompt(binding.taskSpec, explorerReport
         ? compactExplorerReport(explorerReport, binding.budget.maximumExplorerAdvisoryBytes)
-        : null, { variant: binding.runtimeConfiguration?.promptVariant })
+        : null, { variant: binding.runtimeConfiguration?.promptVariant, memoryAdvisory: binding.memoryAdvisory })
       : repairPrompt(binding.taskSpec, attempt, git.head(), failureEvidence, binding.budget);
     assertPromptWithinBudget(writerPrompt, binding.budget.maximumPromptBytes, role);
     const request: ProviderRunRequest = {
@@ -1315,7 +1327,7 @@ export class Orchestrator {
         operation,
         role: operation.kind as "author" | "repair",
         renderedPrompt: operation.kind === "author"
-          ? authorPrompt(run.binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport, run.binding.budget.maximumExplorerAdvisoryBytes) : null, { variant: run.binding.runtimeConfiguration?.promptVariant })
+          ? authorPrompt(run.binding.taskSpec, explorerReport ? compactExplorerReport(explorerReport, run.binding.budget.maximumExplorerAdvisoryBytes) : null, { variant: run.binding.runtimeConfiguration?.promptVariant, memoryAdvisory: run.binding.memoryAdvisory })
           : repairPrompt(run.binding.taskSpec, input.attempt, input.baseCommit, failureEvidence, run.binding.budget),
         outputSchemaPath: this.roleOutputSchemas.author,
         actualProvider: completion.result.identity,

@@ -73,6 +73,16 @@ export function boundedJson(value: unknown, maximumBytes: number): string {
   return JSON.stringify({ ...identity, excerpt: "" });
 }
 
+// Advisory text is model input, not evidence: an oversized advisory is
+// truncated by bytes (a torn trailing code point decodes to a replacement
+// character, which is harmless in a prompt) rather than failing the run.
+export function boundAdvisoryText(text: string | null, maximumBytes: number): string | null {
+  if (text === null) return null;
+  const encoded = Buffer.from(text, "utf8");
+  if (encoded.byteLength <= maximumBytes) return text;
+  return encoded.subarray(0, Math.max(maximumBytes, 0)).toString("utf8");
+}
+
 export function assertPromptWithinBudget(prompt: string, maximumBytes: number | undefined, role: string): void {
   if (maximumBytes === undefined) return;
   const observed = Buffer.byteLength(prompt);

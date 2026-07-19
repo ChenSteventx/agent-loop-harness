@@ -37,6 +37,10 @@ const consumerTraces: Record<string, Array<[string, string]>> = {
     ["src/orchestrator.ts", "lowRiskRubric: this.lowRiskRubric(run.binding)"],
     ["src/reviewer.ts", "Low-risk review rubric: ${input.lowRiskRubric}"],
   ],
+  "memory-retrieval": [
+    ["src/orchestrator.ts", "runtimeConfiguration?.configuration?.memoryRetrievalEnabled"],
+    ["src/full-task-executor.ts", "configuration.memoryRetrievalEnabled"],
+  ],
 };
 
 describe("promotion target to runtime consumer traceability", () => {

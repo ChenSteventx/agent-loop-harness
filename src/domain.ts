@@ -59,6 +59,11 @@ export interface RunBinding {
   configSource: import("./runtime-config.js").ConfigSource;
   runtimeConfiguration: import("./evolution/proposals.js").EvolutionConfiguration | null;
   budget: import("./budget.js").RunBudget;
+  // Approved-memory advisory frozen at run creation (memory-retrieval
+  // target): null when retrieval is disabled or nothing matched. Frozen so
+  // prompt builds and manifest re-renders in later processes cannot drift
+  // as the memory store changes.
+  memoryAdvisory: string | null;
 }
 
 export type OperationStatus = "running" | "succeeded" | "failed";

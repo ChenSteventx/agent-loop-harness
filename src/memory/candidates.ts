@@ -227,6 +227,18 @@ export function expireCandidateMemories(
     }));
 }
 
+// Renders retrieval results into the advisory line the Author prompt
+// carries (memory-retrieval target). Explainable by construction: every
+// entry names the matched terms that selected it.
+export function renderMemoryAdvisory(
+  results: ReadonlyArray<{ memory: CandidateMemory; matchedTerms: string[] }>,
+): string | null {
+  if (results.length === 0) return null;
+  return results
+    .map((result) => `- ${result.memory.summary} (matched: ${result.matchedTerms.join(", ")})`)
+    .join("\n");
+}
+
 export function retrieveApprovedMemory(
   repository: MemoryRepository,
   input: { projectScope: string; query: string; enabled?: boolean; now?: string; limit?: number },

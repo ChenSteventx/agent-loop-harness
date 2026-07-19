@@ -27,6 +27,7 @@ const expectedBindingKeys = [
   "acceptanceHash",
   "baselineCommit",
   "budget",
+  "memoryAdvisory",
   "sourceRepository",
   "worktreePath",
   "risk",

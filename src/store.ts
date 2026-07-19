@@ -999,6 +999,7 @@ function mapRun(row: RunRow): Run {
     configSource: storedBinding.configSource ?? "default",
     runtimeConfiguration: storedBinding.runtimeConfiguration ?? null,
     budget: storedBinding.budget ?? defaultRunBudget(),
+    memoryAdvisory: storedBinding.memoryAdvisory ?? null,
   } : null;
   return {
     id: row.id,

@@ -45,7 +45,7 @@ const binding: RunBinding = {
   projectAdapterName: "generic-node",
   policyVersion: "generic-node/v2",
   configurationVariantId: null, configurationHash: null, canaryAssignmentId: null,
-  configSource: "default", runtimeConfiguration: null, budget: defaultRunBudget(),
+  configSource: "default", runtimeConfiguration: null, budget: defaultRunBudget(), memoryAdvisory: null,
 };
 
 afterEach(() => {
@@ -208,10 +208,10 @@ describe("offline comparison and non-authoritative Shadow", () => {
         passed: true, ready: true, done: false, verificationFailures: 0, latencyMs: 1, resultHash: "unused",
       }),
     })).rejects.toThrow("Verify-only evaluator cannot evaluate");
-    // createChangeProposal now rejects memory-retrieval outright (not runtime
-    // wired), so exercise the compare-layer gate on a hand-built proposal: the
-    // "memory-retrieval-proposal" defence must hold even if the factory gate
-    // is bypassed.
+    // memory-retrieval is runtime-wired now, but its effect is invisible to a
+    // verify-only replay (pinned commits, no author): the compare-layer
+    // "memory-retrieval-proposal" defence below must keep holding on its own,
+    // independent of any factory-side gating.
     const swappedDatasets = catalog.list("comparison").map((dataset) =>
       dataset.kind === "holdout" ? dataset : { ...dataset, contentHash: "swapped-content-hash" });
     await expect(compareVariants(evaluation, {

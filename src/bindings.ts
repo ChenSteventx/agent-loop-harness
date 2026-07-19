@@ -5,7 +5,7 @@ import type { EvidenceDependencies, RunBinding } from "./domain.js";
 import type { ProjectAdapter } from "./ports.js";
 import { routeRisk, type ExecutionTemplateName, type Risk } from "./routing.js";
 import type { TaskSpec } from "./task-spec.js";
-import { defaultRunBudget, validateRunBudget, type RunBudget } from "./budget.js";
+import { boundAdvisoryText, defaultRunBudget, validateRunBudget, type RunBudget } from "./budget.js";
 import { defaultRuntimeConfiguration, type RuntimeConfiguration } from "./runtime-config.js";
 
 export interface CreateRunBindingInput {
@@ -20,11 +20,13 @@ export interface CreateRunBindingInput {
   executionTemplate?: ExecutionTemplateName;
   runtimeConfiguration?: RuntimeConfiguration;
   budget?: RunBudget;
+  memoryAdvisory?: string | null;
 }
 
 export function createRunBinding(input: CreateRunBindingInput): RunBinding {
   const effectiveRisk = input.effectiveRisk ?? input.taskSpec.risk;
   const runtime = input.runtimeConfiguration ?? defaultRuntimeConfiguration();
+  const budget = validateRunBudget(input.budget ?? defaultRunBudget());
   return {
     version: 1,
     taskSpecPath: normalizeExistingPath(input.taskSpecPath),
@@ -50,7 +52,8 @@ export function createRunBinding(input: CreateRunBindingInput): RunBinding {
     canaryAssignmentId: runtime.canaryAssignmentId,
     configSource: runtime.configSource,
     runtimeConfiguration: runtime.configuration,
-    budget: validateRunBudget(input.budget ?? defaultRunBudget()),
+    budget,
+    memoryAdvisory: boundAdvisoryText(input.memoryAdvisory ?? null, budget.maximumExplorerAdvisoryBytes),
   };
 }
 

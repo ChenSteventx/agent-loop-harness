@@ -27,6 +27,7 @@ export const runtimeWiredTargets: readonly EvolutionTarget[] = [
   "retry-policy",
   "timeout-policy",
   "low-risk-review-rubric",
+  "memory-retrieval",
 ];
 
 export interface EvolutionConfiguration {

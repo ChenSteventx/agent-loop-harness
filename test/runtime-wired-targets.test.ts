@@ -4,7 +4,12 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRunBinding } from "../src/bindings.js";
 import { buildClaudeCodeArgs } from "../src/claude-provider.js";
-import { defaultRunBudget } from "../src/budget.js";
+import { boundAdvisoryText, defaultRunBudget } from "../src/budget.js";
+import {
+  renderMemoryAdvisory,
+  retrieveApprovedMemory,
+  type CandidateMemory,
+} from "../src/memory/candidates.js";
 import { CodexCliAdapter } from "../src/provider.js";
 import { renderReviewerPrompt } from "../src/reviewer.js";
 import { authorPrompt, authorPromptVariants } from "../src/roles.js";
@@ -143,5 +148,84 @@ describe("low-risk-review-rubric runtime wiring", () => {
     expect(escalated.executionTemplate).toBe("reviewed");
     expect(() => createRunBinding({ ...bindingInput, effectiveRisk: "high", executionTemplate: "solo" }))
       .toThrow("No valid execution template");
+  });
+});
+
+function approvedMemory(overrides: Partial<CandidateMemory>): CandidateMemory {
+  return {
+    schemaVersion: 1,
+    id: "memory-1",
+    projectScope: "generic-node",
+    repositoryScope: "repo",
+    operationType: "verification",
+    kind: "failure-pattern",
+    summary: "check.mjs asserts trailing punctuation in greetings",
+    terms: ["greeting", "punctuation", "wired"],
+    contentHash: "hash-1",
+    sourceFactHashes: ["fact-1"],
+    sourceRunIds: ["run-1"],
+    sourceCommits: ["c".repeat(40)],
+    evidenceRefs: ["evidence-1"],
+    supportCount: 1,
+    failureSignature: ["assertion"],
+    rootCause: "missing punctuation",
+    usefulTests: ["check"],
+    status: "approved",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    validatedAt: "2026-01-02T00:00:00.000Z",
+    invalidationReason: null,
+    preconditions: [],
+    counterexamples: [],
+    decision: null,
+    ...overrides,
+  };
+}
+
+describe("memory-retrieval runtime wiring", () => {
+  const repository = {
+    listCandidateMemories: () => [
+      approvedMemory({}),
+      approvedMemory({ id: "memory-2", status: "candidate", summary: "unapproved noise" }),
+    ],
+  } as never;
+
+  it("renders an explainable advisory from approved matches only", () => {
+    const results = retrieveApprovedMemory(repository, {
+      projectScope: "generic-node",
+      query: "prove wired greeting punctuation",
+      enabled: true,
+      limit: 3,
+    });
+    const advisory = renderMemoryAdvisory(results);
+    expect(advisory).toContain("check.mjs asserts trailing punctuation");
+    expect(advisory).toContain("matched:");
+    expect(advisory).not.toContain("unapproved noise");
+    expect(renderMemoryAdvisory([])).toBeNull();
+    expect(retrieveApprovedMemory(repository, {
+      projectScope: "generic-node",
+      query: "prove wired greeting punctuation",
+    })).toEqual([]);
+  });
+
+  it("freezes a byte-bounded advisory into the run binding", () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-loop-memory-binding-"));
+    temporaryDirectories.push(root);
+    const taskSpecPath = join(root, "task.yaml");
+    writeFileSync(taskSpecPath, "id: WIRE-1");
+    const binding = createRunBinding({
+      taskSpecPath,
+      taskSpec: task,
+      baselineCommit: "a".repeat(40),
+      sourceRepository: root,
+      worktreePath: join(root, "worktree"),
+      providerProfile: "CODEX_PRIMARY",
+      projectAdapter: { name: "generic-node", policyVersion: "generic-node/v2" } as never,
+      budget: { ...defaultRunBudget(), maximumExplorerAdvisoryBytes: 8 },
+      memoryAdvisory: "0123456789 overflows the cap",
+    });
+    expect(binding.memoryAdvisory).toBe("01234567");
+    expect(boundAdvisoryText(null, 8)).toBeNull();
+    expect(boundAdvisoryText("short", 8)).toBe("short");
   });
 });

@@ -38,8 +38,10 @@ import {
   deriveCandidateMemories,
   invalidateCandidateMemory,
   rejectCandidateMemory,
+  renderMemoryAdvisory,
   retrieveApprovedMemory,
 } from "./memory/candidates.js";
+import type { TaskSpec } from "./task-spec.js";
 import {
   approveChangeProposal,
   createChangeProposal,
@@ -286,7 +288,7 @@ compare
       if (!champion || !challenger) throw new Error("Comparison variants are incomplete");
       const catalog = DatasetCatalog.loadDirectory(resolve(options.datasetDir));
       const datasets = proposalValue.evaluationPlan.datasetIds.map((id) => catalog.get(id, "comparison"));
-      const executor = createEvaluationFullTaskExecutor();
+      const executor = createEvaluationFullTaskExecutor(store);
       // Task ids are only unique within a dataset; an ordinal keeps every
       // (variant, task) evaluation id distinct across datasets.
       const taskOrdinals = new Map<string, number>();
@@ -806,7 +808,7 @@ async function runReplayCommand(options: {
       const evaluator = new FullTaskReplayEvaluator(
         evaluationStore,
         new WorktreeService(run.binding.sourceRepository),
-        createEvaluationFullTaskExecutor(),
+        createEvaluationFullTaskExecutor(evaluationStore),
         resolve(home, "evaluation"),
       );
       print(await evaluator.evaluate({
@@ -835,7 +837,7 @@ async function runReplayCommand(options: {
   });
 }
 
-function createEvaluationFullTaskExecutor(): ReturnType<typeof createFullTaskExecutor> {
+function createEvaluationFullTaskExecutor(memoryStore?: EvaluationStore): ReturnType<typeof createFullTaskExecutor> {
   const projectAdapter = resolveProjectAdapter();
   return createFullTaskExecutor({
     adapters: {
@@ -848,6 +850,7 @@ function createEvaluationFullTaskExecutor(): ReturnType<typeof createFullTaskExe
     },
     defaultFamily: "codex",
     verificationCommands: (task) => projectAdapter.verificationCommands(task),
+    memoryRetriever: memoryStore ? approvedMemoryRetriever(memoryStore) : undefined,
   });
 }
 
@@ -883,11 +886,13 @@ function createOrchestrator(loopHome: string): Orchestrator {
   if (canaryEnabled && !existsSync(evaluationStatePath)) {
     throw new Error("AGENT_LOOP_CANARY_ENABLED=true requires an existing evaluation.sqlite in the loop home");
   }
-  const runtimeConfigResolver = existsSync(evaluationStatePath)
-    ? new RuntimeConfigResolver(
-      new EvaluationStore(evaluationStatePath, { readOnly: true }),
-      canaryEnabled,
-    )
+  // One read-only handle serves both runtime-config resolution and approved-
+  // memory retrieval; the Orchestrator closes it through the resolver.
+  const evaluationState = existsSync(evaluationStatePath)
+    ? new EvaluationStore(evaluationStatePath, { readOnly: true })
+    : undefined;
+  const runtimeConfigResolver = evaluationState
+    ? new RuntimeConfigResolver(evaluationState, canaryEnabled)
     : undefined;
   return new Orchestrator({
     loopHome,
@@ -899,7 +904,21 @@ function createOrchestrator(loopHome: string): Orchestrator {
     projectAdapter: resolveProjectAdapter(),
     roleOutputSchemas: defaultRoleOutputSchemas(),
     runtimeConfigResolver,
+    memoryRetriever: evaluationState ? approvedMemoryRetriever(evaluationState) : undefined,
   });
+}
+
+// memory-retrieval target: lexical retrieval over human-approved memory,
+// rendered as an explainable advisory. Query text is derived from the task
+// alone so the same task yields the same advisory for a given store state.
+function approvedMemoryRetriever(store: EvaluationStore) {
+  return (input: { projectScope: string; task: TaskSpec }): string | null =>
+    renderMemoryAdvisory(retrieveApprovedMemory(store, {
+      projectScope: input.projectScope,
+      query: `${input.task.goal} ${input.task.acceptance.join(" ")}`,
+      enabled: true,
+      limit: 3,
+    }));
 }
 
 async function withOrchestrator(action: (orchestrator: Orchestrator) => Promise<void>): Promise<void> {

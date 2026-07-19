@@ -5,7 +5,7 @@ import type { VerificationCommand } from "./ports.js";
 import type { ProviderAdapter } from "./provider.js";
 import { authorOutputSchema, defaultRoleOutputSchemas } from "./role-output-schemas.js";
 import type { TaskSpec } from "./task-spec.js";
-import { assertPromptWithinBudget } from "./budget.js";
+import { assertPromptWithinBudget, boundAdvisoryText } from "./budget.js";
 import { authorPrompt } from "./roles.js";
 import { WriterExecutor, writerBoundaryViolation } from "./writer-executor.js";
 import { safeEnvironment, type FullTaskExecutor } from "./evaluation/evaluators.js";
@@ -15,6 +15,10 @@ export interface FullTaskExecutorOptions {
   defaultFamily: string;
   verificationCommands: (task: TaskSpec) => readonly VerificationCommand[];
   commandRunner?: CommandRunner;
+  // memory-retrieval target: evaluated per variant configuration so an
+  // offline comparison can measure retrieval on versus off for the same
+  // historical task.
+  memoryRetriever?: (input: { projectScope: string; task: TaskSpec }) => string | null;
 }
 
 export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTaskExecutor {
@@ -29,8 +33,18 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
     const baseCommit = git.head();
     const controlHash = git.controlStateHash();
     const diagnostics: string[] = [];
+    const memoryAdvisory = configuration.memoryRetrievalEnabled
+      ? boundAdvisoryText(
+        options.memoryRetriever?.({
+          projectScope: input.binding.projectAdapterName,
+          task: input.binding.taskSpec,
+        }) ?? null,
+        input.binding.budget.maximumExplorerAdvisoryBytes,
+      )
+      : null;
     const evaluationPrompt = authorPrompt(input.binding.taskSpec, null, {
       variant: configuration.promptVariant,
+      memoryAdvisory,
     });
     assertPromptWithinBudget(evaluationPrompt, input.binding.budget.maximumPromptBytes, "evaluation-author");
     const attempts = Math.min(Math.max(configuration.retryLimit, 0), 3) + 1;
