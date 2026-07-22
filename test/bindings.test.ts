@@ -131,7 +131,7 @@ describe("canonical run and evidence bindings", () => {
     reopened.close();
   });
 
-  it("persists only monotonic risk escalation in the Run binding", () => {
+  it("keeps the workflow frozen during monotonic risk escalation", () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-loop-risk-binding-"));
     temporaryDirectories.push(directory);
     const taskPath = join(directory, "task.yaml");
@@ -147,11 +147,35 @@ describe("canonical run and evidence bindings", () => {
     });
     const store = new SqliteStore(join(directory, "risk.sqlite"));
     store.createBoundRun("risk-run", task.id, binding);
-    expect(store.escalateRunRisk("risk-run", "high", { changedFiles: ["src/security/policy.ts"] }).binding)
-      .toMatchObject({ risk: "high", executionTemplate: "reviewed" });
-    expect(store.escalateRunRisk("risk-run", "low", { changedFiles: [] }).binding)
+    expect(() => store.escalateRunRisk("risk-run", "high", {
+      changedFiles: ["src/security/policy.ts"],
+    })).toThrow(expect.objectContaining({ code: "WORKFLOW_TEMPLATE_ESCALATION_REQUIRED" }));
+    expect(store.getRun("risk-run")?.binding).toEqual(binding);
+    expect(store.listEvents("risk-run").filter((event) => event.type === "run.risk-escalated"))
+      .toHaveLength(0);
+
+    const reviewed = createRunBinding({
+      taskSpecPath: taskPath,
+      taskSpec: task,
+      baselineCommit: "base",
+      sourceRepository: directory,
+      worktreePath: join(directory, "reviewed-worktree"),
+      providerProfile: "CODEX_PRIMARY",
+      projectAdapter: adapter,
+      executionTemplate: "reviewed",
+    });
+    store.createBoundRun("reviewed-run", task.id, reviewed);
+    const escalated = store.escalateRunRisk("reviewed-run", "high", {
+      changedFiles: ["src/security/policy.ts"],
+    });
+    expect(escalated.binding).toMatchObject({ risk: "high", executionTemplate: "reviewed" });
+    expect(escalated.binding && escalated.binding.version === 2 ? escalated.binding.workflow : null)
+      .toEqual(reviewed.version === 2 ? reviewed.workflow : null);
+    expect(store.escalateRunRisk("reviewed-run", "low", { changedFiles: [] }).binding)
       .toMatchObject({ risk: "high", executionTemplate: "reviewed" });
     expect(store.listEvents("risk-run").filter((event) => event.type === "run.risk-escalated"))
+      .toHaveLength(0);
+    expect(store.listEvents("reviewed-run").filter((event) => event.type === "run.risk-escalated"))
       .toHaveLength(1);
     store.close();
   });

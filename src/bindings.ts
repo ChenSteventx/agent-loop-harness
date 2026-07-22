@@ -7,6 +7,8 @@ import { routeRisk, type ExecutionTemplateName, type Risk } from "./routing.js";
 import type { TaskSpec } from "./task-spec.js";
 import { boundAdvisoryText, defaultRunBudget, validateRunBudget, type RunBudget } from "./budget.js";
 import { defaultRuntimeConfiguration, type RuntimeConfiguration } from "./runtime-config.js";
+import { compileWorkflowTopology } from "./workflow-topology.js";
+import { validateWorkflowTopology } from "./workflow-validator.js";
 
 export interface CreateRunBindingInput {
   taskSpecPath: string;
@@ -27,8 +29,13 @@ export function createRunBinding(input: CreateRunBindingInput): RunBinding {
   const effectiveRisk = input.effectiveRisk ?? input.taskSpec.risk;
   const runtime = input.runtimeConfiguration ?? defaultRuntimeConfiguration();
   const budget = validateRunBudget(input.budget ?? defaultRunBudget());
+  const executionTemplate = input.executionTemplate
+    ? routeRisk(effectiveRisk, [input.executionTemplate])
+    : routeRisk(effectiveRisk);
+  const manifest = compileWorkflowTopology(executionTemplate);
+  validateWorkflowTopology(manifest);
   return {
-    version: 1,
+    version: 2,
     taskSpecPath: normalizeExistingPath(input.taskSpecPath),
     taskSpec: input.taskSpec,
     taskSpecHash: taskSpecHash(input.taskSpec),
@@ -41,9 +48,11 @@ export function createRunBinding(input: CreateRunBindingInput): RunBinding {
     // throws when the single candidate sits below the risk's minimum, so an
     // explicit template can escalate (e.g. review a low-risk run) but never
     // downgrade the routed floor.
-    executionTemplate: input.executionTemplate
-      ? routeRisk(effectiveRisk, [input.executionTemplate])
-      : routeRisk(effectiveRisk),
+    executionTemplate,
+    workflow: {
+      manifest,
+      topologyHash: sha256(canonicalJson(manifest)),
+    },
     providerProfile: requiredText(input.providerProfile, "providerProfile"),
     projectAdapterName: requiredText(input.projectAdapter.name, "projectAdapter.name"),
     policyVersion: requiredText(input.projectAdapter.policyVersion, "projectAdapter.policyVersion"),
