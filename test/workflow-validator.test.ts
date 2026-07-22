@@ -38,6 +38,14 @@ describe("validateWorkflowTopology", () => {
     expect(validateWorkflowTopology(compileWorkflowTopology(template))).toBeUndefined();
   });
 
+  it("rejects an unknown execution template at the runtime boundary", () => {
+    const manifest = {
+      ...compileWorkflowTopology("solo"),
+      template: "unregistered",
+    } as unknown as WorkflowTopologyManifest;
+    expectCode(manifest, "WORKFLOW_TEMPLATE_INVALID");
+  });
+
   it("rejects duplicate node identifiers", () => {
     const manifest = compileWorkflowTopology("solo");
     expectCode(withNodes(manifest, [...manifest.nodes, manifest.nodes[0]!]), "WORKFLOW_NODE_DUPLICATED");
@@ -187,5 +195,45 @@ describe("validateWorkflowTopology", () => {
       { ...manifest, budgets: [{ ...manifest.budgets[0]!, maximumTraversals: 0 }] },
       "WORKFLOW_BUDGET_INVALID",
     );
+  });
+
+  it("rejects unknown Evidence requirements at the runtime boundary", () => {
+    const manifest = compileWorkflowTopology("solo");
+    const edges = manifest.edges.map((edge, index) => index === 0
+      ? { ...edge, requiredEvidenceKinds: ["unknown-proof"] } as unknown as WorkflowEdge
+      : edge);
+    expectCode(withEdges(manifest, edges), "WORKFLOW_EVIDENCE_REQUIREMENT_INVALID");
+  });
+
+  it("rejects unknown checkpoint policies at the runtime boundary", () => {
+    const manifest = compileWorkflowTopology("solo");
+    const edges = manifest.edges.map((edge, index) => index === 0
+      ? { ...edge, checkpointPolicy: "trust-me" } as unknown as WorkflowEdge
+      : edge);
+    expectCode(withEdges(manifest, edges), "WORKFLOW_CHECKPOINT_POLICY_INVALID");
+  });
+
+  it("rejects a manifest whose declared template is not its registry projection", () => {
+    const assisted = compileWorkflowTopology("assisted");
+    expectCode(
+      { ...assisted, template: "solo" },
+      "WORKFLOW_REGISTRY_PROJECTION_MISMATCH",
+    );
+  });
+
+  it("rejects registered edge metadata drift even when graph structure remains valid", () => {
+    const manifest = compileWorkflowTopology("solo");
+    const edges = manifest.edges.map((edge) => edge.id === "entry.author"
+      ? { ...edge, guard: "risk-unknown" as const }
+      : edge);
+    expectCode(withEdges(manifest, edges), "WORKFLOW_REGISTRY_PROJECTION_MISMATCH");
+  });
+
+  it("rejects registered node execution-mode drift", () => {
+    const manifest = compileWorkflowTopology("solo");
+    const nodes = manifest.nodes.map((node) => node.id === "verify"
+      ? { ...node, executionMode: "read-only-agent" as const }
+      : node);
+    expectCode(withNodes(manifest, nodes), "WORKFLOW_REGISTRY_PROJECTION_MISMATCH");
   });
 });

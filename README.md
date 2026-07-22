@@ -54,9 +54,12 @@ agent-loop topology --run-id r1 --format json
 ```
 
 Every run freezes one validated `solo`, `assisted`, or `reviewed` topology.
-Only the declared verification/review repair edges can move backward, and they
-share a finite repair budget. Concurrent resumes claim each durable edge with
-an atomic lease, so only one process invokes its provider or command.
+The topology is a policy whitelist for deterministic controller decisions, not
+a token-flow graph. Only the declared verification/review repair edges can move
+backward, and they share a finite repair budget. Concurrent resumes use durable
+receipts and an atomic lease to enforce one live executor per edge. This
+suppresses known duplicates, but does not promise exactly-once external effects
+across an effect-before-receipt crash window.
 
 Commands are shown as `agent-loop <...>`; from a checkout without the global
 install, use `npm run loop -- <...>` instead.

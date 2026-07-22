@@ -3,7 +3,9 @@ import {
   decideNextAction,
   decideNextTransition,
   type ProofGapSnapshot,
+  workflowActionForEdge,
 } from "../src/loop.js";
+import { compileWorkflowTopology } from "../src/workflow-topology.js";
 
 const base: ProofGapSnapshot = {
   risk: "low",
@@ -19,7 +21,7 @@ const base: ProofGapSnapshot = {
 };
 
 describe("bounded proof-gap decision", () => {
-  it("selects one minimum action without adding a workflow graph", () => {
+  it("selects one minimum action from the workflow policy", () => {
     expect(decideNextAction(base)).toEqual({ kind: "author", attempt: 1 });
     expect(decideNextAction({ ...base, writer: "patch-ready" })).toEqual({ kind: "checkpoint-commit" });
     expect(decideNextAction({ ...base, writer: "committed" })).toEqual({ kind: "verify" });
@@ -60,21 +62,23 @@ describe("bounded proof-gap decision", () => {
 
   it.each([
     [{ ...base, risk: "unknown" }, "entry.resolve-risk", "risk-unknown", { kind: "resolve-risk" }],
-    [{ ...base, exploration: "missing" }, "entry.explore", "exploration-required", { kind: "explore" }],
-    [{ ...base, exploration: "satisfied" }, "explore.author", "writer-required", { kind: "author", attempt: 1 }],
+    [{ ...base, template: "assisted", exploration: "missing" }, "entry.explore", "exploration-required", { kind: "explore" }],
+    [{ ...base, template: "assisted", exploration: "satisfied" }, "explore.author", "writer-required", { kind: "author", attempt: 1 }],
     [base, "entry.author", "writer-required", { kind: "author", attempt: 1 }],
     [{ ...base, writer: "patch-ready" }, "author.checkpoint", "writer-patch-ready", { kind: "checkpoint-commit" }],
     [{ ...base, writer: "patch-ready", repairsUsed: 1 }, "repair.checkpoint", "writer-patch-ready", { kind: "checkpoint-commit" }],
-    [{ ...base, writer: "committed", acceptance: "missing" }, "checkpoint.acceptance", "acceptance-binding-required", { kind: "bind-acceptance" }],
+    [{ ...base, template: "reviewed", writer: "committed", acceptance: "missing" }, "checkpoint.acceptance", "acceptance-binding-required", { kind: "bind-acceptance" }],
     [{ ...base, writer: "committed" }, "checkpoint.verify", "verification-required", { kind: "verify" }],
-    [{ ...base, writer: "committed", acceptance: "satisfied" }, "acceptance.verify", "verification-required", { kind: "verify" }],
+    [{ ...base, template: "reviewed", writer: "committed", acceptance: "satisfied" }, "acceptance.verify", "verification-required", { kind: "verify" }],
     [{ ...base, writer: "committed", verification: "failed" }, "verify.repair", "verification-failed-repairable", { kind: "repair", attempt: 1 }],
-    [{ ...base, writer: "committed", verification: "passed", review: "missing" }, "verify.review", "review-required", { kind: "review" }],
-    [{ ...base, writer: "committed", verification: "passed", review: "blocking" }, "review.repair", "review-blocking-repairable", { kind: "repair", attempt: 1 }],
+    [{ ...base, template: "reviewed", writer: "committed", verification: "passed", review: "missing" }, "verify.review", "review-required", { kind: "review" }],
+    [{ ...base, template: "reviewed", writer: "committed", verification: "passed", review: "blocking" }, "review.repair", "review-blocking-repairable", { kind: "repair", attempt: 1 }],
     [{ ...base, writer: "committed", verification: "passed" }, "verify.ready", "ready-evidence-satisfied", { kind: "advance-ready" }],
-    [{ ...base, writer: "committed", verification: "passed", review: "passed" }, "review.ready", "ready-evidence-satisfied", { kind: "advance-ready" }],
+    [{ ...base, template: "reviewed", writer: "committed", verification: "passed", review: "passed" }, "review.ready", "ready-evidence-satisfied", { kind: "advance-ready" }],
   ] as const)("binds a deterministic transition to an allowed edge", (snapshot, edgeId, guard, action) => {
-    expect(decideNextTransition(snapshot)).toEqual({ edgeId, guard, action });
+    const decision = decideNextTransition(snapshot, compileWorkflowTopology(snapshot.template));
+    expect(decision).toEqual({ edgeId, guard, action });
+    expect(workflowActionForEdge(edgeId, action.kind === "repair" ? action.attempt : null)).toEqual(action);
   });
 
   it.each([
@@ -82,11 +86,11 @@ describe("bounded proof-gap decision", () => {
     [{ ...base, writer: "failed" }, "Writer failed"],
     [{ ...base, writer: "committed", verification: "failed", repeatedFailure: true }, "Verification failed: repeated failure signature"],
     [{ ...base, writer: "committed", verification: "failed", repairsUsed: 1 }, "Verification failed: repair budget exhausted"],
-    [{ ...base, writer: "committed", verification: "passed", review: "blocking", repeatedFailure: true }, "Review has blocking findings: repeated failure signature"],
-    [{ ...base, writer: "committed", verification: "passed", review: "blocking", repairsUsed: 1 }, "Review has blocking findings: repair budget exhausted"],
-    [{ ...base, writer: "committed", verification: "passed", review: "unavailable" }, "Independent review is unavailable"],
+    [{ ...base, template: "reviewed", writer: "committed", verification: "passed", review: "blocking", repeatedFailure: true }, "Review has blocking findings: repeated failure signature"],
+    [{ ...base, template: "reviewed", writer: "committed", verification: "passed", review: "blocking", repairsUsed: 1 }, "Review has blocking findings: repair budget exhausted"],
+    [{ ...base, template: "reviewed", writer: "committed", verification: "passed", review: "unavailable" }, "Independent review is unavailable"],
   ] as const)("does not claim a topology edge for a terminal block", (snapshot, reason) => {
-    expect(decideNextTransition(snapshot)).toEqual({
+    expect(decideNextTransition(snapshot, compileWorkflowTopology(snapshot.template))).toEqual({
       edgeId: null,
       guard: null,
       action: { kind: "block", reason },
@@ -94,7 +98,7 @@ describe("bounded proof-gap decision", () => {
   });
 
   it("preserves the original edge identity while resuming running author and repair work", () => {
-    expect(decideNextTransition({ ...base, exploration: "satisfied", writer: "running" })).toEqual({
+    expect(decideNextTransition({ ...base, template: "assisted", exploration: "satisfied", writer: "running" })).toEqual({
       edgeId: "explore.author",
       guard: "writer-required",
       action: { kind: "author", attempt: 1 },
@@ -106,6 +110,7 @@ describe("bounded proof-gap decision", () => {
     });
     expect(decideNextTransition({
       ...base,
+      template: "reviewed",
       writer: "running",
       verification: "passed",
       review: "blocking",
@@ -114,6 +119,21 @@ describe("bounded proof-gap decision", () => {
       edgeId: "review.repair",
       guard: "review-blocking-repairable",
       action: { kind: "repair", attempt: 1 },
+    });
+  });
+
+  it("fails closed when a running repair has lost its pending edge provenance", () => {
+    expect(decideNextTransition({
+      ...base,
+      writer: "running",
+      repairsUsed: 1,
+    })).toEqual({
+      edgeId: null,
+      guard: null,
+      action: {
+        kind: "block",
+        reason: "Running repair has no durable pending transition provenance",
+      },
     });
   });
 

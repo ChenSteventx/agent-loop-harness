@@ -2,6 +2,7 @@ import {
   executionTemplates,
   type ExecutionTemplateName,
 } from "./routing.js";
+import { workflowEdgesForTemplate } from "./workflow-transition-registry.js";
 
 export const workflowNodeIds = [
   "entry",
@@ -31,6 +32,15 @@ export type WorkflowGuardId =
   | "ready-evidence-satisfied";
 
 export type WorkflowBudgetId = "repair";
+export type WorkflowEvidenceRequirement =
+  | "writer-output"
+  | "exploration"
+  | "candidate-commit"
+  | "acceptance-binding"
+  | "verification-failure"
+  | "verification"
+  | "review-findings"
+  | "review";
 export type WorkflowExecutionMode =
   | "deterministic"
   | "read-only-agent"
@@ -50,7 +60,7 @@ export interface WorkflowEdge {
   kind: WorkflowEdgeKind;
   guard: WorkflowGuardId;
   budgetId: WorkflowBudgetId | null;
-  requiredEvidenceKinds: readonly string[];
+  requiredEvidenceKinds: readonly WorkflowEvidenceRequirement[];
   checkpointPolicy: WorkflowCheckpointPolicy;
 }
 
@@ -76,28 +86,6 @@ const node = (id: WorkflowNodeId, executionMode: WorkflowExecutionMode): Workflo
   executionMode,
 });
 
-const edge = (
-  id: string,
-  from: WorkflowNodeId,
-  to: WorkflowNodeId,
-  guard: WorkflowGuardId,
-  options: {
-    kind?: WorkflowEdgeKind;
-    budgetId?: WorkflowBudgetId | null;
-    requiredEvidenceKinds?: readonly string[];
-    checkpointPolicy?: WorkflowCheckpointPolicy;
-  } = {},
-): WorkflowEdge => ({
-  id,
-  from,
-  to,
-  kind: options.kind ?? "forward",
-  guard,
-  budgetId: options.budgetId ?? null,
-  requiredEvidenceKinds: options.requiredEvidenceKinds ?? [],
-  checkpointPolicy: options.checkpointPolicy ?? "none",
-});
-
 const commonNodes: readonly WorkflowNode[] = [
   node("entry", "deterministic"),
   node("resolve-risk", "deterministic"),
@@ -107,95 +95,6 @@ const commonNodes: readonly WorkflowNode[] = [
   node("repair", "workspace-write-agent"),
   node("ready", "deterministic"),
 ];
-
-const commonEntryEdges: readonly WorkflowEdge[] = [
-  edge("entry.resolve-risk", "entry", "resolve-risk", "risk-unknown"),
-];
-
-const commonWriterEdges: readonly WorkflowEdge[] = [
-  edge("author.checkpoint", "author", "checkpoint-commit", "writer-patch-ready", {
-    requiredEvidenceKinds: ["writer-output"],
-  }),
-  edge("repair.checkpoint", "repair", "checkpoint-commit", "writer-patch-ready", {
-    requiredEvidenceKinds: ["writer-output"],
-  }),
-];
-
-const verifyRepairEdge = edge(
-  "verify.repair",
-  "verify",
-  "repair",
-  "verification-failed-repairable",
-  {
-    kind: "back",
-    budgetId: "repair",
-    requiredEvidenceKinds: ["verification-failure"],
-    checkpointPolicy: "clean-candidate-commit-required",
-  },
-);
-
-function soloOrAssistedEdges(template: "solo" | "assisted"): readonly WorkflowEdge[] {
-  const entryEdges = template === "assisted"
-    ? [
-        edge("entry.explore", "entry", "explore", "exploration-required"),
-        edge("explore.author", "explore", "author", "writer-required", {
-          requiredEvidenceKinds: ["exploration"],
-        }),
-      ]
-    : [edge("entry.author", "entry", "author", "writer-required")];
-
-  return [
-    ...commonEntryEdges,
-    ...entryEdges,
-    ...commonWriterEdges,
-    edge("checkpoint.verify", "checkpoint-commit", "verify", "verification-required", {
-      requiredEvidenceKinds: ["candidate-commit"],
-      checkpointPolicy: "clean-candidate-commit-required",
-    }),
-    verifyRepairEdge,
-    edge("verify.ready", "verify", "ready", "ready-evidence-satisfied", {
-      requiredEvidenceKinds: ["verification"],
-      checkpointPolicy: "clean-candidate-commit-required",
-    }),
-  ];
-}
-
-function reviewedEdges(): readonly WorkflowEdge[] {
-  return [
-    ...commonEntryEdges,
-    edge("entry.author", "entry", "author", "writer-required"),
-    ...commonWriterEdges,
-    edge(
-      "checkpoint.acceptance",
-      "checkpoint-commit",
-      "bind-acceptance",
-      "acceptance-binding-required",
-      {
-        requiredEvidenceKinds: ["candidate-commit"],
-        checkpointPolicy: "clean-candidate-commit-required",
-      },
-    ),
-    edge("acceptance.verify", "bind-acceptance", "verify", "verification-required", {
-      requiredEvidenceKinds: ["acceptance-binding"],
-      checkpointPolicy: "clean-candidate-commit-required",
-    }),
-    verifyRepairEdge,
-    edge("verify.review", "verify", "review", "review-required", {
-      requiredEvidenceKinds: ["verification"],
-      checkpointPolicy: "clean-candidate-commit-required",
-    }),
-    edge("review.repair", "review", "repair", "review-blocking-repairable", {
-      kind: "back",
-      budgetId: "repair",
-      requiredEvidenceKinds: ["review-findings"],
-      checkpointPolicy: "clean-candidate-commit-required",
-    }),
-    edge("review.ready", "review", "ready", "ready-evidence-satisfied", {
-      requiredEvidenceKinds: ["verification", "review"],
-      checkpointPolicy: "clean-candidate-commit-required",
-    }),
-  ];
-}
 
 export function compileWorkflowTopology(
   template: ExecutionTemplateName,
@@ -211,7 +110,7 @@ export function compileWorkflowTopology(
           ...commonNodes.slice(5),
         ]
       : [...commonNodes];
-  const selectedEdges = template === "reviewed" ? reviewedEdges() : soloOrAssistedEdges(template);
+  const selectedEdges = workflowEdgesForTemplate(template);
 
   return {
     schemaVersion: 1,

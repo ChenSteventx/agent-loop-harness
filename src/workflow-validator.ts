@@ -1,12 +1,20 @@
 import { executionTemplates } from "./routing.js";
-import type {
-  WorkflowBudgetPolicy,
-  WorkflowEdge,
-  WorkflowNodeId,
-  WorkflowTopologyManifest,
+import {
+  isRegisteredWorkflowBackEdge,
+  isWorkflowEvidenceRequirement,
+  workflowEdgeMetadataEqual,
+  workflowEdgesForTemplate,
+} from "./workflow-transition-registry.js";
+import {
+  compileWorkflowTopology,
+  type WorkflowBudgetPolicy,
+  type WorkflowEdge,
+  type WorkflowNodeId,
+  type WorkflowTopologyManifest,
 } from "./workflow-topology.js";
 
 export type WorkflowTopologyErrorCode =
+  | "WORKFLOW_TEMPLATE_INVALID"
   | "WORKFLOW_NODE_DUPLICATED"
   | "WORKFLOW_EDGE_DUPLICATED"
   | "WORKFLOW_BUDGET_DUPLICATED"
@@ -21,6 +29,9 @@ export type WorkflowTopologyErrorCode =
   | "WORKFLOW_BACK_EDGE_INVALID"
   | "WORKFLOW_BUDGET_INVALID"
   | "WORKFLOW_FORWARD_EDGE_BUDGETED"
+  | "WORKFLOW_EVIDENCE_REQUIREMENT_INVALID"
+  | "WORKFLOW_CHECKPOINT_POLICY_INVALID"
+  | "WORKFLOW_REGISTRY_PROJECTION_MISMATCH"
   | "WORKFLOW_READY_BYPASSES_VERIFICATION"
   | "WORKFLOW_READY_BYPASSES_REVIEW"
   | "WORKFLOW_AUTHOR_BYPASSES_EXPLORATION"
@@ -47,6 +58,13 @@ const fail = (
 };
 
 export function validateWorkflowTopology(manifest: WorkflowTopologyManifest): void {
+  if (!Object.prototype.hasOwnProperty.call(executionTemplates, manifest.template)) {
+    fail(
+      "WORKFLOW_TEMPLATE_INVALID",
+      `Workflow template ${String(manifest.template)} is not registered`,
+      { template: manifest.template },
+    );
+  }
   const nodeIds = new Set<string>();
   for (const node of manifest.nodes) {
     if (nodeIds.has(node.id)) {
@@ -84,6 +102,7 @@ export function validateWorkflowTopology(manifest: WorkflowTopologyManifest): vo
         to: edge.to,
       });
     }
+    validateEdgeProofPolicy(edge);
     validateEdgeBudget(edge, budgets);
   }
 
@@ -125,6 +144,7 @@ export function validateWorkflowTopology(manifest: WorkflowTopologyManifest): vo
   validateForwardDag(manifest);
   validateDominators(manifest);
   validateWriteAuthority(manifest);
+  validateRegistryProjection(manifest);
 }
 
 function budgetMap(budgets: readonly WorkflowBudgetPolicy[]): Map<string, WorkflowBudgetPolicy> {
@@ -165,10 +185,7 @@ function validateEdgeBudget(
     return;
   }
 
-  const allowed =
-    (edge.id === "verify.repair" && edge.from === "verify" && edge.to === "repair") ||
-    (edge.id === "review.repair" && edge.from === "review" && edge.to === "repair");
-  if (!allowed) {
+  if (!isRegisteredWorkflowBackEdge(edge)) {
     fail("WORKFLOW_BACK_EDGE_INVALID", `Back edge ${edge.id} is not an approved repair edge`, {
       edgeId: edge.id,
       from: edge.from,
@@ -186,6 +203,87 @@ function validateEdgeBudget(
       edgeId: edge.id,
       budgetId: edge.budgetId,
     });
+  }
+}
+
+function validateEdgeProofPolicy(edge: WorkflowEdge): void {
+  for (const requirement of edge.requiredEvidenceKinds) {
+    if (!isWorkflowEvidenceRequirement(requirement)) {
+      fail(
+        "WORKFLOW_EVIDENCE_REQUIREMENT_INVALID",
+        `Edge ${edge.id} declares unknown Evidence requirement ${requirement}`,
+        { edgeId: edge.id, requirement },
+      );
+    }
+  }
+  if (
+    edge.checkpointPolicy !== "none" &&
+    edge.checkpointPolicy !== "clean-candidate-commit-required"
+  ) {
+    fail(
+      "WORKFLOW_CHECKPOINT_POLICY_INVALID",
+      `Edge ${edge.id} declares unknown checkpoint policy ${edge.checkpointPolicy}`,
+      { edgeId: edge.id, checkpointPolicy: edge.checkpointPolicy },
+    );
+  }
+}
+
+function validateRegistryProjection(manifest: WorkflowTopologyManifest): void {
+  const expectedManifest = compileWorkflowTopology(manifest.template);
+  if (
+    manifest.schemaVersion !== expectedManifest.schemaVersion ||
+    manifest.entryNode !== expectedManifest.entryNode ||
+    manifest.readyNode !== expectedManifest.readyNode ||
+    manifest.failureDisposition !== expectedManifest.failureDisposition
+  ) {
+    fail(
+      "WORKFLOW_REGISTRY_PROJECTION_MISMATCH",
+      `Workflow envelope is not the registered ${manifest.template} projection`,
+      { template: manifest.template, section: "envelope" },
+    );
+  }
+
+  const nodeMismatchIndex = expectedManifest.nodes.findIndex((node, index) => {
+    const actual = manifest.nodes[index];
+    return actual === undefined || node.id !== actual.id || node.executionMode !== actual.executionMode;
+  });
+  if (manifest.nodes.length !== expectedManifest.nodes.length || nodeMismatchIndex !== -1) {
+    const index = nodeMismatchIndex === -1
+      ? Math.min(manifest.nodes.length, expectedManifest.nodes.length)
+      : nodeMismatchIndex;
+    fail(
+      "WORKFLOW_REGISTRY_PROJECTION_MISMATCH",
+      `Workflow nodes are not the registered ${manifest.template} projection`,
+      {
+        template: manifest.template,
+        section: "nodes",
+        index,
+        expectedNodeId: expectedManifest.nodes[index]?.id ?? null,
+        actualNodeId: manifest.nodes[index]?.id ?? null,
+      },
+    );
+  }
+
+  const expected = workflowEdgesForTemplate(manifest.template);
+  const edgeMismatchIndex = expected.findIndex((edge, index) => {
+    const actual = manifest.edges[index];
+    return actual === undefined || !workflowEdgeMetadataEqual(edge, actual);
+  });
+  if (manifest.edges.length !== expected.length || edgeMismatchIndex !== -1) {
+    const index = edgeMismatchIndex === -1
+      ? Math.min(manifest.edges.length, expected.length)
+      : edgeMismatchIndex;
+    fail(
+      "WORKFLOW_REGISTRY_PROJECTION_MISMATCH",
+      `Workflow edges are not the registered ${manifest.template} projection`,
+      {
+        template: manifest.template,
+        section: "edges",
+        index,
+        expectedEdgeId: expected[index]?.id ?? null,
+        actualEdgeId: manifest.edges[index]?.id ?? null,
+      },
+    );
   }
 }
 

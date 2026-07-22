@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CommandRunner, type CommandRequest, type CommandResult } from "../src/execution.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { GenericNodeProjectAdapter, loadTaskSpec } from "../src/project.js";
-import { createRunBinding } from "../src/bindings.js";
+import { createRunBinding, operationInputHash } from "../src/bindings.js";
 import type { RunBindingV1 } from "../src/domain.js";
 import type {
   ProviderAdapter,
@@ -861,7 +861,22 @@ describe("Orchestrator", () => {
       const blocked = await orchestrator.resume("run-v1");
       expect(blocked.run).toMatchObject({
         status: "blocked",
-        blocked: { checkpointRef: "run-binding" },
+        blocked: {
+          checkpointRef: "run-binding",
+          reason: expect.stringContaining("cannot be migrated in place"),
+          recovery: { kind: "human-action-required", actionType: "start-new-run" },
+        },
+      });
+
+      orchestrator.store.createRun("run-unbound", taskSpec.id);
+      const unbound = await orchestrator.resume("run-unbound");
+      expect(unbound.run).toMatchObject({
+        status: "blocked",
+        blocked: {
+          checkpointRef: "run-binding",
+          reason: expect.stringContaining("cannot be migrated in place"),
+          recovery: { kind: "human-action-required", actionType: "start-new-run" },
+        },
       });
 
       orchestrator.store.database.prepare(
@@ -904,7 +919,7 @@ describe("Orchestrator", () => {
           manifest: {
             ...current.workflow.manifest,
             edges: current.workflow.manifest.edges.map((edge, index) => index === 0
-              ? { ...edge, requiredEvidenceKinds: [...edge.requiredEvidenceKinds, "tampered"] }
+              ? { ...edge, requiredEvidenceKinds: [...edge.requiredEvidenceKinds, "tampered" as never] }
               : edge),
           },
         },
@@ -921,6 +936,29 @@ describe("Orchestrator", () => {
 
       const blocked = await orchestrator.resume("run-tampered-topology");
       expect(blocked.run).toMatchObject({
+        status: "blocked",
+        blocked: { checkpointRef: "run-binding" },
+      });
+
+      const driftedManifest = {
+        ...current.workflow.manifest,
+        edges: current.workflow.manifest.edges.map((edge) => edge.id === "entry.author"
+          ? { ...edge, guard: "risk-unknown" as const }
+          : edge),
+      };
+      const driftedBinding = {
+        ...current,
+        workflow: {
+          manifest: driftedManifest,
+          topologyHash: operationInputHash(driftedManifest),
+        },
+      };
+      orchestrator.store.createBoundRun("run-drifted-topology", taskSpec.id, driftedBinding);
+      expect(() => orchestrator.derivedView("run-drifted-topology")).toThrow(
+        "WORKFLOW_REGISTRY_PROJECTION_MISMATCH",
+      );
+      expect(orchestrator.status("run-drifted-topology").run.status).toBe("open");
+      expect((await orchestrator.resume("run-drifted-topology")).run).toMatchObject({
         status: "blocked",
         blocked: { checkpointRef: "run-binding" },
       });

@@ -9,6 +9,7 @@
 
 ### Reliability
 
-- Workflow edges use durable SQLite traversal receipts, a shared finite repair budget, and atomic execution leases to prevent duplicate provider or command execution during concurrent resume.
+- Topology compilation, ordered guard evaluation, and traversal action reconstruction now share one typed transition registry; frozen manifests must match its complete node/edge projection, and unknown proof requirements fail closed.
+- Workflow edges use durable SQLite traversal receipts, a shared finite repair budget, and atomic execution leases for single-live-owner execution and durable duplicate suppression during concurrent resume. External effect-before-receipt windows are explicitly not claimed as exactly-once.
 - Crash recovery validates every pending receipt against its frozen edge, action, budget ordinal, topology hash, and deterministic identity before continuing.
-- Active legacy V1 runs and tampered V2 bindings fail closed, while terminal legacy facts remain readable.
+- Active legacy V1 runs and tampered V2 bindings fail closed, while terminal legacy facts remain readable. V1 recovery is explicitly start-new-run; there is no in-place migration or transfer of legacy Evidence/worktrees.

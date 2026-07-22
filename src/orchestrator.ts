@@ -334,11 +334,12 @@ export class Orchestrator {
       };
     }
     try {
+      const binding = this.requireWorkflowBinding(runId, { blockOnMismatch: false });
       const pending = this.store.getPendingWorkflowTraversal(runId);
       const snapshot = this.proofGapSnapshot(runId, { reconcile: false });
       return {
         status: run.status,
-        nextAction: pending?.action ?? decideNextTransition(snapshot).action,
+        nextAction: pending?.action ?? decideNextTransition(snapshot, binding.workflow.manifest).action,
         proofGaps: snapshot,
         budget: run.binding?.budget ?? null,
         recovery: null,
@@ -668,7 +669,7 @@ export class Orchestrator {
       return { action: pending.action, edgeId: pending.edgeId, guard: edge.guard };
     }
     const snapshot = this.proofGapSnapshot(runId);
-    const decision = decideNextTransition(snapshot) as PreparedWorkflowDecision;
+    const decision = decideNextTransition(snapshot, binding.workflow.manifest) as PreparedWorkflowDecision;
     Object.defineProperty(decision, preparedSourceStateHash, {
       value: this.workflowSourceStateHash(runId, snapshot),
       enumerable: false,
@@ -2885,21 +2886,26 @@ export class Orchestrator {
     if (!run) throw new Error(`Run not found: ${runId}`);
     if (!run.binding) {
       this.store.invalidateAllEvidence(runId);
-      this.block(runId, "Run predates immutable task binding; start a new run", "run-binding");
+      this.block(
+        runId,
+        "Run predates immutable task binding and cannot be migrated in place; start a new run with a new run ID",
+        "run-binding",
+        { kind: "human-action-required", actionType: "start-new-run" },
+      );
       return null;
     }
 
+    const legacyTopologyBinding = run.binding.version !== 2;
     const mismatches: string[] = [];
     if (run.binding.version !== 2) {
       mismatches.push("workflow topology binding (start a new run)");
+    } else if (operationInputHash(run.binding.workflow.manifest) !== run.binding.workflow.topologyHash) {
+      mismatches.push("workflow topology hash");
     } else {
       try {
         validateWorkflowTopology(run.binding.workflow.manifest);
         if (run.binding.workflow.manifest.template !== run.binding.executionTemplate) {
           mismatches.push("workflow template");
-        }
-        if (operationInputHash(run.binding.workflow.manifest) !== run.binding.workflow.topologyHash) {
-          mismatches.push("workflow topology hash");
         }
       } catch {
         mismatches.push("workflow topology manifest");
@@ -2933,8 +2939,13 @@ export class Orchestrator {
       this.store.invalidateAllEvidence(runId);
       this.block(
         runId,
-        `Immutable run binding mismatch: ${[...new Set(mismatches)].join(", ")}`,
+        legacyTopologyBinding
+          ? `Active V1 runs cannot be migrated in place; preserve this run for inspection and start a new run with a new run ID. Binding mismatch: ${[...new Set(mismatches)].join(", ")}`
+          : `Immutable run binding mismatch: ${[...new Set(mismatches)].join(", ")}`,
         "run-binding",
+        legacyTopologyBinding
+          ? { kind: "human-action-required", actionType: "start-new-run" }
+          : undefined,
       );
       return null;
     }
@@ -2957,13 +2968,13 @@ export class Orchestrator {
     let reason: string | null = null;
     if (binding.version !== 2) {
       reason = "Run predates frozen workflow topology; start a new run";
+    } else if (operationInputHash(binding.workflow.manifest) !== binding.workflow.topologyHash) {
+      reason = "Frozen workflow topology hash does not match its manifest";
     } else {
       try {
         validateWorkflowTopology(binding.workflow.manifest);
         if (binding.workflow.manifest.template !== binding.executionTemplate) {
           reason = "Frozen workflow template does not match the execution template";
-        } else if (operationInputHash(binding.workflow.manifest) !== binding.workflow.topologyHash) {
-          reason = "Frozen workflow topology hash does not match its manifest";
         }
       } catch (error) {
         reason = error instanceof Error ? error.message : "Frozen workflow topology is invalid";

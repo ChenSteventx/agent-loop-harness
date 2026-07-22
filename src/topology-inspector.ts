@@ -23,12 +23,12 @@ export function inspectFrozenTopology(loopHome: string, runId: string): FrozenTo
     const binding = run.binding;
     if (!binding) throw new Error(`Run ${runId} has no immutable binding`);
     if (binding.version !== 2) throw new Error("Run predates frozen workflow topology; start a new run");
+    if (operationInputHash(binding.workflow.manifest) !== binding.workflow.topologyHash) {
+      throw new Error("Frozen workflow topology hash does not match its manifest");
+    }
     validateWorkflowTopology(binding.workflow.manifest);
     if (binding.workflow.manifest.template !== binding.executionTemplate) {
       throw new Error("Frozen workflow template does not match the execution template");
-    }
-    if (operationInputHash(binding.workflow.manifest) !== binding.workflow.topologyHash) {
-      throw new Error("Frozen workflow topology hash does not match its manifest");
     }
     return {
       topologyHash: binding.workflow.topologyHash,
