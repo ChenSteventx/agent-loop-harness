@@ -17,12 +17,14 @@ Shadow is non-authoritative. Canary is disabled by default and requires complete
 ## Boundaries
 
 - `domain.ts` owns the small Run lifecycle and the Run, Operation, Evidence, and Event facts.
-- `store.ts` is the single SQLite state authority. Run changes and their Events share a transaction.
+- `workflow-topology.ts` compiles the three fixed manifests; `workflow-validator.ts` rejects undeclared endpoints, unsafe write authority, unbounded back edges, cycles, and paths that bypass required proof.
+- `store.ts` is the single SQLite state authority. Run changes and their Events share a transaction. It also reserves durable workflow-edge receipts and atomically leases each pending edge to one executor.
 - `execution.ts` obtains Git facts, creates isolated Git worktrees, and records real command process facts.
 - `provider.ts` adapts `codex exec --json` into captured process and JSONL facts. Provider output never changes Run state directly.
 - `project.ts` loads validated YAML and supplies a generic Node project policy.
-- `orchestrator.ts` is the only coordinator. It invokes one Author, verifies a committed worktree, installs commit-bound Evidence, and requests legal deterministic transitions.
-- `cli.ts` exposes bounded commands. `mark-merged` records an existing current repository HEAD and never performs a merge.
+- `orchestrator.ts` is the only coordinator. It invokes one Author, verifies a committed worktree, installs commit-bound Evidence, and requests only transitions declared by the Run's frozen topology.
+- `topology-inspector.ts` opens existing formal state read-only and validates the frozen topology without creating a directory or running a migration.
+- `cli.ts` exposes bounded commands. `topology` is strict read-only inspection; `mark-merged` records an existing current repository HEAD and never performs a merge.
 
 `LOOP_HOME` contains the SQLite database, task worktrees, and command/provider artifacts. It defaults to the private `~/.agent-loop-harness` directory, outside target repositories. Target repositories contain only Git-authored task changes.
 
@@ -30,7 +32,7 @@ Shadow is non-authoritative. Canary is disabled by default and requires complete
 
 Verification Evidence depends on the observed commit SHA, project policy version, and step identity. A changed dependency invalidates old Evidence before the Run can return to `ready`.
 
-Resume reads the durable Run, Operation, Event, Evidence, worktree existence, HEAD, and dirty state. If a provider committed before a crash but its Operation was not finished, resume recognizes the changed clean HEAD, installs the missing deterministic state once, and does not invoke the Author again. Unknown or dirty states fail closed.
+Resume reads the durable Run, Operation, Event, Evidence, workflow traversal, worktree existence, HEAD, and dirty state. Each selected edge is persisted before execution, validated against the frozen manifest and repair budget, then claimed with an expiring owner/token lease. Concurrent resumes therefore observe the same receipt but only one invokes the provider or command; completion uses compare-and-swap ownership. If a provider committed before a crash but its Operation was not finished, resume recognizes the changed clean HEAD, installs the missing deterministic state once, and does not invoke the Author again. Unknown, dirty, legacy-active, or topology-mismatched states fail closed.
 
 After a human merge, `mark-merged` requires the supplied SHA to be the current HEAD of the supplied repository. Resume runs post-merge commands there. Failure keeps the merge SHA and blocks with a remediation instruction; success permits `merged -> done`.
 

@@ -6,8 +6,9 @@ The model proposes; deterministic code decides. Run state, Git commits,
 command exit codes, verification evidence, review validation, and promotion
 of learned configuration are all owned by the harness — a model saying
 "tests pass" is never proof. See `USAGE.md` for a full practical
-walkthrough, `README.zh-CN.md` for the full documentation (Chinese), and
-`AGENTS.md` for the hard boundaries.
+walkthrough, `README.zh-CN.md` for the full documentation (Chinese),
+`docs/ARCHITECTURE.md` for the runtime boundaries, and `AGENTS.md` for the
+hard constraints. Release notes are in `CHANGELOG.md`.
 
 ## Requirements
 
@@ -47,7 +48,15 @@ agent-loop run --run-id r1 --task /path/to/your-repo/task.yaml --repository /pat
 # Inspect durable state, plus the derived view (next action, proof gaps,
 # budget usage, typed recovery):
 agent-loop status --run-id r1 --derived
+
+# Inspect the immutable workflow and durable edge history without writing state:
+agent-loop topology --run-id r1 --format json
 ```
+
+Every run freezes one validated `solo`, `assisted`, or `reviewed` topology.
+Only the declared verification/review repair edges can move backward, and they
+share a finite repair budget. Concurrent resumes claim each durable edge with
+an atomic lease, so only one process invokes its provider or command.
 
 Commands are shown as `agent-loop <...>`; from a checkout without the global
 install, use `npm run loop -- <...>` instead.

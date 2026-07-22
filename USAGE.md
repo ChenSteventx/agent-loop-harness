@@ -86,6 +86,19 @@ and — for a blocked run — a typed recovery disposition.
   `already-committed` / `human-action-required` / `terminal`); do not retry
   blindly.
 
+To inspect the exact workflow contract and its durable progress without
+creating, migrating, or changing formal state:
+
+```bash
+agent-loop topology --run-id r1 --format json
+```
+
+The output includes the immutable topology hash and manifest, completed and
+pending edge receipts, and repair-budget usage. A run can traverse only edges
+in that frozen manifest. The only backward edges are bounded repair paths from
+verification or independent review, and concurrent resumes lease an edge so
+its provider or command is invoked once.
+
 ### 4. Merge it yourself, then reach done
 
 The harness does not merge. After you merge the ready candidate:

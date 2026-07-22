@@ -229,6 +229,20 @@ author 提示词）、`provider-routing`、`role-model-selection`（逐次调用
 npm run loop -- status --run-id <RUN_ID> --derived
 ```
 
+每个新 Run 会在创建时冻结并校验一份 `solo`、`assisted` 或 `reviewed` 拓扑；恢复时
+只能沿冻结清单中的边推进。仅 `verify.repair` 与 `review.repair` 允许回退，并共享有限
+Repair 预算。并发恢复会先原子领取边执行租约，未持有租约的进程不会重复调用 Provider
+或验证命令。
+
+严格只读地查看冻结拓扑、持久化遍历记录、待执行边和预算使用量：
+
+```bash
+npm run loop -- topology --run-id <RUN_ID> --format json
+```
+
+该命令不会创建状态目录，也不会迁移或修改 `state.sqlite`。活跃 V1 Run 或被篡改的
+V2 拓扑会失败关闭；已经结束的旧 Run 事实仍可通过状态接口读取。
+
 ## 声明式项目接入（非 Node 项目）
 
 多数项目不需要写 TypeScript Adapter，一份 JSON 配置即可接入：
@@ -309,6 +323,8 @@ Evolution Outbox 没有正式 Run 的写权限。
 
 - `START-CODEX.md`：可直接粘贴给 Codex 的单段总 Prompt。
 - `AGENTS.md`：全仓库约束。
+- `CHANGELOG.md`：版本发布说明。
+- `docs/ARCHITECTURE.md`：Runtime、冻结拓扑、持久化与恢复边界。
 - `plan/THREE-PHASES.zh-CN.md`：三期路线。
 - `tasks/`：有限任务卡。
 - `automation/continue.mjs`：连续执行器。
