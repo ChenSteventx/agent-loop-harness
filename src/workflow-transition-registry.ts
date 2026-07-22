@@ -311,7 +311,11 @@ const blockRules: readonly WorkflowBlockRule[] = [
   ),
   block(130, "Independent review is unavailable", (snapshot) => snapshot.review === "unavailable"),
   block(150, "Required Evidence is incomplete", (snapshot) => !readyEvidenceSatisfied(snapshot)),
-  block(160, "No registered workflow transition matches the proof state", () => true),
+  block(
+    160,
+    "No registered workflow transition matches the proof state",
+    (snapshot) => readyEvidenceSatisfied(snapshot),
+  ),
 ];
 
 for (const rule of edgeRules) {
