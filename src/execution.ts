@@ -62,6 +62,16 @@ export class GitService {
     return this.git(["status", "--porcelain=v1", "--untracked-files=all"]).length > 0;
   }
 
+  workflowControlState(knownHead?: string): { dirty: boolean; controlStateHash: string } {
+    const head = knownHead ?? this.head();
+    const status = this.git(["status", "--porcelain=v2", "--branch", "--untracked-files=all"]);
+    const dirty = status.split(/\r?\n/u).some((line) => line.length > 0 && !line.startsWith("#"));
+    return {
+      dirty,
+      controlStateHash: createHash("sha256").update(head).update("\0").update(status).digest("hex"),
+    };
+  }
+
   diff(): string {
     const tracked = this.git(["diff", "--binary", "HEAD"]);
     this.assertWithinBudget("maximumDiffBytes", Buffer.byteLength(tracked), "tracked diff");
@@ -147,8 +157,8 @@ export class GitService {
     return this.git(["rev-parse", `${commitSha}^`]).trim();
   }
 
-  controlStateHash(): string {
-    const head = this.head();
+  controlStateHash(knownHead?: string): string {
+    const head = knownHead ?? this.head();
     const branch = this.branch();
     const index = this.git(["ls-files", "--stage", "-z"]);
     const headReflog = this.git(["reflog", "show", "HEAD", "--format=%H%x00%gD%x00%gs"]);

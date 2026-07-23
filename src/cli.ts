@@ -1,11 +1,10 @@
 #!/usr/bin/env node
-
 // Keep the top-level help path independent of the database, orchestration,
 // evaluation, and OCI module graph. Besides making `--help` reliable on slow
 // filesystems, this guarantees that asking for usage information cannot open
 // state or probe an execution backend.
 const topLevelCommands = new Set([
-  "init", "run", "status", "resume", "verify", "mark-merged", "metrics", "eval",
+  "init", "run", "status", "topology", "resume", "verify", "mark-merged", "metrics", "eval",
   "replay", "shadow", "proposal", "config", "canary", "notify", "human", "memory",
 ]);
 const arguments_ = process.argv.slice(2);
@@ -34,6 +33,7 @@ Commands:
   init                       initialize the private loop state directory
   run [options]              create a worktree and execute the fixed risk-routed proof loop
   status [options]           show durable run state after completion or interruption
+  topology [options]         show the frozen workflow topology and durable edge traversals
   resume [options]           inspect durable facts and continue the next deterministic action
   verify [options]           run configured verification in the task worktree
   mark-merged [options]      record a supplied real merge commit without performing a merge

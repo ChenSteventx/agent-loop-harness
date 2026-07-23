@@ -248,6 +248,27 @@ author 提示词）、`provider-routing`、`role-model-selection`（逐次调用
 npm run loop -- status --run-id <RUN_ID> --derived
 ```
 
+每个新 Run 会在创建时冻结并校验一份 `solo`、`assisted` 或 `reviewed` 拓扑；恢复时
+只能沿冻结清单中的边推进。该拓扑是确定性控制器的冻结策略/约束层，不是持久化
+`currentNode` 或令牌在节点间流动的执行引擎；进度由 Run、Operation、Evidence、Git、预算
+与边回执等事实推导。仅 `verify.repair` 与 `review.repair` 允许回退，并共享有限 Repair 预算。
+
+并发恢复通过原子租约保证同一条边只有一个存活执行者，并用持久回执和确定性对账抑制
+可识别的重复执行，但不承诺外部副作用端到端 exactly-once。若外部效果已经发生、进程却在
+回执完成前崩溃，除非集成提供稳定幂等键或可从权威状态对账，租约过期后的恢复仍可能重放。
+
+严格只读地查看冻结拓扑、持久化遍历记录、待执行边和预算使用量：
+
+```bash
+npm run loop -- topology --run-id <RUN_ID> --format json
+```
+
+该命令不会创建状态目录，也不会迁移或修改 `state.sqlite`。活跃 V1 Run 或被篡改的
+V2 拓扑会失败关闭；已经结束的旧 Run 事实仍可通过状态接口读取。活跃 V1 Run 不支持
+原地或批量迁移：保留旧 Run ID 供审计，先检查未合并工作，再在干净仓库上以新 Run ID
+执行 `run`。新 Run 会冻结全新的 V2 Binding/拓扑，不复制旧 Evidence、不接管旧 Worktree，
+也不伪造历史边回执。
+
 ## 声明式项目接入（非 Node 项目）
 
 多数项目不需要写 TypeScript Adapter，一份 JSON 配置即可接入：
@@ -329,6 +350,8 @@ Evolution Outbox 没有正式 Run 的写权限。
 
 - `START-CODEX.md`：可直接粘贴给 Codex 的单段总 Prompt。
 - `AGENTS.md`：全仓库约束。
+- `CHANGELOG.md`：版本发布说明。
+- `docs/ARCHITECTURE.md`：Runtime、冻结拓扑、持久化与恢复边界。
 - `plan/THREE-PHASES.zh-CN.md`：三期路线。
 - `tasks/`：有限任务卡。
 - `automation/continue.mjs`：连续执行器。

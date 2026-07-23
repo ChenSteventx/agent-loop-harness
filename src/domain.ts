@@ -39,8 +39,7 @@ export interface Run {
   updatedAt: string;
 }
 
-export interface RunBinding {
-  version: 1;
+export interface RunBindingBase {
   taskSpecPath: string;
   taskSpec: import("./task-spec.js").TaskSpec;
   taskSpecHash: string;
@@ -64,6 +63,41 @@ export interface RunBinding {
   // prompt builds and manifest re-renders in later processes cannot drift
   // as the memory store changes.
   memoryAdvisory: string | null;
+}
+
+export interface RunBindingV1 extends RunBindingBase {
+  version: 1;
+}
+
+export interface WorkflowBinding {
+  manifest: import("./workflow-topology.js").WorkflowTopologyManifest;
+  topologyHash: string;
+}
+
+export interface RunBindingV2 extends RunBindingBase {
+  version: 2;
+  workflow: WorkflowBinding;
+}
+
+export type RunBinding = RunBindingV1 | RunBindingV2;
+
+export type WorkflowTraversalStatus = "reserved" | "completed";
+
+export interface WorkflowTraversal {
+  id: string;
+  runId: string;
+  topologyHash: string;
+  edgeId: string;
+  budgetId: import("./workflow-topology.js").WorkflowBudgetId | null;
+  budgetOrdinal: number | null;
+  idempotencyKey: string;
+  sourceStateHash: string;
+  action: import("./loop.js").NextAction;
+  status: WorkflowTraversalStatus;
+  operationId: string | null;
+  result: unknown | null;
+  selectedAt: string;
+  completedAt: string | null;
 }
 
 export type OperationStatus = "running" | "succeeded" | "failed";

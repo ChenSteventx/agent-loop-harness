@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { defaultRunBudget } from "./budget.js";
 import { openSqliteDatabase } from "./sqlite.js";
 import {
@@ -13,10 +14,12 @@ import {
   type RunBinding,
   type RunStatus,
   type TransitionOptions,
+  type WorkflowTraversal,
 } from "./domain.js";
 import { canonicalJson, evidenceDependencyHash, operationInputHash } from "./bindings.js";
 import { applyRiskEscalation, routeRisk, type Risk } from "./routing.js";
 import type { InvocationManifest } from "./evaluation/manifests.js";
+import type { WorkflowBudgetId } from "./workflow-topology.js";
 
 type Sqlite = ReturnType<typeof openSqliteDatabase>;
 
@@ -89,6 +92,66 @@ export type EvidenceInstallInput = Omit<
   dependencyVersion?: 1;
   now?: string;
 };
+
+export interface ReserveWorkflowTraversalInput {
+  id: string;
+  runId: string;
+  topologyHash: string;
+  edgeId: string;
+  budgetId: WorkflowBudgetId | null;
+  maximumTraversals?: number;
+  idempotencyKey: string;
+  sourceStateHash: string;
+  action: WorkflowTraversal["action"];
+  now?: string;
+}
+
+export interface WorkflowTraversalExecutionLease {
+  traversalId: string;
+  owner: string;
+  token: string;
+  expiresAt: string;
+}
+
+export class WorkflowTraversalConflictError extends Error {
+  readonly code = "WORKFLOW_TRAVERSAL_CONFLICT" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkflowTraversalConflictError";
+  }
+}
+
+export class WorkflowBudgetExceededError extends Error {
+  readonly code = "WORKFLOW_BUDGET_EXHAUSTED" as const;
+
+  constructor(
+    readonly runId: string,
+    readonly budgetId: WorkflowBudgetId,
+    readonly used: number,
+    readonly maximumTraversals: number,
+  ) {
+    super(
+      `Workflow budget ${budgetId} exhausted for run ${runId}: ${used}/${maximumTraversals} traversals reserved`,
+    );
+    this.name = "WorkflowBudgetExceededError";
+  }
+}
+
+export class WorkflowTemplateEscalationRequiredError extends Error {
+  readonly code = "WORKFLOW_TEMPLATE_ESCALATION_REQUIRED" as const;
+
+  constructor(
+    readonly runId: string,
+    readonly risk: Risk,
+    readonly frozenTemplate: RunBinding["executionTemplate"],
+  ) {
+    super(
+      `Frozen workflow template ${frozenTemplate} cannot handle ${risk} risk for run ${runId}`,
+    );
+    this.name = "WorkflowTemplateEscalationRequiredError";
+  }
+}
 
 export class SqliteStore {
   readonly database: Sqlite;
@@ -170,6 +233,31 @@ export class SqliteStore {
       if (!current.binding) throw new Error(`Run ${id} has no binding to escalate`);
       const risk = applyRiskEscalation(current.binding.risk, proposedFloor);
       if (risk === current.binding.risk) return current;
+      if (current.binding.version === 2) {
+        try {
+          routeRisk(risk, [current.binding.executionTemplate]);
+        } catch {
+          throw new WorkflowTemplateEscalationRequiredError(
+            id,
+            risk,
+            current.binding.executionTemplate,
+          );
+        }
+        const updated: Run = {
+          ...current,
+          binding: { ...current.binding, risk },
+          updatedAt: now,
+        };
+        this.database.prepare("UPDATE runs SET binding_json = ?, updated_at = ? WHERE id = ?")
+          .run(JSON.stringify(updated.binding), now, id);
+        this.insertEvent(id, "run.risk-escalated", {
+          from: current.binding.risk,
+          to: risk,
+          executionTemplate: current.binding.executionTemplate,
+          source,
+        }, now);
+        return updated;
+      }
       const updated: Run = {
         ...current,
         binding: {
@@ -252,6 +340,284 @@ export class SqliteStore {
       data: parseJson(row.data_json),
       createdAt: row.created_at,
     }));
+  }
+
+  reserveWorkflowTraversal(input: ReserveWorkflowTraversalInput): WorkflowTraversal {
+    validateTraversalReservation(input);
+    const selectedAt = input.now ?? new Date().toISOString();
+    const transaction = this.database.transaction(() => {
+      this.requireRun(input.runId);
+
+      const existing = this.workflowTraversalByKey(input.runId, input.idempotencyKey);
+      if (existing) {
+        assertTraversalReservationMatches(existing, input);
+        return existing;
+      }
+
+      const reusedId = this.getWorkflowTraversal(input.id);
+      if (reusedId) {
+        throw new WorkflowTraversalConflictError(
+          `Workflow traversal id ${input.id} was used for different content`,
+        );
+      }
+
+      const pending = this.getPendingWorkflowTraversal(input.runId);
+      if (pending) {
+        throw new WorkflowTraversalConflictError(
+          `Run ${input.runId} already has reserved workflow traversal ${pending.id}`,
+        );
+      }
+
+      let budgetOrdinal: number | null = null;
+      if (input.budgetId !== null) {
+        const used = this.workflowBudgetUsage(input.runId, input.budgetId);
+        const maximumTraversals = input.maximumTraversals!;
+        if (used >= maximumTraversals) {
+          throw new WorkflowBudgetExceededError(
+            input.runId,
+            input.budgetId,
+            used,
+            maximumTraversals,
+          );
+        }
+        budgetOrdinal = used + 1;
+      }
+
+      this.database.prepare(
+        `INSERT INTO workflow_traversals
+         (id, run_id, topology_hash, edge_id, budget_id, budget_ordinal,
+          idempotency_key, source_state_hash, action_json, status, operation_id,
+          result_json, selected_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?, NULL)`,
+      ).run(
+        input.id,
+        input.runId,
+        input.topologyHash,
+        input.edgeId,
+        input.budgetId,
+        budgetOrdinal,
+        input.idempotencyKey,
+        input.sourceStateHash,
+        JSON.stringify(input.action),
+        selectedAt,
+      );
+      this.insertEvent(input.runId, "workflow.edge.reserved", {
+        traversalId: input.id,
+        topologyHash: input.topologyHash,
+        edgeId: input.edgeId,
+        budgetId: input.budgetId,
+        budgetOrdinal,
+        idempotencyKey: input.idempotencyKey,
+        sourceStateHash: input.sourceStateHash,
+        action: input.action,
+      }, selectedAt);
+      return this.requireWorkflowTraversal(input.id);
+    });
+
+    try {
+      return transaction.immediate();
+    } catch (error) {
+      if (isWorkflowTraversalError(error)) throw error;
+      throw contextualize(error, `Cannot reserve workflow traversal ${input.id}`);
+    }
+  }
+
+  completeWorkflowTraversal(
+    id: string,
+    result: unknown,
+    lease: WorkflowTraversalExecutionLease,
+    operationId: string | null = null,
+    now = new Date().toISOString(),
+  ): WorkflowTraversal {
+    const transaction = this.database.transaction(() => {
+      const current = this.requireWorkflowTraversal(id);
+      if (lease.traversalId !== id) {
+        throw new WorkflowTraversalConflictError(
+          `Workflow traversal lease ${lease.traversalId} cannot complete ${id}`,
+        );
+      }
+      if (operationId !== null) {
+        const operation = this.requireOperation(operationId);
+        if (operation.runId !== current.runId) {
+          throw new WorkflowTraversalConflictError(
+            `Operation ${operationId} belongs to run ${operation.runId}, not ${current.runId}`,
+          );
+        }
+      }
+
+      if (current.status === "completed") {
+        if (
+          this.workflowTraversalLeaseMatches(id, lease) &&
+          current.operationId === operationId &&
+          canonicalJson(current.result) === canonicalJson(result)
+        ) {
+          return current;
+        }
+        throw new WorkflowTraversalConflictError(
+          `Workflow traversal ${id} was already completed with different content`,
+        );
+      }
+
+      const serializedResult = JSON.stringify(result);
+      if (serializedResult === undefined) {
+        throw new TypeError("Workflow traversal result must be JSON-serializable");
+      }
+      const updated = this.database.prepare(
+        `UPDATE workflow_traversals
+         SET status = 'completed', operation_id = ?, result_json = ?, completed_at = ?
+         WHERE id = ? AND status = 'reserved'
+           AND execution_owner = ? AND execution_token = ?`,
+      ).run(operationId, serializedResult, now, id, lease.owner, lease.token);
+      if (updated.changes !== 1) {
+        throw new WorkflowTraversalConflictError(
+          `Workflow traversal ${id} completion lost its execution lease`,
+        );
+      }
+      this.insertEvent(current.runId, "workflow.edge.completed", {
+        traversalId: id,
+        topologyHash: current.topologyHash,
+        edgeId: current.edgeId,
+        budgetId: current.budgetId,
+        budgetOrdinal: current.budgetOrdinal,
+        idempotencyKey: current.idempotencyKey,
+        sourceStateHash: current.sourceStateHash,
+        action: current.action,
+        executionOwner: lease.owner,
+        operationId,
+        result,
+      }, now);
+      return this.requireWorkflowTraversal(id);
+    });
+
+    try {
+      return transaction.immediate();
+    } catch (error) {
+      if (isWorkflowTraversalError(error)) throw error;
+      throw contextualize(error, `Cannot complete workflow traversal ${id}`);
+    }
+  }
+
+  claimWorkflowTraversalExecution(
+    id: string,
+    owner: string,
+    leaseDurationMs: number,
+    now = new Date().toISOString(),
+  ): WorkflowTraversalExecutionLease | null {
+    const normalizedOwner = requiredTraversalText(owner, "Workflow traversal execution owner");
+    const nowMs = timestampMilliseconds(now, "Workflow traversal lease time");
+    const claimedAt = new Date(nowMs).toISOString();
+    const duration = positiveSafeInteger(leaseDurationMs, "Workflow traversal lease duration");
+    const expiresAt = leaseExpiry(nowMs, duration);
+    const token = randomUUID();
+    const transaction = this.database.transaction(() => {
+      const traversal = this.requireWorkflowTraversal(id);
+      if (traversal.status === "completed") return null;
+      const claimed = this.database.prepare(
+        `UPDATE workflow_traversals
+         SET execution_owner = ?, execution_token = ?, execution_lease_expires_at = ?
+         WHERE id = ? AND status = 'reserved'
+           AND (execution_token IS NULL OR execution_lease_expires_at <= ?)`,
+      ).run(normalizedOwner, token, expiresAt, id, claimedAt);
+      if (claimed.changes !== 1) return null;
+      this.insertEvent(traversal.runId, "workflow.edge.execution-claimed", {
+        traversalId: id,
+        executionOwner: normalizedOwner,
+        leaseExpiresAt: expiresAt,
+      }, claimedAt);
+      return { traversalId: id, owner: normalizedOwner, token, expiresAt };
+    });
+    try {
+      return transaction.immediate();
+    } catch (error) {
+      if (isWorkflowTraversalError(error)) throw error;
+      throw contextualize(error, `Cannot claim workflow traversal ${id}`);
+    }
+  }
+
+  renewWorkflowTraversalExecution(
+    lease: WorkflowTraversalExecutionLease,
+    leaseDurationMs: number,
+    now = new Date().toISOString(),
+  ): WorkflowTraversalExecutionLease | null {
+    validateWorkflowTraversalLease(lease);
+    const nowMs = timestampMilliseconds(now, "Workflow traversal lease renewal time");
+    const duration = positiveSafeInteger(leaseDurationMs, "Workflow traversal lease duration");
+    const expiresAt = leaseExpiry(nowMs, duration);
+    const transaction = this.database.transaction(() => {
+      const renewed = this.database.prepare(
+        `UPDATE workflow_traversals
+         SET execution_lease_expires_at = ?
+         WHERE id = ? AND status = 'reserved'
+           AND execution_owner = ? AND execution_token = ?`,
+      ).run(expiresAt, lease.traversalId, lease.owner, lease.token);
+      return renewed.changes === 1 ? { ...lease, expiresAt } : null;
+    });
+    try {
+      return transaction.immediate();
+    } catch (error) {
+      throw contextualize(error, `Cannot renew workflow traversal ${lease.traversalId}`);
+    }
+  }
+
+  releaseWorkflowTraversalExecution(
+    lease: WorkflowTraversalExecutionLease,
+    now = new Date().toISOString(),
+  ): boolean {
+    validateWorkflowTraversalLease(lease);
+    const transaction = this.database.transaction(() => {
+      const current = this.requireWorkflowTraversal(lease.traversalId);
+      const released = this.database.prepare(
+        `UPDATE workflow_traversals
+         SET execution_owner = NULL, execution_token = NULL, execution_lease_expires_at = NULL
+         WHERE id = ? AND status = 'reserved'
+           AND execution_owner = ? AND execution_token = ?`,
+      ).run(lease.traversalId, lease.owner, lease.token);
+      if (released.changes === 1) {
+        this.insertEvent(current.runId, "workflow.edge.execution-released", {
+          traversalId: lease.traversalId,
+          executionOwner: lease.owner,
+        }, now);
+      }
+      return released.changes === 1;
+    });
+    try {
+      return transaction.immediate();
+    } catch (error) {
+      throw contextualize(error, `Cannot release workflow traversal ${lease.traversalId}`);
+    }
+  }
+
+  getWorkflowTraversal(id: string): WorkflowTraversal | null {
+    const row = this.database.prepare("SELECT * FROM workflow_traversals WHERE id = ?").get(id) as
+      | WorkflowTraversalRow
+      | undefined;
+    return row ? mapWorkflowTraversal(row) : null;
+  }
+
+  listWorkflowTraversals(runId: string): WorkflowTraversal[] {
+    this.requireRun(runId);
+    const rows = this.database.prepare(
+      "SELECT * FROM workflow_traversals WHERE run_id = ? ORDER BY selected_at, id",
+    ).all(runId) as WorkflowTraversalRow[];
+    return rows.map(mapWorkflowTraversal);
+  }
+
+  workflowBudgetUsage(runId: string, budgetId: WorkflowBudgetId): number {
+    this.requireRun(runId);
+    const row = this.database.prepare(
+      `SELECT COUNT(*) AS used FROM workflow_traversals
+       WHERE run_id = ? AND budget_id = ? AND status IN ('reserved', 'completed')`,
+    ).get(runId, budgetId) as { used: number };
+    return row.used;
+  }
+
+  getPendingWorkflowTraversal(runId: string): WorkflowTraversal | null {
+    this.requireRun(runId);
+    const row = this.database.prepare(
+      `SELECT * FROM workflow_traversals
+       WHERE run_id = ? AND status = 'reserved' ORDER BY selected_at, id LIMIT 1`,
+    ).get(runId) as WorkflowTraversalRow | undefined;
+    return row ? mapWorkflowTraversal(row) : null;
   }
 
   createOperation(input: {
@@ -768,6 +1134,30 @@ export class SqliteStore {
     return mapEvidence(row);
   }
 
+  private workflowTraversalByKey(runId: string, idempotencyKey: string): WorkflowTraversal | null {
+    const row = this.database.prepare(
+      "SELECT * FROM workflow_traversals WHERE run_id = ? AND idempotency_key = ?",
+    ).get(runId, idempotencyKey) as WorkflowTraversalRow | undefined;
+    return row ? mapWorkflowTraversal(row) : null;
+  }
+
+  private requireWorkflowTraversal(id: string): WorkflowTraversal {
+    const traversal = this.getWorkflowTraversal(id);
+    if (!traversal) throw new Error(`Workflow traversal not found: ${id}`);
+    return traversal;
+  }
+
+  private workflowTraversalLeaseMatches(
+    id: string,
+    lease: WorkflowTraversalExecutionLease,
+  ): boolean {
+    const row = this.database.prepare(
+      `SELECT 1 FROM workflow_traversals
+       WHERE id = ? AND execution_owner = ? AND execution_token = ?`,
+    ).get(id, lease.owner, lease.token);
+    return row !== undefined;
+  }
+
   private migrate(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS runs (
@@ -870,6 +1260,44 @@ export class SqliteStore {
         manifest_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS workflow_traversals (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        topology_hash TEXT NOT NULL,
+        edge_id TEXT NOT NULL,
+        budget_id TEXT,
+        budget_ordinal INTEGER,
+        idempotency_key TEXT NOT NULL,
+        source_state_hash TEXT NOT NULL,
+        action_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('reserved', 'completed')),
+        operation_id TEXT REFERENCES operations(id),
+        result_json TEXT,
+        selected_at TEXT NOT NULL,
+        completed_at TEXT,
+        execution_owner TEXT,
+        execution_token TEXT,
+        execution_lease_expires_at TEXT,
+        UNIQUE(run_id, idempotency_key),
+        CHECK(
+          (budget_id IS NULL AND budget_ordinal IS NULL) OR
+          (budget_id IS NOT NULL AND budget_ordinal IS NOT NULL AND budget_ordinal > 0)
+        ),
+        CHECK(
+          (status = 'reserved' AND completed_at IS NULL AND result_json IS NULL) OR
+          (status = 'completed' AND completed_at IS NOT NULL AND result_json IS NOT NULL)
+        ),
+        CHECK(
+          (execution_owner IS NULL AND execution_token IS NULL AND execution_lease_expires_at IS NULL) OR
+          (execution_owner IS NOT NULL AND execution_token IS NOT NULL AND execution_lease_expires_at IS NOT NULL)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS workflow_traversals_run_edge
+        ON workflow_traversals(run_id, edge_id);
+      CREATE INDEX IF NOT EXISTS workflow_traversals_run_budget
+        ON workflow_traversals(run_id, budget_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS workflow_traversals_one_reserved_per_run
+        ON workflow_traversals(run_id) WHERE status = 'reserved';
     `);
     this.ensureColumn("runs", "binding_json", "TEXT");
     this.ensureColumn("operations", "input_json", "TEXT");
@@ -881,6 +1309,9 @@ export class SqliteStore {
     this.ensureColumn("outbox", "deduplication_key", "TEXT");
     this.ensureColumn("outbox", "dead_lettered_at", "TEXT");
     this.ensureColumn("outbox", "provider_message_id", "TEXT");
+    this.ensureColumn("workflow_traversals", "execution_owner", "TEXT");
+    this.ensureColumn("workflow_traversals", "execution_token", "TEXT");
+    this.ensureColumn("workflow_traversals", "execution_lease_expires_at", "TEXT");
     this.database.prepare("UPDATE outbox SET next_attempt_at = created_at WHERE next_attempt_at IS NULL").run();
     const legacyOutbox = this.database.prepare(
       "SELECT id FROM outbox WHERE deduplication_key IS NULL OR deduplication_key = '' ORDER BY id",
@@ -898,6 +1329,7 @@ export class SqliteStore {
         this.database.pragma("user_version = 2");
       })();
     }
+    if (version < 3) this.database.pragma("user_version = 3");
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -917,6 +1349,23 @@ interface InvocationManifestRow {
   role: string;
   manifest_json: string;
   created_at: string;
+}
+
+interface WorkflowTraversalRow {
+  id: string;
+  run_id: string;
+  topology_hash: string;
+  edge_id: string;
+  budget_id: WorkflowBudgetId | null;
+  budget_ordinal: number | null;
+  idempotency_key: string;
+  source_state_hash: string;
+  action_json: string;
+  status: WorkflowTraversal["status"];
+  operation_id: string | null;
+  result_json: string | null;
+  selected_at: string;
+  completed_at: string | null;
 }
 
 interface RunRow {
@@ -1026,6 +1475,25 @@ function mapOperation(row: OperationRow): Operation {
   };
 }
 
+function mapWorkflowTraversal(row: WorkflowTraversalRow): WorkflowTraversal {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    topologyHash: row.topology_hash,
+    edgeId: row.edge_id,
+    budgetId: row.budget_id,
+    budgetOrdinal: row.budget_ordinal,
+    idempotencyKey: row.idempotency_key,
+    sourceStateHash: row.source_state_hash,
+    action: parseJson(row.action_json) as WorkflowTraversal["action"],
+    status: row.status,
+    operationId: row.operation_id,
+    result: row.result_json === null ? null : parseJson(row.result_json),
+    selectedAt: row.selected_at,
+    completedAt: row.completed_at,
+  };
+}
+
 function mapEvidence(row: EvidenceRow): Evidence {
   return {
     id: row.id,
@@ -1102,6 +1570,93 @@ function validateHumanResolution(resolution: HumanResolution): void {
     (resolution.outcome !== "confirmed" && resolution.outcome !== "rejected") ||
     !(resolution.note === null || typeof resolution.note === "string")
   ) throw new Error("Human resolution requires a Finding id and confirmed or rejected outcome");
+}
+
+function validateTraversalReservation(input: ReserveWorkflowTraversalInput): void {
+  const required = [
+    ["id", input.id],
+    ["runId", input.runId],
+    ["topologyHash", input.topologyHash],
+    ["edgeId", input.edgeId],
+    ["idempotencyKey", input.idempotencyKey],
+    ["sourceStateHash", input.sourceStateHash],
+  ] as const;
+  for (const [field, value] of required) {
+    if (!value.trim()) throw new Error(`Workflow traversal ${field} is required`);
+  }
+  if (input.budgetId === null) {
+    if (input.maximumTraversals !== undefined) {
+      throw new Error("Unbudgeted workflow traversal cannot specify maximumTraversals");
+    }
+  } else if (
+    !Number.isInteger(input.maximumTraversals) ||
+    (input.maximumTraversals ?? 0) <= 0
+  ) {
+    throw new Error("Budgeted workflow traversal requires a positive maximumTraversals");
+  }
+  const serializedAction = JSON.stringify(input.action);
+  if (serializedAction === undefined) {
+    throw new TypeError("Workflow traversal action must be JSON-serializable");
+  }
+}
+
+function validateWorkflowTraversalLease(lease: WorkflowTraversalExecutionLease): void {
+  requiredTraversalText(lease.traversalId, "Workflow traversal lease traversal id");
+  requiredTraversalText(lease.owner, "Workflow traversal execution owner");
+  requiredTraversalText(lease.token, "Workflow traversal execution token");
+  timestampMilliseconds(lease.expiresAt, "Workflow traversal lease expiry");
+}
+
+function timestampMilliseconds(value: string, label: string): number {
+  const parsed = Date.parse(requiredTraversalText(value, label));
+  if (!Number.isFinite(parsed)) throw new Error(`${label} must be an ISO timestamp`);
+  return parsed;
+}
+
+function requiredTraversalText(value: string, label: string): string {
+  if (!value.trim()) throw new Error(`${label} is required`);
+  return value;
+}
+
+function positiveSafeInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${label} must be a positive integer`);
+  return value;
+}
+
+function leaseExpiry(nowMs: number, durationMs: number): string {
+  const expiry = nowMs + durationMs;
+  if (!Number.isSafeInteger(expiry)) throw new Error("Workflow traversal lease expiry is out of range");
+  try {
+    return new Date(expiry).toISOString();
+  } catch {
+    throw new Error("Workflow traversal lease expiry is out of range");
+  }
+}
+
+function assertTraversalReservationMatches(
+  existing: WorkflowTraversal,
+  input: ReserveWorkflowTraversalInput,
+): void {
+  if (
+    existing.id !== input.id ||
+    existing.runId !== input.runId ||
+    existing.topologyHash !== input.topologyHash ||
+    existing.edgeId !== input.edgeId ||
+    existing.budgetId !== input.budgetId ||
+    existing.idempotencyKey !== input.idempotencyKey ||
+    existing.sourceStateHash !== input.sourceStateHash ||
+    canonicalJson(existing.action) !== canonicalJson(input.action)
+  ) {
+    throw new WorkflowTraversalConflictError(
+      `Workflow traversal idempotency key ${input.idempotencyKey} was used for different content`,
+    );
+  }
+}
+
+function isWorkflowTraversalError(
+  error: unknown,
+): error is WorkflowTraversalConflictError | WorkflowBudgetExceededError {
+  return error instanceof WorkflowTraversalConflictError || error instanceof WorkflowBudgetExceededError;
 }
 
 function parseJson(value: string): unknown {

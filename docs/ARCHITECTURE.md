@@ -17,20 +17,32 @@ Shadow is non-authoritative. Canary is disabled by default and requires complete
 ## Boundaries
 
 - `domain.ts` owns the small Run lifecycle and the Run, Operation, Evidence, and Event facts.
-- `store.ts` is the single SQLite state authority. Run changes and their Events share a transaction.
+- `workflow-topology.ts` compiles the three fixed manifests; `workflow-validator.ts` rejects undeclared endpoints, unsafe write authority, unbounded back edges, cycles, and paths that bypass required proof.
+- `store.ts` is the single SQLite state authority. Run changes and their Events share a transaction. It also reserves durable workflow-edge receipts and atomically leases each pending edge to one executor.
 - `execution.ts` obtains Git facts, creates isolated Git worktrees, and records real command process facts.
 - `provider.ts` adapts `codex exec --json` into captured process and JSONL facts. Provider output never changes Run state directly.
 - `project.ts` loads validated YAML and supplies a generic Node project policy.
-- `orchestrator.ts` is the only coordinator. It invokes one Author, verifies a committed worktree, installs commit-bound Evidence, and requests legal deterministic transitions.
-- `cli.ts` exposes bounded commands. `mark-merged` records an existing current repository HEAD and never performs a merge.
+- `orchestrator.ts` is the only coordinator. It invokes one Author, verifies a committed worktree, installs commit-bound Evidence, and requests only transitions declared by the Run's frozen topology.
+- `topology-inspector.ts` opens existing formal state read-only and validates the frozen topology without creating a directory or running a migration.
+- `cli.ts` exposes bounded commands. `topology` is strict read-only inspection; `mark-merged` records an existing current repository HEAD and never performs a merge.
 
 `LOOP_HOME` contains the SQLite database, task worktrees, and command/provider artifacts. It defaults to the private `~/.agent-loop-harness` directory, outside target repositories. Target repositories contain only Git-authored task changes.
+
+## Workflow topology semantics
+
+The frozen topology is a policy and constraint layer over the deterministic controller. Its manifest whitelists possible transitions, attaches guards and proof/checkpoint requirements, identifies the only bounded back edges, and gives durable receipts an immutable identity. It is not a token-flow execution engine: the Run does not persist a `currentNode`, move tokens between nodes, or infer authority from graph reachability alone.
+
+The controller derives the next eligible transition from durable Run, Operation, Evidence, Git, and budget facts. It persists that selected transition as a receipt before execution, and resume validates the receipt against the frozen manifest. Completed and pending receipts are therefore an auditable transition history, not a substitute for the underlying proof state. Adding true token-flow semantics later would require an explicit schema and continuity model rather than reinterpreting these receipts.
 
 ## Recovery and evidence
 
 Verification Evidence depends on the observed commit SHA, project policy version, and step identity. A changed dependency invalidates old Evidence before the Run can return to `ready`.
 
-Resume reads the durable Run, Operation, Event, Evidence, worktree existence, HEAD, and dirty state. If a provider committed before a crash but its Operation was not finished, resume recognizes the changed clean HEAD, installs the missing deterministic state once, and does not invoke the Author again. Unknown or dirty states fail closed.
+Resume reads the durable Run, Operation, Event, Evidence, workflow traversal, worktree existence, HEAD, and dirty state. Each selected edge is persisted before execution, validated against the frozen manifest and repair budget, then claimed with an expiring owner/token lease. Concurrent resumes therefore observe the same receipt, and only one live lease owner is authorized to invoke the provider or command; completion uses compare-and-swap ownership. Durable identities and reconciliation suppress duplicates the harness can recognize. If a provider committed before a crash but its Operation was not finished, resume recognizes the changed clean HEAD, installs the missing deterministic state once, and does not invoke the Author again. Unknown, dirty, legacy-active, or topology-mismatched states fail closed.
+
+These controls provide single-live-owner execution plus durable duplicate suppression, not end-to-end exactly-once delivery. An external provider or command can produce an effect before the process durably completes its receipt. After the lease expires, recovery cannot safely distinguish every such effect from no effect. “Effectively once” applies only where the integration supplies a stable idempotency key or the harness can reconcile the effect from authoritative state (as with the clean changed-HEAD recovery above); other external effects must be designed as idempotent or accept possible replay.
+
+Active V1 runs have no frozen topology binding and are never upgraded in place. Resume fails closed with a `start-new-run` recovery action; terminal V1 facts remain readable. Operators keep the old run for audit and create a new run ID against a clean repository. No V1 Evidence, worktree ownership, or synthetic traversal history is transferred into the new V2 run.
 
 After a human merge, `mark-merged` requires the supplied SHA to be the current HEAD of the supplied repository. Resume runs post-merge commands there. Failure keeps the merge SHA and blocks with a remediation instruction; success permits `merged -> done`.
 

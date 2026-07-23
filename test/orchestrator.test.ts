@@ -6,7 +6,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { containedCommandResult } from "./oci-fixture.js";
 import { CommandRunner, type CommandRequest, type CommandResult } from "../src/execution.js";
 import { Orchestrator } from "../src/orchestrator.js";
-import { GenericNodeProjectAdapter } from "../src/project.js";
+import { GenericNodeProjectAdapter, loadTaskSpec } from "../src/project.js";
+import { createRunBinding, operationInputHash } from "../src/bindings.js";
+import type { RunBindingV1 } from "../src/domain.js";
 import type {
   ProviderAdapter,
   ProviderProbe,
@@ -132,6 +134,31 @@ class FakeAuthor implements ProviderAdapter {
 
   async cancel(): Promise<boolean> {
     return false;
+  }
+}
+
+class BlockingAuthor extends FakeAuthor {
+  entries = 0;
+  private releaseWriter!: () => void;
+  private writerStarted!: () => void;
+  readonly started = new Promise<void>((resolveStarted) => {
+    this.writerStarted = resolveStarted;
+  });
+  private readonly released = new Promise<void>((resolveReleased) => {
+    this.releaseWriter = resolveReleased;
+  });
+
+  override async run(request: ProviderRunRequest): Promise<ProviderRunResult> {
+    if (request.workspaceAccess === "workspace-write") {
+      this.entries += 1;
+      this.writerStarted();
+      await this.released;
+    }
+    return super.run(request);
+  }
+
+  release(): void {
+    this.releaseWriter();
   }
 }
 
@@ -552,12 +579,16 @@ describe("Orchestrator", () => {
       runId: "run-risk-changed-files", taskPath: fixture.taskPath, targetRepository: fixture.root,
     });
 
-    expect(view.run.binding).toMatchObject({ risk: "high", executionTemplate: "reviewed" });
+    expect(view.run.binding).toMatchObject({ risk: "low", executionTemplate: "solo" });
     expect(view.run.status).toBe("blocked");
+    expect(view.run.blocked).toMatchObject({
+      checkpointRef: "workflow-template-escalation",
+      recovery: { kind: "human-action-required", actionType: "start-new-run" },
+    });
     expect(view.events).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        type: "run.risk-escalated",
-        data: expect.objectContaining({ from: "low", to: "high" }),
+        type: "WORKFLOW_TEMPLATE_ESCALATION_REQUIRED",
+        data: expect.objectContaining({ changedFiles: expect.arrayContaining(["src/security/policy.txt"]) }),
       }),
     ]));
     orchestrator.close();
@@ -718,15 +749,242 @@ describe("Orchestrator", () => {
       orchestrator.start({ runId: "run-crash", taskPath: fixture.taskPath, targetRepository: fixture.root }),
     ).rejects.toThrow("simulated crash");
     expect(orchestrator.status("run-crash").operations[0]?.status).toBe("running");
+    expect(orchestrator.status("run-crash").workflowTraversals).toMatchObject([
+      { edgeId: "entry.author", status: "reserved", action: { kind: "author", attempt: 1 } },
+    ]);
 
     const resumed = await orchestrator.resume("run-crash");
     expect(resumed.run.status).toBe("ready");
     expect(provider.calls).toBe(1);
+    expect(resumed.workflowTraversals.every((traversal) => traversal.status === "completed")).toBe(true);
     expect(resumed.events.some((event) => event.type === "author.recovered")).toBe(true);
     const counts = [resumed.operations.length, resumed.evidence.length, resumed.events.length];
     const repeated = await orchestrator.resume("run-crash");
     expect([repeated.operations.length, repeated.evidence.length, repeated.events.length]).toEqual(counts);
     orchestrator.close();
+  }, 60_000);
+
+  it("leases a pending edge so concurrent resumes invoke the Author only once", async () => {
+    const fixture = targetRepository();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    const seedingProvider = new FakeAuthor();
+    const seeding = new Orchestrator({
+      loopHome,
+      provider: seedingProvider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+      faults: {
+        afterWriterOperationCreated: () => {
+          throw new Error("pause after reserving the Author edge");
+        },
+      },
+    });
+    await expect(seeding.start({
+      runId: "run-concurrent-resume",
+      taskPath: fixture.taskPath,
+      targetRepository: fixture.root,
+    })).rejects.toThrow("pause after reserving");
+    expect(seedingProvider.calls).toBe(0);
+    expect(seeding.status("run-concurrent-resume").workflowTraversals.at(-1)).toMatchObject({
+      edgeId: "entry.author",
+      status: "reserved",
+    });
+    seeding.close();
+
+    const provider = new BlockingAuthor();
+    const first = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+    });
+    const second = new Orchestrator({
+      loopHome,
+      provider,
+      projectAdapter: new GenericNodeProjectAdapter(),
+    });
+    const winningResume = first.resume("run-concurrent-resume");
+    await provider.started;
+    const observer = await second.resume("run-concurrent-resume");
+    expect(observer.run.status).toBe("open");
+    expect(provider.entries).toBe(1);
+
+    provider.release();
+    const completed = await winningResume;
+    expect(completed.run.status).toBe("ready");
+    expect(provider.entries).toBe(1);
+    expect(provider.calls).toBe(1);
+    expect(completed.workflowTraversals.every((traversal) => traversal.status === "completed"))
+      .toBe(true);
+    second.close();
+    first.close();
+  }, 90_000);
+
+  it("blocks a tampered durable traversal before executing its action", async () => {
+    const fixture = targetRepository();
+    const provider = new FakeAuthor();
+    const orchestrator = createOrchestrator(
+      fixture,
+      provider,
+      new GenericNodeProjectAdapter(),
+      { afterWriterOperationCreated: () => { throw new Error("pause after reservation"); } },
+    );
+    try {
+      await expect(orchestrator.start({
+        runId: "run-tampered-traversal",
+        taskPath: fixture.taskPath,
+        targetRepository: fixture.root,
+      })).rejects.toThrow("pause after reservation");
+      orchestrator.store.database.prepare(
+        "UPDATE workflow_traversals SET action_json = ? WHERE run_id = ? AND status = 'reserved'",
+      ).run(JSON.stringify({ kind: "advance-ready" }), "run-tampered-traversal");
+
+      const blocked = await orchestrator.resume("run-tampered-traversal");
+
+      expect(blocked.run).toMatchObject({
+        status: "blocked",
+        blocked: { checkpointRef: "workflow-traversal" },
+      });
+      expect(provider.calls).toBe(0);
+      expect(blocked.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "WORKFLOW_TRAVERSAL_CONFLICT" }),
+      ]));
+    } finally {
+      orchestrator.close();
+    }
+  }, 30_000);
+
+  it("fails closed for an active V1 run while keeping terminal V1 facts readable", async () => {
+    const fixture = targetRepository();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    const orchestrator = new Orchestrator({
+      loopHome,
+      provider: new FakeAuthor(),
+      projectAdapter: new GenericNodeProjectAdapter(),
+    });
+    try {
+      const taskSpec = loadTaskSpec(fixture.taskPath);
+      const current = createRunBinding({
+        taskSpecPath: fixture.taskPath,
+        taskSpec,
+        baselineCommit: git(fixture.root, ["rev-parse", "HEAD"]),
+        sourceRepository: fixture.root,
+        worktreePath: fixture.root,
+        providerProfile: "LEGACY_SINGLE_PROVIDER",
+        projectAdapter: new GenericNodeProjectAdapter(),
+      });
+      if (current.version !== 2) throw new Error("Expected a V2 binding");
+      const { workflow: _workflow, ...base } = current;
+      const legacy: RunBindingV1 = { ...base, version: 1 };
+      orchestrator.store.createBoundRun("run-v1", taskSpec.id, legacy);
+
+      const blocked = await orchestrator.resume("run-v1");
+      expect(blocked.run).toMatchObject({
+        status: "blocked",
+        blocked: {
+          checkpointRef: "run-binding",
+          reason: expect.stringContaining("cannot be migrated in place"),
+          recovery: { kind: "human-action-required", actionType: "start-new-run" },
+        },
+      });
+
+      orchestrator.store.createRun("run-unbound", taskSpec.id);
+      const unbound = await orchestrator.resume("run-unbound");
+      expect(unbound.run).toMatchObject({
+        status: "blocked",
+        blocked: {
+          checkpointRef: "run-binding",
+          reason: expect.stringContaining("cannot be migrated in place"),
+          recovery: { kind: "human-action-required", actionType: "start-new-run" },
+        },
+      });
+
+      orchestrator.store.database.prepare(
+        "UPDATE runs SET status = 'done', blocked_json = NULL WHERE id = ?",
+      ).run("run-v1");
+      expect(orchestrator.status("run-v1").run).toMatchObject({
+        status: "done",
+        binding: { version: 1 },
+      });
+    } finally {
+      orchestrator.close();
+    }
+  }, 20_000);
+
+  it("keeps derived inspection read-only before blocking a tampered V2 topology", async () => {
+    const fixture = targetRepository();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    const orchestrator = new Orchestrator({
+      loopHome,
+      provider: new FakeAuthor(),
+      projectAdapter: new GenericNodeProjectAdapter(),
+    });
+    try {
+      const taskSpec = loadTaskSpec(fixture.taskPath);
+      const current = createRunBinding({
+        taskSpecPath: fixture.taskPath,
+        taskSpec,
+        baselineCommit: git(fixture.root, ["rev-parse", "HEAD"]),
+        sourceRepository: fixture.root,
+        worktreePath: fixture.root,
+        providerProfile: "LEGACY_SINGLE_PROVIDER",
+        projectAdapter: new GenericNodeProjectAdapter(),
+      });
+      if (current.version !== 2) throw new Error("Expected a V2 binding");
+      const binding = {
+        ...current,
+        workflow: {
+          ...current.workflow,
+          manifest: {
+            ...current.workflow.manifest,
+            edges: current.workflow.manifest.edges.map((edge, index) => index === 0
+              ? { ...edge, requiredEvidenceKinds: [...edge.requiredEvidenceKinds, "tampered" as never] }
+              : edge),
+          },
+        },
+      };
+      orchestrator.store.createBoundRun("run-tampered-topology", taskSpec.id, binding);
+      const before = orchestrator.status("run-tampered-topology");
+
+      expect(() => orchestrator.derivedView("run-tampered-topology")).toThrow(
+        "Frozen workflow topology hash does not match its manifest",
+      );
+      const observed = orchestrator.status("run-tampered-topology");
+      expect(observed.run.status).toBe("open");
+      expect(observed.events).toEqual(before.events);
+
+      const blocked = await orchestrator.resume("run-tampered-topology");
+      expect(blocked.run).toMatchObject({
+        status: "blocked",
+        blocked: { checkpointRef: "run-binding" },
+      });
+
+      const driftedManifest = {
+        ...current.workflow.manifest,
+        edges: current.workflow.manifest.edges.map((edge) => edge.id === "entry.author"
+          ? { ...edge, guard: "risk-unknown" as const }
+          : edge),
+      };
+      const driftedBinding = {
+        ...current,
+        workflow: {
+          manifest: driftedManifest,
+          topologyHash: operationInputHash(driftedManifest),
+        },
+      };
+      orchestrator.store.createBoundRun("run-drifted-topology", taskSpec.id, driftedBinding);
+      expect(() => orchestrator.derivedView("run-drifted-topology")).toThrow(
+        "WORKFLOW_REGISTRY_PROJECTION_MISMATCH",
+      );
+      expect(orchestrator.status("run-drifted-topology").run.status).toBe("open");
+      expect((await orchestrator.resume("run-drifted-topology")).run).toMatchObject({
+        status: "blocked",
+        blocked: { checkpointRef: "run-binding" },
+      });
+    } finally {
+      orchestrator.close();
+    }
   }, 20_000);
 
   it("recovers a crash after the Harness commit without invoking the Author again", async () => {
@@ -747,13 +1005,16 @@ describe("Orchestrator", () => {
     expect(orchestrator.status("run-commit-crash").operations.at(-1)).toMatchObject({
       kind: "checkpoint-commit", status: "running",
     });
+    expect(orchestrator.status("run-commit-crash").workflowTraversals.at(-1)).toMatchObject({
+      edgeId: "author.checkpoint", status: "reserved",
+    });
 
     const resumed = await orchestrator.resume("run-commit-crash");
     expect(resumed.run.status).toBe("ready");
     expect(provider.calls).toBe(1);
     expect(resumed.events.some((event) => event.type === "candidate-commit.recovered")).toBe(true);
     orchestrator.close();
-  }, 20_000);
+  }, 60_000);
 
   it("refuses to bless an external same-parent commit during checkpoint recovery", async () => {
     const fixture = targetRepository();
@@ -906,7 +1167,7 @@ describe("CLI surface", () => {
       encoding: "utf8",
     });
     expect(result.status).toBe(0);
-    for (const command of ["init", "run", "status", "resume", "verify", "mark-merged"]) {
+    for (const command of ["init", "run", "status", "topology", "resume", "verify", "mark-merged"]) {
       expect(result.stdout).toContain(command);
     }
     expect(result.stdout).toContain("--provider-profile");

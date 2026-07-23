@@ -125,6 +125,44 @@ and — for a blocked run — a typed recovery disposition.
   `already-committed` / `human-action-required` / `terminal`); do not retry
   blindly.
 
+To inspect the exact workflow contract and its durable progress without
+creating, migrating, or changing formal state:
+
+```bash
+agent-loop topology --run-id r1 --format json
+```
+
+The output includes the immutable topology hash and manifest, completed and
+pending edge receipts, and repair-budget usage. A run can traverse only edges
+in that frozen manifest. The only backward edges are bounded repair paths from
+verification or independent review. This topology is a frozen policy/constraint
+layer over deterministic decisions; it is not a `currentNode` cursor or a graph
+whose tokens flow between nodes. Progress is derived from durable Run,
+Operation, Evidence, Git, and transition-receipt facts.
+
+Concurrent resumes lease an edge so only one live owner is allowed to invoke
+its provider or command. Durable receipts and deterministic reconciliation
+suppress duplicates that the harness can recognize. They are not a universal
+exactly-once guarantee: if an external effect happens and the process dies
+before its receipt is durably completed, recovery may invoke it again unless
+that integration supplies an idempotency key or effect reconciliation.
+
+### Upgrading an active V1 run
+
+An active V1 run has no frozen topology binding, so it cannot be resumed or
+migrated in place. Its recorded facts remain available to `status` for audit.
+Preserve the old run ID, inspect any unmerged work, and start a V2 run with a
+new run ID from a clean repository:
+
+```bash
+agent-loop status --run-id old-v1
+agent-loop run --run-id new-v2 --task ./task.yaml --repository /path/to/repo
+```
+
+The new run freezes a fresh binding and topology. The harness does not copy V1
+Evidence, adopt its worktree, or synthesize traversal receipts. There is no
+bulk or in-place V1 migration command.
+
 ### 4. Merge it yourself, then reach done
 
 The harness does not merge. After you merge the ready candidate:

@@ -40,6 +40,7 @@ const expectedBindingKeys = [
   "canaryAssignmentId",
   "configSource",
   "runtimeConfiguration",
+  "workflow",
 ].sort();
 
 describe("RunBinding construction contract", () => {
@@ -70,12 +71,16 @@ describe("RunBinding construction contract", () => {
       expect(value, `binding field ${key} must be defined`).not.toBeUndefined();
     }
     expect(built).toMatchObject({
-      version: 1,
+      version: 2,
       configSource: "default",
       configurationVariantId: null,
       runtimeConfiguration: null,
       budget: defaultRunBudget(),
     });
+    expect(built.version).toBe(2);
+    if (built.version !== 2) throw new Error("new bindings must use the V2 workflow contract");
+    expect(built.workflow.topologyHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(built.workflow.manifest.template).toBe(built.executionTemplate);
   });
 
   it("validates budget boundaries and rejects non-positive limits", () => {

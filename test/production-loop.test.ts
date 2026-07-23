@@ -149,6 +149,24 @@ describe("production CLI loop", () => {
     expect(reloaded.derived.budget?.maximumDiffBytes).toBeGreaterThan(0);
     expect(reloaded.derived.proofGaps).not.toBeNull();
 
+    const topology = runCli([
+      "--loop-home", loopHome, "--provider-profile", "CODEX_PRIMARY",
+      "topology", "--run-id", runId, "--format", "json",
+    ], environment) as {
+      topologyHash: string;
+      manifest: { template: string; edges: Array<{ id: string }> };
+      traversals: Array<{ edgeId: string; status: string }>;
+      pendingTraversal: unknown;
+      budgetUsage: { repair: number };
+    };
+    expect(topology.topologyHash).toMatch(/^[a-f0-9]{64}$/u);
+    expect(topology.manifest.template).toBe("solo");
+    expect(topology.manifest.edges.map((edge) => edge.id)).toContain("verify.repair");
+    expect(topology.traversals.length).toBeGreaterThan(0);
+    expect(topology.traversals.every((traversal) => traversal.status === "completed")).toBe(true);
+    expect(topology.pendingTraversal).toBeNull();
+    expect(topology.budgetUsage.repair).toBe(0);
+
     // The derived view must OBSERVE without mutating: even when the worktree
     // HEAD has moved past the proven commit, status --derived must not
     // invalidate the ready run's evidence.
