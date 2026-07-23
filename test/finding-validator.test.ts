@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,8 +18,13 @@ import type {
 } from "../src/ports.js";
 import type { Finding } from "../src/reviewer.js";
 import type { TaskSpec } from "../src/task-spec.js";
+import {
+  containedCommandExpectation,
+  containedCommandResult,
+  fakeOciImage,
+} from "./oci-fixture.js";
 
-const commit = "abc123";
+const commit = "a".repeat(40);
 const temporaryDirectories: string[] = [];
 
 const task: TaskSpec = {
@@ -54,7 +60,26 @@ class Adapter implements ProjectAdapter {
 class RecordingRunner {
   calls: CommandRequest[] = [];
 
-  constructor(private readonly result?: (request: CommandRequest) => CommandResult) {}
+  constructor(
+    private readonly result?: (request: CommandRequest) => CommandResult,
+    private readonly containment: { imageDigest: string; containmentSpecHash: string } | null = {
+      imageDigest: fakeOciImage,
+      containmentSpecHash: "1".repeat(64),
+    },
+  ) {}
+
+  configurationBinding() {
+    return this.containment;
+  }
+
+  receiptExpectation(request: CommandRequest) {
+    if (!this.containment) throw new Error("OCI containment unavailable");
+    return {
+      ...containedCommandExpectation(request, commit),
+      imageDigest: this.containment.imageDigest,
+      containmentSpecHash: this.containment.containmentSpecHash,
+    };
+  }
 
   async run(request: CommandRequest): Promise<CommandResult> {
     this.calls.push(request);
@@ -126,19 +151,19 @@ function resultWithOutput(
   const stderrPath = join(request.artifactDirectory, "stderr.log");
   writeFileSync(stdoutPath, stdout);
   writeFileSync(stderrPath, stderr);
-  return {
-    argv: request.argv,
-    cwd: request.cwd,
+  return containedCommandResult(request, commit, {
     exitCode,
-    signal: null,
-    durationMs: 1,
-    timedOut: false,
     stdoutPath,
     stderrPath,
+    stdoutHash: sha256(stdout),
+    stderrHash: sha256(stderr),
     stdoutTruncated: truncated.stdout ?? false,
     stderrTruncated: truncated.stderr ?? false,
-    commitBefore: commit,
-  };
+  });
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function validationPlan(
@@ -220,19 +245,19 @@ describe("FindingValidator evidence and execution boundaries", () => {
       },
       evidenceIds: ["E-FAILURE"],
     });
-    const machineResult: CommandResult = {
+    const machineResult: CommandResult = containedCommandResult({
       argv: command.argv,
       cwd: "/repo",
+      artifactDirectory: "/artifacts",
+      policyVersion: "test/v1",
+      configurationHash: null,
+    }, commit, {
       exitCode: 2,
-      signal: null,
-      durationMs: 1,
-      timedOut: false,
       stdoutPath: "/artifacts/stdout.log",
       stderrPath: "/artifacts/stderr.log",
-      stdoutTruncated: false,
-      stderrTruncated: false,
-      commitBefore: commit,
-    };
+      stdoutHash: sha256(""),
+      stderrHash: sha256("authorization bypass reproduced"),
+    });
     const matchingEvidence = evidence({
       id: "E-FAILURE",
       kind: "verification_failure",
@@ -241,6 +266,13 @@ describe("FindingValidator evidence and execution boundaries", () => {
         commandId: command.id,
         argv: command.argv,
         result: machineResult,
+        receiptExpectation: containedCommandExpectation({
+          argv: command.argv,
+          cwd: "/repo",
+          artifactDirectory: "/artifacts",
+          policyVersion: "test/v1",
+          configurationHash: null,
+        }, commit),
         stdout: "",
         stderr: "authorization bypass reproduced",
       },
@@ -275,6 +307,28 @@ describe("FindingValidator evidence and execution boundaries", () => {
 
     expect(decision.status).toBe("inconclusive");
     expect(decision.reason).toContain("Exit code alone");
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("does not execute a diagnostic when OCI containment has no immutable binding", async () => {
+    const command: VerificationCommand = { id: "security-check", argv: ["verify", "--check"] };
+    const runner = new RecordingRunner(
+      (request) => resultWithOutput(request, "reproduced", "", 0),
+      null,
+    );
+    const decision = await new FindingValidator(new Adapter(
+      [command],
+      () => validationPlan(command, { stdoutIncludes: "reproduced" }),
+    ), runner).validate(input(finding({
+      verificationRequest: {
+        verificationStepId: command.id,
+        proposedArgv: command.argv,
+        stdoutIncludes: "reproduced",
+      },
+    })));
+
+    expect(decision.status).toBe("inconclusive");
+    expect(decision.reason).toContain("OCI containment");
     expect(runner.calls).toEqual([]);
   });
 
@@ -376,6 +430,26 @@ describe("FindingValidator evidence and execution boundaries", () => {
 
     expect(decision.status).toBe("confirmed");
     expect(decision.predicateEvaluation).toMatchObject({ matched: true, inconclusive: false });
+  });
+
+  it("treats diagnostic output that does not match its receipt hash as inconclusive", async () => {
+    const command: VerificationCommand = { id: "security-check", argv: ["verify", "--check"] };
+    const runner = new RecordingRunner((request) => ({
+      ...resultWithOutput(request, "needle", "", 0),
+      stdoutHash: sha256("different bytes"),
+    }));
+    const validator = new FindingValidator(new Adapter(
+      [command],
+      () => validationPlan(command, { stdoutIncludes: "needle" }),
+    ), runner);
+
+    const decision = await validator.validate(input(finding({
+      verificationRequest: { verificationStepId: command.id, stdoutIncludes: "needle" },
+    })));
+
+    expect(decision.status).toBe("inconclusive");
+    expect(decision.reason).toContain("hashes");
+    expect(decision.predicateEvaluation?.observed.stdoutReceiptMatched).toBe(false);
   });
 
   it("does not execute a plan without diagnosticSafe true", async () => {

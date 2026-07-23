@@ -2,15 +2,54 @@
 
 A practical walkthrough. The one rule to keep in mind throughout: **the model
 proposes, deterministic code decides.** The harness owns the Git commit and
-runs the real verification commands; `ready`/`done` is decided by exit codes
-bound to a commit, never by anything a model — including you — says.
+runs verification in a disposable OCI container; `ready`/`done` requires a
+Receipt V2 bound to the commit, immutable image, containment policy, and clean
+post-state, never anything a model — including you — says.
 
 ## Requirements
 
 - Node.js 20+ (22 recommended) and Git 2.40+
+- Docker or Podman, plus a locally available verification image pinned by
+  `@sha256:<64 lowercase hex>` (formal commands use `--pull=never`)
 - One authenticated provider CLI on PATH: Codex CLI, Claude Code, or a
   Pi/DeepSeek endpoint
 - A target repository that is a clean Git working tree
+
+Configure the one supported containment backend before a run. Replace the
+image below with a digest that exists in your runtime:
+
+```bash
+export AGENT_LOOP_OCI_ENGINE=docker        # or podman
+export AGENT_LOOP_OCI_IMAGE='registry.example/agent-loop-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+# Optional when the executable is not named docker/podman:
+# export AGENT_LOOP_OCI_EXECUTABLE=/absolute/path/to/docker
+```
+
+The image must contain every executable named by the task. The harness does
+not build images or discover toolchains. Missing runtime/image configuration,
+an unavailable digest, or an unconfirmed timeout fails closed. The committed
+Git tree is mounted read-only at `/workspace`; commands that need writable
+build/cache paths must redirect them to `/artifacts` or `/tmp`. `/artifacts`
+is a byte- and inode-bounded tmpfs; only validated regular files, directories,
+and symlinks are copied out after the container exits.
+Remote Docker/Podman endpoints and non-default Docker contexts are rejected:
+local bind mounts cannot prove the selected snapshot when the daemon is on a
+different host.
+
+The regular unit suite uses a fake runtime to test argument and receipt logic;
+it is not proof of OS containment. Before relying on this security boundary,
+run the opt-in gate with the exact runtime and locally available Node-capable
+image used by the deployment:
+
+```bash
+AGENT_LOOP_REAL_OCI_TEST=1 \
+AGENT_LOOP_OCI_ENGINE=docker \
+AGENT_LOOP_OCI_IMAGE='registry.example/agent-loop-node@sha256:<64-lowercase-hex>' \
+npx vitest run test/real-oci-execution.test.ts
+```
+
+Do not claim the containment gate passed unless this command exits zero. The
+test is skipped unless `AGENT_LOOP_REAL_OCI_TEST=1` is set.
 
 ## Install
 
@@ -122,6 +161,7 @@ cat > project.json <<'JSON'
 {
   "name": "python-service",
   "policyVersion": "python-service/v1",
+  "verificationImage": "registry.example/python-verifier@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "sensitivePathSegments": ["payments/", "auth/"],
   "rewriteNodeCommands": false
 }

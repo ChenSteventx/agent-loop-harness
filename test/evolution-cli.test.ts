@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-const tsxCli = resolve("node_modules/tsx/dist/cli.mjs");
-const loopCli = resolve("src/cli.ts");
+// The integration surface is the same built CLI artifact installed by the
+// package. `pretest` rebuilds it from current sources before this file runs.
+const loopCli = resolve("dist/cli-fast.bundle.mjs");
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
@@ -21,7 +22,7 @@ function temporaryDirectory(prefix: string): string {
 }
 
 function cli(loopHome: string, args: string[]): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync(process.execPath, [tsxCli, loopCli, "--loop-home", loopHome, ...args], {
+  const result = spawnSync(process.execPath, [loopCli, "--loop-home", loopHome, ...args], {
     cwd: resolve("."),
     env: { ...process.env, AGENT_LOOP_PROVIDER_PROFILE: "CODEX_PRIMARY" },
     encoding: "utf8",
@@ -37,7 +38,7 @@ function cli(loopHome: string, args: string[]): { status: number | null; stdout:
 describe("evolution cycle CLI completeness", () => {
   it("creates the initial Champion and refuses to clobber it", () => {
     const loopHome = temporaryDirectory("agent-loop-champion-init-");
-    const created = cli(loopHome, ["config", "champion-init", "--project", "generic-node"]);
+    const created = cli(loopHome, ["config", "champion-init", "--project=generic-node"]);
     expect(created.status, created.stderr).toBe(0);
     const champion = JSON.parse(created.stdout) as { id: string; projectScope: string; status: string };
     expect(champion).toMatchObject({ projectScope: "generic-node", status: "champion" });

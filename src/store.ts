@@ -1,5 +1,5 @@
-import Database from "better-sqlite3";
 import { defaultRunBudget } from "./budget.js";
+import { openSqliteDatabase } from "./sqlite.js";
 import {
   createRun as newRun,
   resumeBlockedRun,
@@ -18,7 +18,7 @@ import { canonicalJson, evidenceDependencyHash, operationInputHash } from "./bin
 import { applyRiskEscalation, routeRisk, type Risk } from "./routing.js";
 import type { InvocationManifest } from "./evaluation/manifests.js";
 
-type Sqlite = InstanceType<typeof Database>;
+type Sqlite = ReturnType<typeof openSqliteDatabase>;
 
 export const outboxEventTypes = ["blocked", "needs-human", "provider-fallback", "ready", "done"] as const;
 export type OutboxEventType = (typeof outboxEventTypes)[number];
@@ -94,9 +94,7 @@ export class SqliteStore {
   readonly database: Sqlite;
 
   constructor(path: string, options: { readOnly?: boolean } = {}) {
-    this.database = options.readOnly
-      ? new Database(path, { readonly: true, fileMustExist: true })
-      : new Database(path);
+    this.database = openSqliteDatabase(path, options);
     this.database.pragma("foreign_keys = ON");
     if (!options.readOnly) this.migrate();
   }

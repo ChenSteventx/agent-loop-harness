@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { operationInputHash } from "./bindings.js";
+import { isImmutableImageDigest } from "./execution.js";
 import type { ProjectAdapter, VerificationCommand } from "./ports.js";
 import type { Risk } from "./routing.js";
 import type { TaskSpec } from "./task-spec.js";
@@ -12,12 +13,15 @@ import type { TaskSpec } from "./task-spec.js";
 const declarativeProjectConfigSchema = z.object({
   name: z.string().trim().min(1).max(128),
   policyVersion: z.string().trim().min(1).max(128),
+  verificationImage: z.string().trim().refine(isImmutableImageDigest, {
+    message: "must be an immutable repository reference pinned by @sha256:<64 lowercase hex>",
+  }),
   // Substring/segment patterns whose presence in the task scope or changed
   // files raises the minimum risk to high. Required: "nothing is sensitive"
   // must be an explicit [] in the config, never an accidental omission.
   sensitivePathSegments: z.array(z.string().trim().min(1).max(256)).max(200),
-  // Rewrite a leading "node" argv entry to the current Node executable —
-  // what the built-in generic-node adapter does. Off for non-Node projects.
+  // Normalize a leading "node" argv entry for the configured container image.
+  // Host executable paths are never copied into contained command specs.
   rewriteNodeCommands: z.boolean().default(false),
 }).strict();
 
@@ -41,9 +45,11 @@ export function loadDeclarativeProjectConfig(path: string): DeclarativeProjectCo
 export class DeclarativeProjectAdapter implements ProjectAdapter {
   readonly name: string;
   readonly policyVersion: string;
+  readonly verificationImageDigest: string;
 
   constructor(private readonly config: DeclarativeProjectConfig) {
     this.name = config.name;
+    this.verificationImageDigest = config.verificationImage;
     // The effective policy version is content-addressed: the run binding
     // freezes it, and the resume-time drift gate compares it against the
     // live adapter — so editing the config file between attempts (same
@@ -73,7 +79,7 @@ export class DeclarativeProjectAdapter implements ProjectAdapter {
 
   private normalize(command: VerificationCommand): VerificationCommand {
     if (!this.config.rewriteNodeCommands || command.argv[0] !== "node") return command;
-    return { ...command, argv: [process.execPath, ...command.argv.slice(1)] };
+    return { ...command, argv: ["node", ...command.argv.slice(1)] };
   }
 }
 

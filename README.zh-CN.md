@@ -32,6 +32,25 @@ skill，驱动单次受限运行并如实汇报 harness 裁定（确定性权威
 `ln -s "$(pwd)/skills/agent-loop" ~/.claude/skills/agent-loop` 激活后用 `/agent-loop`
 调用，详见 `skills/README.md`。
 
+正式验证还要求 Docker 或 Podman，以及本机已有、以不可变 digest 固定的镜像；
+缺少任一项都会闭合失败，不会退回宿主同 UID 执行：
+
+```bash
+export AGENT_LOOP_OCI_ENGINE=docker  # 或 podman
+export AGENT_LOOP_OCI_IMAGE='registry.example/agent-loop-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+```
+
+Harness 使用 `--pull=never`，不会自动构建或拉取镜像。完整提交树会被物化到一次性
+目录并以只读方式挂载到 `/workspace`；命令如需写构建产物或缓存，必须改写到
+`/artifacts` 或 `/tmp`。`/artifacts` 是限制字节数与 inode 数的 tmpfs；容器退出后
+只有通过类型、数量、大小和哈希验证的产物才会复制到外部目录。容器不挂载用户
+主目录、凭据、Loop 状态库、Git 元数据或其他仓库，并禁用网络。
+远程 Docker/Podman endpoint 与非默认 Docker context 会被拒绝，因为远端 daemon
+无法用本机 bind mount 证明选中的提交快照。
+
+伪运行时单元测试只验证参数和收据逻辑，不能证明上述操作系统隔离。实际依赖该
+边界之前，必须按 `USAGE.md` 用部署所采用的真实 runtime 和镜像运行显式动态门禁。
+
 也可使用 npm 别名：
 
 ```bash
@@ -238,6 +257,7 @@ cat > project.json <<'JSON'
 {
   "name": "python-service",
   "policyVersion": "python-service/v1",
+  "verificationImage": "registry.example/python-verifier@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "sensitivePathSegments": ["payments/", "auth/"],
   "rewriteNodeCommands": false
 }

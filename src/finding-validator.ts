@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Evidence } from "./domain.js";
-import type { CommandRequest, CommandResult, CommandRunner, GitService } from "./execution.js";
+import {
+  commandReceiptMatchesExecution,
+  type CommandReceiptExpectation,
+  type CommandRequest,
+  type CommandResult,
+  type CommandRunner,
+  type GitService,
+} from "./execution.js";
 import { operationInputHash } from "./bindings.js";
 import type {
   FindingValidationPlan,
@@ -26,6 +33,8 @@ export interface PredicateEvaluation {
     timedOut: boolean;
     stdoutSha256: string;
     stderrSha256: string;
+    stdoutReceiptMatched: boolean;
+    stderrReceiptMatched: boolean;
     stdoutTruncated: boolean;
     stderrTruncated: boolean;
     exitCodeMatched: boolean;
@@ -56,6 +65,7 @@ export interface FindingValidationInput {
   task: TaskSpec;
   worktreePath: string;
   artifactDirectory: string;
+  configurationHash?: string | null;
   evidence: readonly Evidence[];
   git: Pick<GitService, "head" | "isDirty" | "diffHash" | "controlStateHash">;
 }
@@ -65,7 +75,7 @@ export class FindingValidationBoundaryError extends Error {}
 export class FindingValidator {
   constructor(
     private readonly projectAdapter: ProjectAdapter,
-    private readonly commandRunner: Pick<CommandRunner, "run">,
+    private readonly commandRunner: Pick<CommandRunner, "run" | "configurationBinding" | "receiptExpectation">,
   ) {}
 
   async validate(input: FindingValidationInput): Promise<FindingValidationDecision> {
@@ -96,15 +106,26 @@ export class FindingValidator {
     if (!resolved.allowed || !resolved.plan || !input.finding.verificationRequest) {
       return decide("inconclusive", resolved.reason);
     }
+    const request = commandRequest(
+      resolved.plan.command,
+      input.worktreePath,
+      input.artifactDirectory,
+      this.projectAdapter.policyVersion,
+      input.configurationHash ?? null,
+    );
+    let expectation: CommandReceiptExpectation;
+    try {
+      expectation = this.commandRunner.receiptExpectation(request);
+    } catch (error) {
+      return decide("inconclusive", "OCI containment is not configured for the diagnostic command", {
+        commandError: errorMessage(error),
+      });
+    }
 
     const before = gitBoundary(input.git);
     let commandResult: CommandResult;
     try {
-      commandResult = await this.commandRunner.run(commandRequest(
-        resolved.plan.command,
-        input.worktreePath,
-        input.artifactDirectory,
-      ));
+      commandResult = await this.commandRunner.run(request);
     } catch (error) {
       return decide("inconclusive", "The approved diagnostic command could not be executed", {
         commandError: errorMessage(error),
@@ -118,14 +139,19 @@ export class FindingValidator {
 
     const stdout = artifactText(commandResult.stdoutPath);
     const stderr = artifactText(commandResult.stderrPath);
+    if (expectation.sourceCommit !== input.reviewedCommit) {
+      return decide("inconclusive", "The diagnostic receipt expectation is not bound to the reviewed commit", {
+        commandResult,
+      });
+    }
     const predicateEvaluation = evaluatePredicate(
       resolved.plan.expected,
       commandResult,
       stdout,
       stderr,
-      input.reviewedCommit,
+      expectation,
     );
-    if (commandResult.signal !== null || commandResult.timedOut || commandResult.commitBefore !== input.reviewedCommit) {
+    if (!commandReceiptMatchesExecution(commandResult, expectation)) {
       return decide("inconclusive", "The diagnostic process receipt is incomplete or stale", {
         commandResult,
         predicateEvaluation,
@@ -134,7 +160,9 @@ export class FindingValidator {
     if (predicateEvaluation.inconclusive) {
       return decide(
         "inconclusive",
-        "A required output predicate was not observed because the diagnostic output was truncated",
+        predicateEvaluation.observed.stdoutReceiptMatched && predicateEvaluation.observed.stderrReceiptMatched
+          ? "A required output predicate was not observed because the diagnostic output was truncated"
+          : "The diagnostic output no longer matches the hashes in its process receipt",
         { commandResult, predicateEvaluation },
       );
     }
@@ -259,13 +287,17 @@ function evidenceConfirmsFinding(
     typeof evidence.data.stdout !== "string" ||
     typeof evidence.data.stderr !== "string"
   ) return false;
-  const result = commandResultFromEvidence(evidence.data.result, command.argv);
+  const expectation = commandReceiptExpectationFromValue(evidence.data.receiptExpectation);
+  if (!expectation || expectation.sourceCommit !== reviewedCommit ||
+      expectation.policyVersion !== evidence.policyVersion ||
+      !sameArgvValue(expectation.argv, command.argv)) return false;
+  const result = commandResultFromEvidence(evidence.data.result, expectation);
   return result !== null && evaluatePredicate(
     expected,
     result,
     evidence.data.stdout,
     evidence.data.stderr,
-    reviewedCommit,
+    expectation,
   ).matched;
 }
 
@@ -274,17 +306,21 @@ function evaluatePredicate(
   result: CommandResult,
   stdout: string,
   stderr: string,
-  reviewedCommit: string,
+  expectation: CommandReceiptExpectation,
 ): PredicateEvaluation {
   const exitCodeMatched = expected.exitCode === undefined || result.exitCode === expected.exitCode;
   const stdoutMatched = expected.stdoutIncludes === undefined || stdout.includes(expected.stdoutIncludes);
   const stderrMatched = expected.stderrIncludes === undefined || stderr.includes(expected.stderrIncludes);
-  const inconclusive = (
+  const stdoutSha256 = sha256(stdout);
+  const stderrSha256 = sha256(stderr);
+  const stdoutReceiptMatched = stdoutSha256 === result.stdoutHash;
+  const stderrReceiptMatched = stderrSha256 === result.stderrHash;
+  const inconclusive = !stdoutReceiptMatched || !stderrReceiptMatched || (
     expected.stdoutIncludes !== undefined && !stdoutMatched && result.stdoutTruncated
   ) || (
     expected.stderrIncludes !== undefined && !stderrMatched && result.stderrTruncated
   );
-  const receiptMatched = result.commitBefore === reviewedCommit && result.signal === null && !result.timedOut;
+  const receiptMatched = commandReceiptMatchesExecution(result, expectation);
   return {
     expected: {
       ...(expected.exitCode === undefined ? {} : { exitCode: expected.exitCode }),
@@ -295,8 +331,10 @@ function evaluatePredicate(
       exitCode: result.exitCode,
       signal: result.signal,
       timedOut: result.timedOut,
-      stdoutSha256: sha256(stdout),
-      stderrSha256: sha256(stderr),
+      stdoutSha256,
+      stderrSha256,
+      stdoutReceiptMatched,
+      stderrReceiptMatched,
       stdoutTruncated: result.stdoutTruncated,
       stderrTruncated: result.stderrTruncated,
       exitCodeMatched,
@@ -344,7 +382,13 @@ function validValidationPlan(plan: FindingValidationPlan): boolean {
     (plan.expected.stderrIncludes === undefined || plan.expected.stderrIncludes.length > 0);
 }
 
-function commandRequest(command: VerificationCommand, cwd: string, artifactDirectory: string): CommandRequest {
+function commandRequest(
+  command: VerificationCommand,
+  cwd: string,
+  artifactDirectory: string,
+  policyVersion: string,
+  configurationHash: string | null,
+): CommandRequest {
   return {
     argv: command.argv,
     cwd,
@@ -353,24 +397,22 @@ function commandRequest(command: VerificationCommand, cwd: string, artifactDirec
     timeoutMs: 60_000,
     outputLimitBytes: 1024 * 1024,
     shell: false,
+    policyVersion,
+    configurationHash,
   };
 }
 
-function commandResultFromEvidence(value: Record<string, unknown>, argv: readonly string[]): CommandResult | null {
-  if (
-    !sameArgvValue(value.argv, argv) ||
-    typeof value.cwd !== "string" ||
-    !(typeof value.exitCode === "number" || value.exitCode === null) ||
-    !(typeof value.signal === "string" || value.signal === null) ||
-    typeof value.durationMs !== "number" ||
-    typeof value.timedOut !== "boolean" ||
-    typeof value.stdoutPath !== "string" ||
-    typeof value.stderrPath !== "string" ||
-    typeof value.stdoutTruncated !== "boolean" ||
-    typeof value.stderrTruncated !== "boolean" ||
-    typeof value.commitBefore !== "string"
-  ) return null;
-  return value as unknown as CommandResult;
+function commandResultFromEvidence(
+  value: Record<string, unknown>,
+  expectation: CommandReceiptExpectation,
+): CommandResult | null {
+  return commandReceiptMatchesExecution(value, expectation) ? value : null;
+}
+
+function commandReceiptExpectationFromValue(value: unknown): CommandReceiptExpectation | null {
+  if (!isRecord(value) || !Array.isArray(value.argv) ||
+      value.argv.some((part) => typeof part !== "string")) return null;
+  return value as unknown as CommandReceiptExpectation;
 }
 
 function gitBoundary(git: FindingValidationInput["git"]): Record<string, string | boolean> {

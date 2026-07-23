@@ -7,6 +7,7 @@ import {
   loadDeclarativeProjectConfig,
 } from "../src/declarative-project.js";
 import type { TaskSpec } from "../src/task-spec.js";
+import { fakeOciImage } from "./oci-fixture.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -40,6 +41,7 @@ describe("declarative project entry", () => {
     const path = configFile(JSON.stringify({
       name: "python-service",
       policyVersion: "python-service/v1",
+      verificationImage: fakeOciImage,
       sensitivePathSegments: ["payments/", "secrets"],
       rewriteNodeCommands: false,
     }));
@@ -56,15 +58,18 @@ describe("declarative project entry", () => {
   it("rewrites a leading node argv only when asked", () => {
     const adapter = new DeclarativeProjectAdapter({
       name: "node-service", policyVersion: "node-service/v1",
+      verificationImage: fakeOciImage,
       sensitivePathSegments: [], rewriteNodeCommands: true,
     });
     const argv = adapter.verificationCommands(task).map((command) => command.argv[0]);
     expect(argv[0]).toBe("sh");
-    expect(argv[1]).toBe(process.execPath);
+    expect(argv[1]).toBe("node");
   });
 
   it("binds the policy version to the config content, not just the declared string", () => {
-    const base = { name: "svc", policyVersion: "svc/v1", rewriteNodeCommands: false };
+    const base = {
+      name: "svc", policyVersion: "svc/v1", verificationImage: fakeOciImage, rewriteNodeCommands: false,
+    };
     const strict = new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(
       configFile(JSON.stringify({ ...base, sensitivePathSegments: ["deploy/"] }))));
     const loosened = new DeclarativeProjectAdapter(loadDeclarativeProjectConfig(
@@ -80,6 +85,7 @@ describe("declarative project entry", () => {
   it("matches sensitive segments across Unicode normalization forms", () => {
     const adapter = new DeclarativeProjectAdapter({
       name: "svc", policyVersion: "svc/v1",
+      verificationImage: fakeOciImage,
       sensitivePathSegments: ["s\u00e9curit\u00e9/"], rewriteNodeCommands: false,
     });
     // Git often emits NFD; the config author typically types NFC.
@@ -95,7 +101,11 @@ describe("declarative project entry", () => {
     expect(() => loadDeclarativeProjectConfig(configFile(JSON.stringify({ name: "x", policyVersion: "v1" }))))
       .toThrow("sensitivePathSegments");
     expect(() => loadDeclarativeProjectConfig(configFile(JSON.stringify({
-      name: "x", policyVersion: "v1", sensitivePathSegments: [], gitAuthority: "mine",
+      name: "x", policyVersion: "v1", sensitivePathSegments: [], verificationImage: "node:latest",
+    })))).toThrow("immutable repository reference");
+    expect(() => loadDeclarativeProjectConfig(configFile(JSON.stringify({
+      name: "x", policyVersion: "v1", verificationImage: fakeOciImage,
+      sensitivePathSegments: [], gitAuthority: "mine",
     })))).toThrow("Project config is invalid");
   });
 });

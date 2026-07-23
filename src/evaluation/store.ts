@@ -1,5 +1,5 @@
-import Database from "better-sqlite3";
 import { canonicalJson, operationInputHash } from "../bindings.js";
+import { openSqliteDatabase } from "../sqlite.js";
 import type { SanitizedFactBundle } from "./facts.js";
 import type { RunMetricsProjection } from "./metrics.js";
 import type { ReadinessReport } from "./readiness.js";
@@ -24,15 +24,13 @@ import {
   type EvolutionOutboxEventType,
 } from "./outbox.js";
 
-type Sqlite = InstanceType<typeof Database>;
+type Sqlite = ReturnType<typeof openSqliteDatabase>;
 
 export class EvaluationStore {
   readonly database: Sqlite;
 
   constructor(path: string, options: { readOnly?: boolean } = {}) {
-    this.database = options.readOnly
-      ? new Database(path, { readonly: true, fileMustExist: true })
-      : new Database(path);
+    this.database = openSqliteDatabase(path, options);
     this.database.pragma("foreign_keys = ON");
     if (!options.readOnly) this.migrate();
   }

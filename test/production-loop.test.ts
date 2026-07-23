@@ -376,6 +376,7 @@ describe("production CLI loop", () => {
     writeFileSync(projectConfig, JSON.stringify({
       name: "shell-project",
       policyVersion: "shell-project/v1",
+      verificationImage: process.env.AGENT_LOOP_OCI_IMAGE,
       sensitivePathSegments: ["deploy/"],
       rewriteNodeCommands: false,
     }));

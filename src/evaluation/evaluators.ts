@@ -1,7 +1,15 @@
 import { resolve } from "node:path";
 import { operationInputHash } from "../bindings.js";
 import type { RunBinding } from "../domain.js";
-import { CommandRunner, GitService, type WorktreeService } from "../execution.js";
+import {
+  CommandRunner,
+  GitService,
+  commandReceiptProofProjection,
+  commandReceiptProvesSuccess,
+  type CommandRequest,
+  type CommandResult,
+  type WorktreeService,
+} from "../execution.js";
 import type { ConfigurationVariant } from "../evolution/proposals.js";
 import type { SanitizedFactBundle } from "./facts.js";
 import {
@@ -31,9 +39,9 @@ export class VerifyOnlyEvaluator {
     if (!commit || new GitService(input.binding.worktreePath).head() !== commit) {
       throw new Error("PinnedVerificationCommitUnavailable");
     }
-    const receipts = [];
+    const receipts: Array<{ commandId: string; result: CommandResult; passed: boolean }> = [];
     for (const command of input.binding.taskSpec.verification) {
-      const result = await this.runner.run({
+      const request: CommandRequest = {
         argv: command.argv,
         cwd: input.binding.worktreePath,
         artifactDirectory: resolve(input.artifactDirectory, command.id),
@@ -41,20 +49,25 @@ export class VerifyOnlyEvaluator {
         timeoutMs: 60_000,
         outputLimitBytes: 1024 * 1024,
         shell: false,
-      });
+        policyVersion: input.binding.policyVersion,
+        configurationHash: input.binding.configurationHash,
+      };
+      const expectation = this.runner.receiptExpectation(request);
+      const result = await this.runner.run(request);
       receipts.push({
         commandId: command.id,
-        exitCode: result.exitCode,
-        signal: result.signal,
-        timedOut: result.timedOut,
-        commitBefore: result.commitBefore,
+        result,
+        passed: expectation.sourceCommit === commit && commandReceiptProvesSuccess(result, expectation),
       });
     }
     return {
-      passed: receipts.every((receipt) => receipt.exitCode === 0 && receipt.signal === null &&
-        !receipt.timedOut && receipt.commitBefore === commit),
-      evidenceHash: operationInputHash(receipts),
-      diagnostics: receipts.filter((receipt) => receipt.exitCode !== 0).map((receipt) => receipt.commandId),
+      passed: receipts.every((receipt) => receipt.passed),
+      evidenceHash: operationInputHash(receipts.map((receipt) => ({
+        commandId: receipt.commandId,
+        passed: receipt.passed,
+        proof: commandReceiptProofProjection(receipt.result),
+      }))),
+      diagnostics: receipts.filter((receipt) => !receipt.passed).map((receipt) => receipt.commandId),
     };
   }
 }

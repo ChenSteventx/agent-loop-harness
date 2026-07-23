@@ -13,6 +13,7 @@ walkthrough, `README.zh-CN.md` for the full documentation (Chinese), and
 
 - Node.js 20+ (22 recommended)
 - Git 2.40+
+- Docker or Podman and a locally available verification image pinned by digest
 - At least one provider CLI on PATH: Codex CLI, Claude Code, or a
   Pi-compatible DeepSeek endpoint
 
@@ -26,6 +27,10 @@ npm run typecheck && npm test   # optional but recommended
 
 # Optional: install as a command (agent-loop). Otherwise use `npm run loop --`.
 npm i -g .
+
+# Formal verification fails closed without an OCI runtime and immutable image.
+export AGENT_LOOP_OCI_ENGINE=docker  # or podman
+export AGENT_LOOP_OCI_IMAGE='registry.example/agent-loop-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 
 # A task is a small YAML file inside the target repository:
 cat > /path/to/your-repo/task.yaml <<'YAML'
@@ -78,6 +83,7 @@ cat > project.json <<'JSON'
 {
   "name": "python-service",
   "policyVersion": "python-service/v1",
+  "verificationImage": "registry.example/python-verifier@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "sensitivePathSegments": ["payments/", "auth/"],
   "rewriteNodeCommands": false
 }
@@ -94,6 +100,17 @@ no promotion rights. `sensitivePathSegments` is required — declaring
 content is hashed into the effective policy version and frozen into the
 run binding, so editing the config between attempts blocks the run
 instead of silently reclassifying risk.
+
+Formal commands run against a disposable, read-only materialization of the
+complete committed Git tree with network disabled. They receive only a
+byte- and inode-bounded `/artifacts` tmpfs and bounded `/tmp`; validated
+artifacts are copied out only after the container exits. No host home,
+credentials, loop state, Git metadata, or other repository is mounted. The
+configured image is never built or pulled automatically.
+
+These OS-level guarantees are not established by the fake-runtime unit tests.
+Before relying on them, run the opt-in real-runtime gate documented in
+`USAGE.md` against the exact deployment runtime and image.
 
 ## Status
 

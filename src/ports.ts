@@ -40,6 +40,7 @@ export interface FindingValidationContext {
 export interface ProjectAdapter {
   readonly name: string;
   readonly policyVersion: string;
+  readonly verificationImageDigest?: string | null;
   minimumRisk(input: {
     task: TaskSpec;
     changedFiles?: readonly string[];

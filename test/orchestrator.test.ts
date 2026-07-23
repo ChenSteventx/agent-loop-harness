@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { containedCommandResult } from "./oci-fixture.js";
 import { CommandRunner, type CommandRequest, type CommandResult } from "../src/execution.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { GenericNodeProjectAdapter } from "../src/project.js";
@@ -209,19 +210,12 @@ class TimedOutSuccessRunner extends CommandRunner {
     const stderrPath = join(request.artifactDirectory, "stderr.log");
     writeFileSync(stdoutPath, "");
     writeFileSync(stderrPath, "timed out after child reported zero\n");
-    return {
-      argv: request.argv,
-      cwd: request.cwd,
-      exitCode: 0,
-      signal: null,
-      durationMs: 1,
+    return containedCommandResult(request, git(request.cwd, ["rev-parse", "HEAD"]), {
       timedOut: true,
+      containmentOutcome: "killed",
       stdoutPath,
       stderrPath,
-      stdoutTruncated: false,
-      stderrTruncated: false,
-      commitBefore: git(request.cwd, ["rev-parse", "HEAD"]),
-    };
+    });
   }
 }
 
@@ -328,10 +322,36 @@ describe("Orchestrator", () => {
     });
     expect(view.run.status).toBe("blocked");
     expect(view.evidence.some((item) => item.kind === "command" && item.status === "valid")).toBe(false);
-    expect(view.evidence.some((item) => item.kind === "verification_failure")).toBe(true);
+    expect(view.evidence.some((item) => item.kind === "verification_failure")).toBe(false);
+    expect(view.run.blocked?.reason).toContain("non-authoritative process receipt");
     expect(view.operations.find((operation) => operation.kind === "verify:check")).toMatchObject({
       status: "failed",
       result: { exitCode: 0, timedOut: true },
+    });
+    orchestrator.close();
+  }, 30_000);
+
+  it("blocks with a typed recovery action when OCI containment is unavailable", async () => {
+    const fixture = targetRepository();
+    const loopHome = mkdtempSync(join(tmpdir(), "agent-loop-home-"));
+    temporaryDirectories.push(loopHome);
+    const orchestrator = new Orchestrator({
+      loopHome,
+      provider: new FakeAuthor(),
+      projectAdapter: new GenericNodeProjectAdapter(),
+      commandRunner: new CommandRunner({ controlEnvironment: {} }),
+    });
+    const view = await orchestrator.start({
+      runId: "run-no-containment", taskPath: fixture.taskPath, targetRepository: fixture.root,
+    });
+    expect(view.run).toMatchObject({
+      status: "blocked",
+      blocked: { recovery: { kind: "human-action-required", actionType: "configure-oci-containment" } },
+    });
+    expect(view.evidence.some((item) => item.kind === "command")).toBe(false);
+    expect(view.operations.find((operation) => operation.kind === "verify:check")).toMatchObject({
+      status: "failed",
+      result: { errorCode: "OciContainmentUnavailable" },
     });
     orchestrator.close();
   }, 30_000);

@@ -161,7 +161,7 @@ describe("completed-window Metrics digests", () => {
     development.createRun("digest-run", "task-1", new Date(todayUtc - 1_000).toISOString());
     development.close();
     const argv = [
-      resolve("node_modules/tsx/dist/cli.mjs"), "src/cli.ts", "--loop-home", directory,
+      resolve("dist/cli-fast.bundle.mjs"), "--loop-home", directory,
       "notify", "digest", "--period", "daily",
     ];
     execFileSync(process.execPath, argv, { cwd: resolve("."), stdio: "pipe" });

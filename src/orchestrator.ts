@@ -5,10 +5,15 @@ import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import {
   CommandRunner,
+  ContainmentUnavailableError,
   GitService,
   WorktreeService,
+  commandReceiptMatchesExecution,
+  commandReceiptProvesSuccess,
   safeBranchName,
   type CandidateCommit,
+  type CommandRequest,
+  type CommandReceiptExpectation,
 } from "./execution.js";
 import {
   FindingValidator,
@@ -214,7 +219,9 @@ export class Orchestrator {
       explorer: resolve(options.roleOutputSchemas?.explorer ?? legacySchema ?? defaults.explorer),
       reviewer: resolve(options.roleOutputSchemas?.reviewer ?? legacySchema ?? defaults.reviewer),
     };
-    this.commandRunner = options.commandRunner ?? new CommandRunner();
+    this.commandRunner = options.commandRunner ?? new CommandRunner({
+      imageDigest: options.projectAdapter.verificationImageDigest ?? undefined,
+    });
     this.afterProviderCompletion = options.faults?.afterProviderCompletion;
     this.afterHarnessCommit = options.faults?.afterHarnessCommit;
     this.afterVerificationFailure = options.faults?.afterVerificationFailure;
@@ -1634,14 +1641,30 @@ export class Orchestrator {
   }
 
   private reviewVerificationEvidence(runId: string, commitSha: string): VerificationEvidence[] {
+    const run = this.requireBoundRun(runId);
+    const commands = new Map(this.projectAdapter.verificationCommands(run.binding.taskSpec)
+      .map((command) => [`verify:${command.id}`, command]));
     return this.store.listEvidence(runId, "valid").flatMap((item) => {
       if (item.kind !== "command" || item.commitSha !== commitSha || !item.stepId.startsWith("verify:") || !isRecord(item.data)) {
         return [];
       }
-      if (!Array.isArray(item.data.argv) || item.data.argv.some((part) => typeof part !== "string") || item.data.exitCode !== 0) {
-        return [];
+      const command = commands.get(item.stepId);
+      let expectation: CommandReceiptExpectation | null = null;
+      if (command) {
+        try {
+          expectation = this.commandRunner.receiptExpectation(this.commandRequest(
+            runId,
+            run.binding.worktreePath,
+            "verify",
+            command,
+          ));
+          if (expectation.sourceCommit !== commitSha) expectation = null;
+        } catch {
+          expectation = null;
+        }
       }
-      return [{ evidenceId: item.id, command: item.data.argv as string[], exitCode: 0, commitSha, result: "passed" }];
+      if (!command || !isSuccessfulCommandResult(item.data, expectation)) return [];
+      return [{ evidenceId: item.id, command: [...command.argv], exitCode: 0, commitSha, result: "passed" }];
     });
   }
 
@@ -1700,6 +1723,7 @@ export class Orchestrator {
           reviewedCommit,
           task: run.binding.taskSpec,
           worktreePath: run.binding.worktreePath,
+          configurationHash: run.binding.configurationHash,
           artifactDirectory: resolve(
             this.loopHome,
             "runs",
@@ -2095,8 +2119,17 @@ export class Orchestrator {
     commands: readonly VerificationCommand[],
     phase: "verify" | "post-merge",
   ): Promise<boolean> {
+    const run = this.requireBoundRun(runId);
     const commitSha = new GitService(worktreePath).head();
     for (const command of commands) {
+      const request = this.commandRequest(runId, worktreePath, phase, command);
+      let expectation: CommandReceiptExpectation | null = null;
+      try {
+        expectation = this.commandRunner.receiptExpectation(request);
+      } catch {
+        // The pending operation below records the authoritative execution
+        // failure. A saved receipt can never pass without a fresh expectation.
+      }
       const stepId = `${phase}:${command.id}`;
       const receipt = this.commandEvidenceReceipt(runId, commitSha, worktreePath, phase, command);
       const dependencyHash = receipt.dependencyHash;
@@ -2112,7 +2145,7 @@ export class Orchestrator {
         input: receipt.operationInput,
       });
       if (operation.status === "succeeded") {
-        if (isSuccessfulCommandResult(operation.result, commitSha, command.argv)) {
+        if (isSuccessfulCommandResult(operation.result, expectation)) {
           this.store.installEvidence({
             id: `${runId}:evidence:${phase}:${command.id}:${dependencyHash.slice(0, 12)}`,
             runId,
@@ -2131,39 +2164,47 @@ export class Orchestrator {
         return false;
       }
       if (operation.status === "failed") {
-        if (phase === "verify" && isCommandFailureResult(operation.result)) {
-          this.installVerificationFailure(runId, operation, command, commitSha, receipt.operationInput);
+        if (phase === "verify" && isCommandFailureResult(operation.result, expectation)) {
+          this.installVerificationFailure(
+            runId, operation, command, commitSha, receipt.operationInput, expectation!,
+          );
         } else {
-          this.block(runId, `Previous ${stepId} operation failed`, operation.id);
+          const containmentUnavailable = isRecord(operation.result) &&
+            operation.result.errorCode === "OciContainmentUnavailable";
+          this.block(runId, containmentUnavailable
+            ? `Previous ${stepId} operation could not obtain OCI containment`
+            : `Previous ${stepId} operation failed`, operation.id, containmentUnavailable
+              ? { kind: "human-action-required", actionType: "configure-oci-containment" }
+              : undefined);
         }
         return false;
       }
       let result;
       try {
-        result = await this.commandRunner.run({
-          argv: command.argv,
-          cwd: worktreePath,
-          artifactDirectory: resolve(this.loopHome, "runs", runId, phase, command.id),
-          environmentAllowlist: commandEnvironmentAllowlist(),
-          timeoutMs: this.requireBoundRun(runId).binding.runtimeConfiguration?.timeoutMs ?? 10 * 60_000,
-          outputLimitBytes: 1024 * 1024,
-        });
+        result = await this.commandRunner.run(request);
       } catch (error) {
-        this.store.finishOperation(operation.id, "failed", { error: errorMessage(error) });
-        this.block(runId, `Verification ${command.id} could not run: ${errorMessage(error)}`, operation.id);
+        const containmentUnavailable = error instanceof ContainmentUnavailableError;
+        this.store.finishOperation(operation.id, "failed", {
+          error: errorMessage(error),
+          errorCode: containmentUnavailable ? error.code : null,
+        });
+        this.block(runId, `Verification ${command.id} could not run: ${errorMessage(error)}`, operation.id,
+          containmentUnavailable
+            ? { kind: "human-action-required", actionType: "configure-oci-containment" }
+            : undefined);
         return false;
       }
-      const succeeded = isSuccessfulCommandResult(result, commitSha, command.argv);
+      const succeeded = isSuccessfulCommandResult(result, expectation);
       this.store.finishOperation(operation.id, succeeded ? "succeeded" : "failed", result);
       if (!succeeded) {
-        if (phase === "verify") {
-          this.installVerificationFailure(runId, operation, command, commitSha, receipt.operationInput, result);
-        } else {
-          this.block(
-            runId,
-            `Post-merge verification ${command.id} failed or produced an invalid process receipt`,
-            operation.id,
+        if (phase === "verify" && isCommandFailureResult(result, expectation)) {
+          this.installVerificationFailure(
+            runId, operation, command, commitSha, receipt.operationInput, expectation!, result,
           );
+        } else {
+          this.block(runId, phase === "post-merge"
+            ? `Post-merge verification ${command.id} failed or produced an invalid process receipt`
+            : `Verification ${command.id} produced a non-authoritative process receipt`, operation.id);
         }
         return false;
       }
@@ -2189,6 +2230,7 @@ export class Orchestrator {
     command: VerificationCommand,
     commitSha: string,
     operationInput: unknown,
+    receiptExpectation: CommandReceiptExpectation,
     suppliedResult?: unknown,
   ): Evidence {
     const run = this.requireBoundRun(runId);
@@ -2231,6 +2273,7 @@ export class Orchestrator {
         commandId: command.id,
         argv: [...command.argv],
         result,
+        receiptExpectation,
         stderr,
         stdout,
       },
@@ -2407,6 +2450,26 @@ export class Orchestrator {
     }
   }
 
+  private commandRequest(
+    runId: string,
+    cwd: string,
+    phase: "verify" | "post-merge",
+    command: VerificationCommand,
+  ): CommandRequest {
+    const run = this.requireBoundRun(runId);
+    return {
+      argv: command.argv,
+      cwd,
+      artifactDirectory: resolve(this.loopHome, "runs", runId, phase, command.id),
+      environmentAllowlist: commandEnvironmentAllowlist(),
+      timeoutMs: run.binding.runtimeConfiguration?.timeoutMs ?? 10 * 60_000,
+      outputLimitBytes: 1024 * 1024,
+      terminationGraceMs: 1_000,
+      policyVersion: run.binding.policyVersion,
+      configurationHash: run.binding.configurationHash,
+    };
+  }
+
   private commandEvidenceReceipt(
     runId: string,
     commitSha: string,
@@ -2425,6 +2488,14 @@ export class Orchestrator {
       commandId: command.id,
       argv: [...command.argv],
       cwd: resolve(cwd),
+      policyVersion: run.binding.policyVersion,
+      configurationHash: run.binding.configurationHash,
+      executionLimits: {
+        timeoutMs: run.binding.runtimeConfiguration?.timeoutMs ?? 10 * 60_000,
+        outputLimitBytes: 1024 * 1024,
+        terminationGraceMs: 1_000,
+      },
+      containment: this.commandRunner.configurationBinding(),
     };
     const dependencies = evidenceDependencies({
       commitSha,
@@ -2586,18 +2657,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isSuccessfulCommandResult(
-  value: unknown,
-  commitSha: string,
-  argv: readonly string[],
-): boolean {
-  return isRecord(value) &&
-    value.exitCode === 0 &&
-    value.commitBefore === commitSha &&
-    value.timedOut === false &&
-    value.signal === null &&
-    Array.isArray(value.argv) &&
-    JSON.stringify(value.argv) === JSON.stringify(argv);
+function isSuccessfulCommandResult(value: unknown, expectation: CommandReceiptExpectation | null): boolean {
+  return expectation !== null && commandReceiptProvesSuccess(value, expectation);
 }
 
 function normalizedExistingPath(path: string): string {
@@ -2695,10 +2756,8 @@ function failureEvidenceSignature(evidence: Evidence | undefined): string | null
     : null;
 }
 
-function isCommandFailureResult(value: unknown): boolean {
-  return isRecord(value) &&
-    Array.isArray(value.argv) &&
-    (value.exitCode !== 0 || value.timedOut === true || value.signal !== null);
+function isCommandFailureResult(value: unknown, expectation: CommandReceiptExpectation | null): boolean {
+  return expectation !== null && commandReceiptMatchesExecution(value, expectation) && value.exitCode !== 0;
 }
 
 function commandArtifactText(value: unknown, field: "stdoutPath" | "stderrPath"): string {

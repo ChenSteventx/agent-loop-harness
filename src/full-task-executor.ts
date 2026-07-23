@@ -1,6 +1,13 @@
 import { resolve } from "node:path";
 import { operationInputHash } from "./bindings.js";
-import { CommandRunner, GitService } from "./execution.js";
+import {
+  CommandRunner,
+  GitService,
+  commandReceiptProofProjection,
+  commandReceiptProvesSuccess,
+  type CommandRequest,
+  type CommandResult,
+} from "./execution.js";
 import type { VerificationCommand } from "./ports.js";
 import type { ProviderAdapter } from "./provider.js";
 import { authorOutputSchema, defaultRoleOutputSchemas } from "./role-output-schemas.js";
@@ -96,9 +103,9 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
       baseCommit,
       message: `agent-loop(${input.binding.taskSpec.id}): evaluation replay candidate`,
     });
-    const receipts = [];
+    const receipts: Array<{ commandId: string; result: CommandResult; passed: boolean }> = [];
     for (const command of options.verificationCommands(input.binding.taskSpec)) {
-      const result = await runner.run({
+      const request: CommandRequest = {
         argv: command.argv,
         cwd: input.worktreePath,
         artifactDirectory: resolve(input.artifactDirectory, "verify", command.id),
@@ -106,27 +113,32 @@ export function createFullTaskExecutor(options: FullTaskExecutorOptions): FullTa
         timeoutMs: configuration.timeoutMs,
         outputLimitBytes: 1024 * 1024,
         shell: false,
-      });
+        policyVersion: input.binding.policyVersion,
+        configurationHash: input.configurationVariant.configurationHash,
+      };
+      const expectation = runner.receiptExpectation(request);
+      const result = await runner.run(request);
       receipts.push({
         commandId: command.id,
-        exitCode: result.exitCode,
-        signal: result.signal,
-        timedOut: result.timedOut,
-        commitBefore: result.commitBefore,
+        result,
+        passed: expectation.sourceCommit === candidate.commitSha && commandReceiptProvesSuccess(result, expectation),
       });
     }
-    const passed = receipts.every((receipt) => receipt.exitCode === 0 && receipt.signal === null &&
-      !receipt.timedOut && receipt.commitBefore === candidate.commitSha);
+    const passed = receipts.every((receipt) => receipt.passed);
     return {
       passed,
       evidenceHash: operationInputHash({
         candidateCommit: candidate.commitSha,
         diffHash: candidate.diffHash,
-        receipts,
+        receipts: receipts.map((receipt) => ({
+          commandId: receipt.commandId,
+          passed: receipt.passed,
+          proof: commandReceiptProofProjection(receipt.result),
+        })),
       }),
       diagnostics: [
         ...diagnostics,
-        ...receipts.filter((receipt) => receipt.exitCode !== 0).map((receipt) => receipt.commandId),
+        ...receipts.filter((receipt) => !receipt.passed).map((receipt) => receipt.commandId),
       ],
     };
   };
