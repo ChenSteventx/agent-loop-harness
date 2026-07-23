@@ -72,6 +72,7 @@ import {
 } from "./profiles.js";
 import { executionTemplateNames, riskValues, type ExecutionTemplateName, type Risk } from "./routing.js";
 import { RuntimeConfigResolver } from "./runtime-config.js";
+import { inspectFrozenTopology } from "./topology-inspector.js";
 
 const program = new Command()
   .name("agent-loop")
@@ -130,6 +131,17 @@ program
       const view = orchestrator.status(options.runId);
       return print(options.derived ? { ...view, derived: orchestrator.derivedView(options.runId) } : view);
     });
+  });
+
+program
+  .command("topology")
+  .requiredOption("--run-id <id>")
+  .option("--format <format>", "output format (json)", "json")
+  .description("show the frozen workflow topology and durable edge traversals")
+  .action(async (options: { runId: string; format: string }) => {
+    if (options.format !== "json") throw new Error(`Unsupported topology format: ${options.format}`);
+    const home = resolve(program.opts<{ loopHome: string }>().loopHome);
+    print(inspectFrozenTopology(home, options.runId));
   });
 
 program

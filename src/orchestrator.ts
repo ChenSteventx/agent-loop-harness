@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -22,8 +22,22 @@ import { repositoryScopeOf } from "./evaluation/facts.js";
 import { loadTaskSpec } from "./project.js";
 import type { TaskSpec } from "./task-spec.js";
 import { authorPrompt } from "./roles.js";
-import { SqliteStore } from "./store.js";
-import type { Evidence, Operation, RecoveryDisposition, Run, RunBinding } from "./domain.js";
+import {
+  SqliteStore,
+  WorkflowBudgetExceededError,
+  WorkflowTemplateEscalationRequiredError,
+  WorkflowTraversalConflictError,
+  type WorkflowTraversalExecutionLease,
+} from "./store.js";
+import type {
+  Evidence,
+  Operation,
+  RecoveryDisposition,
+  Run,
+  RunBinding,
+  RunBindingV2,
+  WorkflowTraversal,
+} from "./domain.js";
 import { EvidenceGate } from "./evidence-gate.js";
 import { applyRiskEscalation, executionTemplates, type ExecutionTemplateName } from "./routing.js";
 import {
@@ -33,18 +47,26 @@ import {
   runExplorer,
   type ExplorerReport,
 } from "./explorer.js";
-import { decideNextAction, type NextAction, type ProofGapSnapshot } from "./loop.js";
+import {
+  decideNextTransition,
+  workflowActionForEdge,
+  type NextAction,
+  type ProofGapSnapshot,
+  type WorkflowDecision,
+} from "./loop.js";
 import { BudgetExceededError, assertPromptWithinBudget, boundedJson, type RunBudget } from "./budget.js";
 import { normalizeFailureText } from "./failure-fingerprint.js";
 import { LoopController } from "./loop-controller.js";
 import {
   acceptanceHash,
+  canonicalJson,
   createRunBinding,
   evidenceDependencies,
   evidenceDependencyHash,
   operationInputHash,
   taskSpecHash,
 } from "./bindings.js";
+import { validateWorkflowTopology } from "./workflow-validator.js";
 import {
   authorOutputSchema,
   defaultRoleOutputSchemas,
@@ -81,6 +103,16 @@ import {
   type ManifestContextInput,
 } from "./evaluation/manifests.js";
 import type { RuntimeConfigResolver } from "./runtime-config.js";
+
+const preparedSourceStateHash = Symbol("preparedSourceStateHash");
+type PreparedWorkflowDecision = WorkflowDecision & { [preparedSourceStateHash]?: string };
+const proofWorkspaceFacts = Symbol("proofWorkspaceFacts");
+type PreparedProofGapSnapshot = ProofGapSnapshot & {
+  [proofWorkspaceFacts]?: { head: string; dirty: boolean; controlStateHash: string };
+};
+const emptyGitDiffHash = createHash("sha256").update("").digest("hex");
+const workflowExecutionLeaseDurationMs = 2 * 60_000;
+const workflowExecutionLeaseRenewIntervalMs = 15_000;
 
 export function defaultLoopHome(): string {
   return resolve(homedir(), ".agent-loop-harness");
@@ -140,6 +172,7 @@ export interface RunView {
   evidence: ReturnType<SqliteStore["listEvidence"]>;
   events: ReturnType<SqliteStore["listEvents"]>;
   invocationManifests: ReturnType<SqliteStore["listInvocationManifests"]>;
+  workflowTraversals: ReturnType<SqliteStore["listWorkflowTraversals"]>;
   worktreePath: string;
   worktreeExists: boolean;
 }
@@ -196,6 +229,7 @@ export class Orchestrator {
   private readonly explorerContextBudget: number;
   private readonly providerProfileName: string;
   private readonly maxLoopSteps: number;
+  private readonly workflowExecutionOwner = randomUUID();
   private readonly runtimeConfigResolver: (Pick<RuntimeConfigResolver, "resolve"> &
     Partial<Pick<RuntimeConfigResolver, "close">>) | null;
   private readonly memoryRetriever: ((input: { projectScope: string; repositoryScope: string; task: TaskSpec }) => string | null) | null;
@@ -300,10 +334,12 @@ export class Orchestrator {
       };
     }
     try {
+      const binding = this.requireWorkflowBinding(runId, { blockOnMismatch: false });
+      const pending = this.store.getPendingWorkflowTraversal(runId);
       const snapshot = this.proofGapSnapshot(runId, { reconcile: false });
       return {
         status: run.status,
-        nextAction: decideNextAction(snapshot),
+        nextAction: pending?.action ?? decideNextTransition(snapshot, binding.workflow.manifest).action,
         proofGaps: snapshot,
         budget: run.binding?.budget ?? null,
         recovery: null,
@@ -332,6 +368,7 @@ export class Orchestrator {
       evidence: this.store.listEvidence(runId),
       events: this.store.listEvents(runId),
       invocationManifests: this.store.listInvocationManifests(runId),
+      workflowTraversals: this.store.listWorkflowTraversals(runId),
       worktreePath,
       worktreeExists: existsSync(worktreePath),
     };
@@ -341,7 +378,30 @@ export class Orchestrator {
     return this.store.listRuns();
   }
 
+  topology(runId: string): {
+    topologyHash: string;
+    manifest: RunBindingV2["workflow"]["manifest"];
+    traversals: WorkflowTraversal[];
+    pendingTraversal: WorkflowTraversal | null;
+    budgetUsage: Record<string, number>;
+  } {
+    const binding = this.requireWorkflowBinding(runId, { blockOnMismatch: false });
+    return {
+      topologyHash: binding.workflow.topologyHash,
+      manifest: binding.workflow.manifest,
+      traversals: this.store.listWorkflowTraversals(runId),
+      pendingTraversal: this.store.getPendingWorkflowTraversal(runId),
+      budgetUsage: Object.fromEntries(
+        binding.workflow.manifest.budgets.map((budget) => [
+          budget.id,
+          this.store.workflowBudgetUsage(runId, budget.id),
+        ]),
+      ),
+    };
+  }
+
   markMerged(runId: string, repository: string, mergeSha: string): RunView {
+    this.requireWorkflowBinding(runId);
     assertCommit(repository, mergeSha);
     const root = new GitService(repository).root;
     if (new GitService(root).head() !== mergeSha) {
@@ -378,14 +438,24 @@ export class Orchestrator {
       this.block(runId, "Task worktree is missing", "worktree");
       return this.status(runId);
     }
+    try {
+      this.completePendingTraversalWhenDurable(runId);
+    } catch (error) {
+      const blocked = this.blockOnWorkflowTraversalError(runId, error);
+      if (blocked) return blocked;
+      throw error;
+    }
+    run = this.store.getRun(runId)!;
     if (run.status === "ready") {
       try {
-        if (this.nextAction(runId).kind === "advance-ready") return this.status(runId);
+        if (this.nextDecision(runId).action.kind === "advance-ready") return this.status(runId);
       } catch (error) {
         if (error instanceof BudgetExceededError) {
           this.block(runId, error.message, "budget-exceeded");
           return this.status(runId);
         }
+        const blocked = this.blockOnWorkflowTraversalError(runId, error);
+        if (blocked) return blocked;
         throw error;
       }
       this.store.reopenRunForInvalidEvidence(runId);
@@ -394,7 +464,7 @@ export class Orchestrator {
   }
 
   private async runUntilStable(runId: string): Promise<RunView> {
-    return new LoopController<RunView>(this.maxLoopSteps).run({
+    return new LoopController<RunView, PreparedWorkflowDecision>(this.maxLoopSteps).run({
       isActive: () => this.store.getRun(runId)?.status === "open",
       status: () => this.status(runId),
       // Snapshot construction reads workspace diffs, so budget hits can
@@ -402,22 +472,143 @@ export class Orchestrator {
       // resolve to a blocked run rather than a crashed entry point.
       nextAction: () => {
         try {
-          return this.nextAction(runId);
+          return this.nextDecision(runId);
         } catch (error) {
           if (error instanceof BudgetExceededError) {
             this.block(runId, error.message, "budget-exceeded");
-            return { kind: "block", reason: error.message };
+            return { action: { kind: "block", reason: error.message }, edgeId: null, guard: null };
+          }
+          const blocked = this.blockOnWorkflowTraversalError(runId, error);
+          if (blocked) {
+            return { action: { kind: "block", reason: blocked.run.blocked?.reason ?? "Workflow blocked" }, edgeId: null, guard: null };
           }
           throw error;
         }
       },
       recordAction: (step, action) => this.store.appendEvent(runId, "loop.action", { step, action }),
-      execute: (action) => this.executeLoopAction(runId, action),
+      execute: async (decision) => {
+        try {
+          return await this.executeWorkflowDecision(runId, decision);
+        } catch (error) {
+          const blocked = this.blockOnWorkflowTraversalError(runId, error);
+          if (blocked) return blocked;
+          throw error;
+        }
+      },
       exhausted: () => {
         this.block(runId, "Loop step budget exhausted", "loop-budget");
         return this.status(runId);
       },
     });
+  }
+
+  private async executeWorkflowDecision(
+    runId: string,
+    decision: PreparedWorkflowDecision,
+  ): Promise<RunView | null> {
+    if (decision.edgeId === null) return this.executeLoopAction(runId, decision.action);
+    const binding = this.requireWorkflowBinding(runId);
+    const edge = binding.workflow.manifest.edges.find((candidate) => candidate.id === decision.edgeId);
+    if (!edge || edge.guard !== decision.guard) {
+      throw new WorkflowTraversalConflictError(
+        `Workflow decision is not present in frozen topology: ${decision.edgeId}`,
+      );
+    }
+
+    let traversal = this.store.getPendingWorkflowTraversal(runId);
+    if (traversal) {
+      this.validatePendingWorkflowTraversal(runId, binding, traversal);
+      if (
+        traversal.edgeId !== decision.edgeId ||
+        canonicalJson(traversal.action) !== canonicalJson(decision.action)
+      ) {
+        throw new WorkflowTraversalConflictError(
+          `Pending traversal ${traversal.id} does not match its frozen workflow decision`,
+        );
+      }
+    } else {
+      const sourceStateHash = decision[preparedSourceStateHash] ??
+        this.workflowSourceStateHash(runId, this.proofGapSnapshot(runId));
+      const idempotencyKey = `workflow:${operationInputHash({
+        runId,
+        topologyHash: binding.workflow.topologyHash,
+        edgeId: edge.id,
+        sourceStateHash,
+        action: decision.action,
+      })}`;
+      const budget = edge.budgetId === null
+        ? null
+        : binding.workflow.manifest.budgets.find((candidate) => candidate.id === edge.budgetId);
+      if (edge.budgetId !== null && !budget) {
+        throw new WorkflowTraversalConflictError(
+          `Frozen workflow edge ${edge.id} references an unknown budget`,
+        );
+      }
+      traversal = this.store.reserveWorkflowTraversal({
+        id: `${runId}:traversal:${idempotencyKey.slice(-24)}`,
+        runId,
+        topologyHash: binding.workflow.topologyHash,
+        edgeId: edge.id,
+        budgetId: edge.budgetId,
+        ...(budget ? { maximumTraversals: budget.maximumTraversals } : {}),
+        idempotencyKey,
+        sourceStateHash,
+        action: decision.action,
+      });
+      if (decision.action.kind === "repair" && traversal.budgetOrdinal !== decision.action.attempt) {
+        throw new WorkflowTraversalConflictError(
+          `Repair attempt ${decision.action.attempt} does not match traversal ordinal ${traversal.budgetOrdinal}`,
+        );
+      }
+    }
+
+    const lease = this.store.claimWorkflowTraversalExecution(
+      traversal.id,
+      this.workflowExecutionOwner,
+      workflowExecutionLeaseDurationMs,
+    );
+    if (!lease) {
+      // Another live Orchestrator owns this edge. Returning the current view
+      // stops this invocation without blocking the Run or duplicating the
+      // provider/command side effect; the owner will advance durable state.
+      return this.status(runId);
+    }
+
+    let completed = false;
+    let heartbeatFailure: unknown = null;
+    const heartbeat = setInterval(() => {
+      try {
+        if (!this.store.renewWorkflowTraversalExecution(lease, workflowExecutionLeaseDurationMs)) {
+          heartbeatFailure = new WorkflowTraversalConflictError(
+            `Workflow traversal ${traversal.id} lost its execution lease`,
+          );
+        }
+      } catch (error) {
+        heartbeatFailure = error;
+      }
+    }, workflowExecutionLeaseRenewIntervalMs);
+    heartbeat.unref();
+    try {
+      if (this.traversalActionIsDurable(runId, traversal)) {
+        this.assertWorkflowExecutionLease(lease, heartbeatFailure);
+        this.completeTraversal(runId, traversal, lease);
+        completed = true;
+        return null;
+      }
+      const terminal = await this.executeLoopAction(runId, traversal.action);
+      this.assertWorkflowExecutionLease(lease, heartbeatFailure);
+      if (
+        (traversal.action.kind !== "author" && traversal.action.kind !== "repair") ||
+        this.traversalActionIsDurable(runId, traversal)
+      ) {
+        this.completeTraversal(runId, traversal, lease);
+        completed = true;
+      }
+      return terminal ? this.status(runId) : null;
+    } finally {
+      clearInterval(heartbeat);
+      if (!completed) this.store.releaseWorkflowTraversalExecution(lease);
+    }
   }
 
   private async executeLoopAction(runId: string, action: NextAction): Promise<RunView | null> {
@@ -470,28 +661,251 @@ export class Orchestrator {
     return null;
   }
 
-  private nextAction(runId: string): NextAction {
-    return decideNextAction(this.proofGapSnapshot(runId));
+  private nextDecision(runId: string): PreparedWorkflowDecision {
+    const binding = this.requireWorkflowBinding(runId);
+    const pending = this.store.getPendingWorkflowTraversal(runId);
+    if (pending) {
+      const edge = this.validatePendingWorkflowTraversal(runId, binding, pending);
+      return { action: pending.action, edgeId: pending.edgeId, guard: edge.guard };
+    }
+    const snapshot = this.proofGapSnapshot(runId);
+    const decision = decideNextTransition(snapshot, binding.workflow.manifest) as PreparedWorkflowDecision;
+    Object.defineProperty(decision, preparedSourceStateHash, {
+      value: this.workflowSourceStateHash(runId, snapshot),
+      enumerable: false,
+    });
+    return decision;
+  }
+
+  private validatePendingWorkflowTraversal(
+    runId: string,
+    binding: RunBindingV2,
+    pending: WorkflowTraversal,
+  ): RunBindingV2["workflow"]["manifest"]["edges"][number] {
+    if (pending.runId !== runId || pending.topologyHash !== binding.workflow.topologyHash) {
+      throw new WorkflowTraversalConflictError(
+        `Pending traversal ${pending.id} is not bound to run ${runId} and its frozen topology`,
+      );
+    }
+    const edge = binding.workflow.manifest.edges.find((candidate) => candidate.id === pending.edgeId);
+    if (!edge) {
+      throw new WorkflowTraversalConflictError(
+        `Pending traversal ${pending.id} references an unknown edge`,
+      );
+    }
+    const budget = edge.budgetId === null
+      ? null
+      : binding.workflow.manifest.budgets.find((candidate) => candidate.id === edge.budgetId) ?? null;
+    if (
+      pending.budgetId !== edge.budgetId ||
+      (edge.budgetId === null && pending.budgetOrdinal !== null) ||
+      (edge.budgetId !== null && (
+        budget === null ||
+        pending.budgetOrdinal === null ||
+        pending.budgetOrdinal <= 0 ||
+        pending.budgetOrdinal > budget.maximumTraversals
+      ))
+    ) {
+      throw new WorkflowTraversalConflictError(
+        `Pending traversal ${pending.id} has budget data inconsistent with edge ${edge.id}`,
+      );
+    }
+    const expectedAction = workflowActionForEdge(edge.id, pending.budgetOrdinal);
+    if (expectedAction === null || canonicalJson(expectedAction) !== canonicalJson(pending.action)) {
+      throw new WorkflowTraversalConflictError(
+        `Pending traversal ${pending.id} has an action inconsistent with edge ${edge.id}`,
+      );
+    }
+    const expectedKey = `workflow:${operationInputHash({
+      runId,
+      topologyHash: binding.workflow.topologyHash,
+      edgeId: edge.id,
+      sourceStateHash: pending.sourceStateHash,
+      action: expectedAction,
+    })}`;
+    const expectedId = `${runId}:traversal:${expectedKey.slice(-24)}`;
+    if (pending.idempotencyKey !== expectedKey || pending.id !== expectedId) {
+      throw new WorkflowTraversalConflictError(
+        `Pending traversal ${pending.id} has an invalid deterministic identity`,
+      );
+    }
+    return edge;
+  }
+
+  private workflowSourceStateHash(runId: string, proofGaps: ProofGapSnapshot): string {
+    const run = this.requireBoundRun(runId);
+    const binding = this.requireWorkflowBinding(runId);
+    const git = new GitService(binding.worktreePath, binding.budget);
+    const preparedFacts = (proofGaps as PreparedProofGapSnapshot)[proofWorkspaceFacts];
+    return operationInputHash({
+      topologyHash: binding.workflow.topologyHash,
+      run: {
+        status: run.status,
+        updatedAt: run.updatedAt,
+        risk: binding.risk,
+        taskSpecHash: binding.taskSpecHash,
+        acceptanceHash: binding.acceptanceHash,
+        policyVersion: binding.policyVersion,
+        configurationHash: binding.configurationHash,
+      },
+      git: {
+        head: preparedFacts?.head ?? git.head(),
+        dirty: preparedFacts?.dirty ?? git.isDirty(),
+        diffHash: preparedFacts && !preparedFacts.dirty ? emptyGitDiffHash : git.diffHash(),
+        controlStateHash: preparedFacts?.controlStateHash ?? git.controlStateHash(preparedFacts?.head),
+      },
+      proofGaps,
+      operations: this.store.listOperations(runId).map((operation) => ({
+        id: operation.id,
+        kind: operation.kind,
+        inputHash: operation.inputHash,
+        status: operation.status,
+        finishedAt: operation.finishedAt,
+      })),
+      evidence: this.store.listEvidence(runId).map((item) => ({
+        id: item.id,
+        kind: item.kind,
+        status: item.status,
+        commitSha: item.commitSha,
+        dependencyHash: item.dependencyHash,
+      })),
+    });
+  }
+
+  private completePendingTraversalWhenDurable(runId: string): void {
+    const pending = this.store.getPendingWorkflowTraversal(runId);
+    if (pending && this.traversalActionIsDurable(runId, pending)) {
+      this.validatePendingWorkflowTraversal(runId, this.requireWorkflowBinding(runId), pending);
+      const lease = this.store.claimWorkflowTraversalExecution(
+        pending.id,
+        this.workflowExecutionOwner,
+        workflowExecutionLeaseDurationMs,
+      );
+      if (lease) this.completeTraversal(runId, pending, lease);
+    }
+  }
+
+  private traversalActionIsDurable(runId: string, traversal: WorkflowTraversal): boolean {
+    const action = traversal.action;
+    const run = this.store.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+    if (action.kind === "author" || action.kind === "repair") {
+      const id = action.kind === "author" ? `${runId}:author` : `${runId}:repair:${action.attempt}`;
+      const operation = this.store.getOperation(id);
+      return operation !== null && operation.status !== "running";
+    }
+    if (action.kind === "resolve-risk") return run.status === "blocked";
+    if (action.kind === "advance-ready") return run.status === "ready";
+    if (action.kind === "block") return run.status === "blocked";
+    if (run.status === "blocked") return true;
+
+    const operations = this.store.listOperations(runId).filter((operation) =>
+      operation.startedAt >= traversal.selectedAt
+    );
+    if (action.kind === "explore") {
+      const operation = operations.find((candidate) => candidate.kind === "explorer");
+      return operation !== undefined && operation.status !== "running";
+    }
+    if (action.kind === "checkpoint-commit") {
+      const operation = operations.find((candidate) => candidate.kind === "checkpoint-commit");
+      if (!operation || operation.status === "running") return false;
+      if (operation.status === "failed") return true;
+      return this.store.listEvidence(runId, "valid").some((item) =>
+        item.kind === "candidate_commit" && item.operationId === operation.id
+      );
+    }
+    if (action.kind === "bind-acceptance") {
+      const operation = operations.find((candidate) => candidate.kind === "acceptance-binding");
+      return operation !== undefined && operation.status !== "running";
+    }
+    if (action.kind === "verify") {
+      const commands = operations.filter((operation) => operation.kind.startsWith("verify:"));
+      return commands.length >= this.requireBoundRun(runId).binding.taskSpec.verification.length &&
+        commands.every((operation) => operation.status !== "running");
+    }
+    if (action.kind === "review") {
+      const operation = operations.find((candidate) => candidate.kind === "independent-review");
+      return operation !== undefined && operation.status !== "running";
+    }
+    return false;
+  }
+
+  private completeTraversal(
+    runId: string,
+    traversal: WorkflowTraversal,
+    lease: WorkflowTraversalExecutionLease,
+  ): void {
+    const operation = this.workflowActionOperation(runId, traversal.action);
+    const run = this.store.getRun(runId);
+    this.store.completeWorkflowTraversal(
+      traversal.id,
+      { action: traversal.action, resultingRunStatus: run?.status ?? null },
+      lease,
+      operation?.id ?? null,
+    );
+  }
+
+  private assertWorkflowExecutionLease(
+    lease: WorkflowTraversalExecutionLease,
+    heartbeatFailure: unknown,
+  ): void {
+    const renewed = this.store.renewWorkflowTraversalExecution(
+      lease,
+      workflowExecutionLeaseDurationMs,
+    );
+    if (!renewed) {
+      throw heartbeatFailure instanceof Error
+        ? heartbeatFailure
+        : new WorkflowTraversalConflictError(
+            `Workflow traversal ${lease.traversalId} lost its execution lease`,
+          );
+    }
+  }
+
+  private workflowActionOperation(runId: string, action: NextAction): Operation | null {
+    if (action.kind === "author") return this.store.getOperation(`${runId}:author`);
+    if (action.kind === "repair") return this.store.getOperation(`${runId}:repair:${action.attempt}`);
+    if (action.kind === "verify") {
+      return this.store.listOperations(runId).filter((operation) => operation.kind.startsWith("verify:")).at(-1) ?? null;
+    }
+    const kind = action.kind === "explore"
+      ? "explorer"
+      : action.kind === "checkpoint-commit"
+        ? "checkpoint-commit"
+        : action.kind === "bind-acceptance"
+          ? "acceptance-binding"
+          : action.kind === "review"
+            ? "independent-review"
+            : null;
+    if (kind === null) return null;
+    return this.store.listOperations(runId).filter((operation) => operation.kind === kind).at(-1) ?? null;
   }
 
   private proofGapSnapshot(runId: string, options: { reconcile?: boolean } = {}): ProofGapSnapshot {
-    const run = this.requireBoundRun(runId);
-    const binding = run.binding;
+    const binding = this.requireWorkflowBinding(runId, {
+      blockOnMismatch: options.reconcile !== false,
+    });
     const git = new GitService(binding.worktreePath, binding.budget);
+    const currentHead = git.head();
+    const workflowControl = git.workflowControlState(currentHead);
+    const dirty = workflowControl.dirty;
     // Reconciliation invalidates stale commit-bound evidence — a write. The
     // derived status view must observe without mutating, so it opts out.
-    if (options.reconcile !== false) this.reconcileCommitBoundEvidence(runId, git.head());
+    if (options.reconcile !== false) this.reconcileCommitBoundEvidence(runId, currentHead);
     const operations = this.store.listOperations(runId);
     const allEvidence = this.store.listEvidence(runId);
     const evidenceGate = new EvidenceGate(allEvidence);
     const validEvidence = evidenceGate.validEvidence();
-    const template = executionTemplates[binding.executionTemplate];
+    const requiresExplorer = binding.workflow.manifest.nodes.some((node) => node.id === "explore");
+    const requiresIndependentReview = binding.workflow.manifest.nodes.some((node) => node.id === "review");
+    const repairBudget = binding.workflow.manifest.budgets.find((budget) => budget.id === "repair");
+    if (!repairBudget) throw new Error("Frozen workflow topology has no repair budget");
 
     const explorer = operations.find((operation) => operation.kind === "explorer");
     const explorerDependencyHash = explorer
       ? this.explorationEvidenceReceipt(runId, explorer).dependencyHash
       : null;
-    const exploration = !template.requiresExplorer
+    const exploration = !requiresExplorer
       ? "not-required"
       : explorerDependencyHash && validEvidence.some((item) =>
           item.kind === "exploration" && item.dependencyHash === explorerDependencyHash
@@ -509,9 +923,9 @@ export class Orchestrator {
     const savedCheckpoint = operations.some((operation) =>
       operation.kind === "checkpoint-commit" && operation.status === "succeeded"
     );
-    const currentCandidate = evidenceGate.has("candidate_commit", (item) => item.commitSha === git.head());
+    const currentCandidate = evidenceGate.has("candidate_commit", (item) => item.commitSha === currentHead);
     let writerProof: ProofGapSnapshot["writer"];
-    if (git.isDirty()) {
+    if (dirty) {
       writerProof = writer && (writer.status === "running" || writer.status === "succeeded")
         ? "patch-ready"
         : "failed";
@@ -524,32 +938,32 @@ export class Orchestrator {
 
     const commands = this.projectAdapter.verificationCommands(binding.taskSpec);
     const expectedCommandHashes = commands.map((command) =>
-      this.commandEvidenceReceipt(runId, git.head(), binding.worktreePath, "verify", command).dependencyHash
+      this.commandEvidenceReceipt(runId, currentHead, binding.worktreePath, "verify", command).dependencyHash
     );
-    const currentFailures = evidenceGate.matching("verification_failure", (item) => item.commitSha === git.head());
-    const verification = evidenceGate.verificationStatus(git.head(), expectedCommandHashes);
+    const currentFailures = evidenceGate.matching("verification_failure", (item) => item.commitSha === currentHead);
+    const verification = evidenceGate.verificationStatus(currentHead, expectedCommandHashes);
 
-    const acceptanceReceipt = this.acceptanceEvidenceReceipt(runId, git.head());
-    const acceptance = !template.requiresIndependentReview
+    const acceptanceReceipt = this.acceptanceEvidenceReceipt(runId, currentHead);
+    const acceptance = !requiresIndependentReview
       ? "not-required"
       : evidenceGate.has("acceptance_binding", (item) => item.dependencyHash === acceptanceReceipt.dependencyHash)
         ? "satisfied"
         : "missing";
 
     let review: ProofGapSnapshot["review"] = "not-required";
-    if (template.requiresIndependentReview && acceptance === "satisfied" && verification === "passed") {
+    if (requiresIndependentReview && acceptance === "satisfied" && verification === "passed") {
       const candidates = this.safeReviewCandidates(runId);
       const reviewInput = this.reviewOperationInput(
         runId,
-        git.head(),
-        hashReviewDiff(git.diffBetween(binding.baselineCommit, git.head())),
+        currentHead,
+        hashReviewDiff(git.diffBetween(binding.baselineCommit, currentHead)),
         git.controlStateHash(),
         candidates,
       );
-      const reviewOperation = this.store.getOperation(this.reviewOperationId(runId, git.head(), reviewInput));
+      const reviewOperation = this.store.getOperation(this.reviewOperationId(runId, currentHead, reviewInput));
       const receipt = validEvidence.find((item) =>
         item.kind === "independent_review" &&
-        item.commitSha === git.head() &&
+        item.commitSha === currentHead &&
         reviewOperation !== null &&
         candidates.some((candidate) =>
           this.matchesReviewEvidence(runId, item, candidate, reviewOperation, reviewInput)
@@ -569,8 +983,8 @@ export class Orchestrator {
     const repeatedFailure = signature !== null && allEvidence.some((item) =>
       item.id !== latestFailure?.id && failureEvidenceSignature(item) === signature
     );
-    const repairsUsed = operations.filter((operation) => operation.kind === "repair").length;
-    return {
+    const repairsUsed = this.store.workflowBudgetUsage(runId, "repair");
+    const snapshot: PreparedProofGapSnapshot = {
       risk: binding.risk,
       template: binding.executionTemplate,
       exploration,
@@ -579,9 +993,14 @@ export class Orchestrator {
       verification,
       review,
       repairsUsed,
-      maximumRepairs: template.maximumRepairs,
+      maximumRepairs: repairBudget.maximumTraversals,
       repeatedFailure,
     };
+    Object.defineProperty(snapshot, proofWorkspaceFacts, {
+      value: { head: currentHead, dirty, controlStateHash: workflowControl.controlStateHash },
+      enumerable: false,
+    });
+    return snapshot;
   }
 
   private async executeExplorer(runId: string): Promise<void> {
@@ -806,6 +1225,19 @@ export class Orchestrator {
       return;
     }
     const git = new GitService(binding.worktreePath, binding.budget);
+    const operationId = role === "author" ? `${runId}:author` : `${runId}:repair:${attempt}`;
+    const existingOperation = this.store.getOperation(operationId);
+    if (existingOperation) {
+      if (existingOperation.status !== "running") return;
+      const completedReceipt = this.writerProviderReceipt(runId, existingOperation.id);
+      if (completedReceipt) {
+        this.recoverWriterOperation(runId, existingOperation, git);
+        return;
+      }
+    }
+    // A dirty workspace matters only when making a new provider call. Durable
+    // receipts and operation recovery above must remain usable after a writer
+    // has produced its patch but the process crashed before reconciliation.
     if (git.isDirty()) {
       this.block(runId, `${role} cannot start from a dirty worktree`, "worktree");
       return;
@@ -817,7 +1249,6 @@ export class Orchestrator {
             (item.kind === "independent_review" && isRecord(item.data) && item.data.blocking === true))
         )
       : [];
-    const operationId = role === "author" ? `${runId}:author` : `${runId}:repair:${attempt}`;
     const input = {
       role,
       attempt,
@@ -830,7 +1261,6 @@ export class Orchestrator {
       failureEvidenceIds: failureEvidence.map((item) => item.id),
       failureSignatures: failureEvidence.map(failureEvidenceSignature).filter((value): value is string => value !== null),
     };
-    const existingOperation = this.store.getOperation(operationId);
     const operation = this.store.createOperation({
       id: operationId,
       runId,
@@ -839,11 +1269,6 @@ export class Orchestrator {
       input,
     });
     if (operation.status !== "running") return;
-    const completedReceipt = this.writerProviderReceipt(runId, operation.id);
-    if (completedReceipt) {
-      this.recoverWriterOperation(runId, operation, git);
-      return;
-    }
     if (!existingOperation) this.afterWriterOperationCreated?.(role);
     const explorerReport = this.savedExplorerReport(runId);
     const writerPrompt = role === "author"
@@ -2337,10 +2762,26 @@ export class Orchestrator {
       task: this.requireBoundRun(runId).binding.taskSpec,
       changedFiles,
     });
-    this.store.escalateRunRisk(runId, riskFloor, {
-      changedFiles,
-      candidateCommit: candidate.commitSha,
-    });
+    try {
+      this.store.escalateRunRisk(runId, riskFloor, {
+        changedFiles,
+        candidateCommit: candidate.commitSha,
+      });
+    } catch (error) {
+      if (!(error instanceof WorkflowTemplateEscalationRequiredError)) throw error;
+      this.store.appendEvent(runId, error.code, {
+        message: error.message,
+        changedFiles,
+        candidateCommit: candidate.commitSha,
+      });
+      this.block(
+        runId,
+        `${error.message}; the frozen topology cannot be upgraded in place, so start a new run`,
+        "workflow-template-escalation",
+        { kind: "human-action-required", actionType: "start-new-run" },
+      );
+      return null;
+    }
     const effectiveRun = this.requireBoundRun(runId);
     const stepId = `candidate-commit:${attempt}`;
     const dependencies = evidenceDependencies({
@@ -2445,11 +2886,31 @@ export class Orchestrator {
     if (!run) throw new Error(`Run not found: ${runId}`);
     if (!run.binding) {
       this.store.invalidateAllEvidence(runId);
-      this.block(runId, "Run predates immutable task binding; start a new run", "run-binding");
+      this.block(
+        runId,
+        "Run predates immutable task binding and cannot be migrated in place; start a new run with a new run ID",
+        "run-binding",
+        { kind: "human-action-required", actionType: "start-new-run" },
+      );
       return null;
     }
 
+    const legacyTopologyBinding = run.binding.version !== 2;
     const mismatches: string[] = [];
+    if (run.binding.version !== 2) {
+      mismatches.push("workflow topology binding (start a new run)");
+    } else if (operationInputHash(run.binding.workflow.manifest) !== run.binding.workflow.topologyHash) {
+      mismatches.push("workflow topology hash");
+    } else {
+      try {
+        validateWorkflowTopology(run.binding.workflow.manifest);
+        if (run.binding.workflow.manifest.template !== run.binding.executionTemplate) {
+          mismatches.push("workflow template");
+        }
+      } catch {
+        mismatches.push("workflow topology manifest");
+      }
+    }
     if (run.binding.projectAdapterName !== this.projectAdapter.name) mismatches.push("project adapter");
     if (run.binding.policyVersion !== this.projectAdapter.policyVersion) mismatches.push("policy version");
     if (run.binding.providerProfile !== this.providerProfileName) mismatches.push("provider profile");
@@ -2478,8 +2939,13 @@ export class Orchestrator {
       this.store.invalidateAllEvidence(runId);
       this.block(
         runId,
-        `Immutable run binding mismatch: ${[...new Set(mismatches)].join(", ")}`,
+        legacyTopologyBinding
+          ? `Active V1 runs cannot be migrated in place; preserve this run for inspection and start a new run with a new run ID. Binding mismatch: ${[...new Set(mismatches)].join(", ")}`
+          : `Immutable run binding mismatch: ${[...new Set(mismatches)].join(", ")}`,
         "run-binding",
+        legacyTopologyBinding
+          ? { kind: "human-action-required", actionType: "start-new-run" }
+          : undefined,
       );
       return null;
     }
@@ -2491,6 +2957,54 @@ export class Orchestrator {
     if (!run) throw new Error(`Run not found: ${runId}`);
     if (!run.binding) throw new Error(`Run ${runId} has no immutable binding`);
     return run as Run & { binding: NonNullable<Run["binding"]> };
+  }
+
+  private requireWorkflowBinding(
+    runId: string,
+    options: { blockOnMismatch?: boolean } = {},
+  ): RunBindingV2 {
+    const run = this.requireBoundRun(runId);
+    const binding = run.binding;
+    let reason: string | null = null;
+    if (binding.version !== 2) {
+      reason = "Run predates frozen workflow topology; start a new run";
+    } else if (operationInputHash(binding.workflow.manifest) !== binding.workflow.topologyHash) {
+      reason = "Frozen workflow topology hash does not match its manifest";
+    } else {
+      try {
+        validateWorkflowTopology(binding.workflow.manifest);
+        if (binding.workflow.manifest.template !== binding.executionTemplate) {
+          reason = "Frozen workflow template does not match the execution template";
+        }
+      } catch (error) {
+        reason = error instanceof Error ? error.message : "Frozen workflow topology is invalid";
+      }
+    }
+    if (reason !== null) {
+      if (
+        options.blockOnMismatch !== false &&
+        (run.status === "open" || run.status === "ready" || run.status === "merged")
+      ) {
+        this.store.invalidateAllEvidence(runId);
+        this.block(runId, reason, "workflow-topology");
+      }
+      throw new Error(reason);
+    }
+    return binding as RunBindingV2;
+  }
+
+  private blockOnWorkflowTraversalError(runId: string, error: unknown): RunView | null {
+    if (error instanceof WorkflowBudgetExceededError) {
+      this.store.appendEvent(runId, error.code, { message: error.message });
+      this.block(runId, error.message, "workflow-budget");
+      return this.status(runId);
+    }
+    if (error instanceof WorkflowTraversalConflictError) {
+      this.store.appendEvent(runId, error.code, { message: error.message });
+      this.block(runId, error.message, "workflow-traversal");
+      return this.status(runId);
+    }
+    return null;
   }
 
   private block(runId: string, reason: string, checkpointRef: string, recovery?: RecoveryDisposition): void {

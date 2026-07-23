@@ -45,4 +45,22 @@ describe("generic architecture boundary", () => {
       for (const pattern of forbidden) expect(source, `${file} violates the sidecar boundary`).not.toMatch(pattern);
     }
   });
+
+  it("keeps workflow edge semantics in the typed transition registry", () => {
+    const sourceRoot = resolve("src");
+    const registryPath = resolve(sourceRoot, "workflow-transition-registry.ts");
+    const registrySource = readFileSync(registryPath, "utf8");
+    const edgeIds = [...registrySource.matchAll(/workflowEdge\(\s*"([^"]+)"/gu)]
+      .map((match) => match[1]!)
+      .sort();
+    expect(edgeIds).toHaveLength(14);
+    expect(new Set(edgeIds).size).toBe(edgeIds.length);
+
+    for (const file of sourceFiles(sourceRoot).filter((file) => file !== registryPath)) {
+      const source = readFileSync(file, "utf8");
+      for (const edgeId of edgeIds) {
+        expect(source, `${file} duplicates transition ${edgeId}`).not.toContain(`"${edgeId}"`);
+      }
+    }
+  });
 });

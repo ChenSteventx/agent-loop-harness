@@ -54,7 +54,7 @@ describe("SqliteStore", () => {
     });
     const operationColumns = migrated.database.pragma("table_info(operations)") as Array<{ name: string }>;
     expect(operationColumns.map(({ name }) => name)).toEqual(expect.arrayContaining(["input_json", "input_hash"]));
-    expect(migrated.database.pragma("user_version", { simple: true })).toBe(2);
+    expect(migrated.database.pragma("user_version", { simple: true })).toBe(3);
     migrated.close();
   });
 
