@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type {
   CommandReceiptExpectation,
   CommandRequest,
@@ -9,7 +9,11 @@ import type {
 } from "../src/execution.js";
 
 export const fakeOciImage = `fixture.invalid/agent-loop-node@sha256:${"0".repeat(64)}`;
-export const fakeOciRuntime = resolve("test/fixtures/fake-oci-runtime.mjs");
+const fakeOciRuntimeSource = resolve("test/fixtures/fake-oci-runtime.mjs");
+export const fakeOciRuntime = join(tmpdir(), `agent-loop-fake-oci-runtime-${process.pid}.mjs`);
+copyFileSync(fakeOciRuntimeSource, fakeOciRuntime);
+chmodSync(fakeOciRuntime, 0o755);
+process.once("exit", () => rmSync(fakeOciRuntime, { force: true }));
 
 export function fakeOciRunnerOptions(stateDirectory: string, tracePath?: string): CommandRunnerOptions {
   mkdirSync(stateDirectory, { recursive: true });

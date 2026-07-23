@@ -180,6 +180,7 @@ if (Number.isSafeInteger(delayedCreateMs) && delayedCreateMs > 0) {
     windowsHide: true,
   });
   helper.unref();
+  setInterval(() => {}, 1_000);
   await new Promise(() => {});
 }
 
