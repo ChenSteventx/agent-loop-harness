@@ -27,7 +27,7 @@ const receiptSchemaVersion = 2 as const;
 const nullDependencyInputHash = null;
 const containerReapTimeoutMs = 15_000;
 const containerAbsenceConfirmationMs = 1_000;
-const containerReapPollMs = 50;
+const containerReapPollMs = 250;
 
 export type ContainmentOutcome =
   | "exited"
